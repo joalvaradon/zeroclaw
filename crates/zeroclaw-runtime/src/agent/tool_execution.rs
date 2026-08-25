@@ -362,26 +362,42 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or_else(|| r.output.into_string());
+                    // A tool can report a short `error` (e.g. "HTTP 400") while
+                    // separately building a richer `output` with the detail an
+                    // agent would need to self-correct (e.g. the full response
+                    // body explaining what was wrong with the request). Only
+                    // `output` reaches the LLM (see `ToolExecutionOutcome::output`
+                    // doc comment), so when both are present and distinct, fold
+                    // the detail into what the agent sees instead of discarding
+                    // it. Tools that already put everything into `error` and
+                    // leave `output` empty (the common case) are unaffected.
+                    let output_text = r.output.as_str().to_string();
+                    let output_data = r.output.into_data();
+                    let reason = r.error.unwrap_or_else(|| output_text.clone());
+                    let full_output = if !output_text.is_empty() && output_text != reason {
+                        format!("{reason}\n\n{output_text}")
+                    } else {
+                        reason.clone()
+                    };
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
                         arguments: Some(full_args.clone()),
-                        result: Some(scrub_credentials(&reason)),
+                        result: Some(scrub_credentials(&full_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
-                        output: format!("Error: {reason}"),
+                        output: format!("Error: {full_output}"),
                         success: false,
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
-                        output_data: None,
+                        output_data,
                     })
                 }
             }
@@ -759,6 +775,170 @@ mod tests {
             "Tool not available in this turn: extract_text"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Fake tool that always fails, with an `error` distinct from `output` —
+    /// mirrors `http_request`'s pattern of a short status in `error` plus a
+    /// detailed body in `output`.
+    struct FailingToolWithDetailedOutput;
+
+    #[async_trait]
+    impl zeroclaw_api::attribution::Attributable for FailingToolWithDetailedOutput {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-failing-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingToolWithDetailedOutput {
+        fn name(&self) -> &str {
+            "failing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Always fails with error + detailed output, for regression testing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: "Response Body: the api-version needs the -preview suffix".into(),
+                error: Some("HTTP 400".into()),
+            })
+        }
+    }
+
+    /// Fake tool that fails with only `error` set and empty `output` — the
+    /// common case (e.g. `file_edit`, blocked shell commands) that must keep
+    /// behaving exactly as before this change.
+    struct FailingToolWithNoOutput;
+
+    #[async_trait]
+    impl zeroclaw_api::attribution::Attributable for FailingToolWithNoOutput {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-failing-tool-no-output"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingToolWithNoOutput {
+        fn name(&self) -> &str {
+            "failing_tool_no_output"
+        }
+
+        fn description(&self) -> &str {
+            "Always fails with only error set, for regression testing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: zeroclaw_api::tool::ToolOutput::default(),
+                error: Some("old_string not found in file".into()),
+            })
+        }
+    }
+
+    fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
+        crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_includes_detailed_output_alongside_short_error() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FailingToolWithDetailedOutput)];
+        let meta = test_turn_meta();
+        let outcome = execute_one_tool(
+            "failing_tool",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should return an outcome for a failing tool");
+
+        assert!(!outcome.success);
+        assert!(
+            outcome.output.contains("HTTP 400"),
+            "the short error must still be present: {}",
+            outcome.output
+        );
+        assert!(
+            outcome
+                .output
+                .contains("the api-version needs the -preview suffix"),
+            "the tool's detailed output must reach the agent, not just the bare status: {}",
+            outcome.output
+        );
+        assert_eq!(
+            outcome.error_reason.as_deref(),
+            Some("HTTP 400"),
+            "error_reason stays the short, raw reason for other consumers"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_error_only_output_is_unchanged() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FailingToolWithNoOutput)];
+        let meta = test_turn_meta();
+        let outcome = execute_one_tool(
+            "failing_tool_no_output",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should return an outcome for a failing tool");
+
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.output, "Error: old_string not found in file",
+            "tools with empty output must keep the exact pre-existing message shape"
+        );
     }
 
     use super::should_execute_tools_in_parallel;
