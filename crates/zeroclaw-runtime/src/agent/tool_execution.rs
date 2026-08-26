@@ -969,8 +969,8 @@ mod tests {
         );
     }
 
-    /// The production-boundary case #10357 explicitly requires: the real
-    /// `http_request` tool against a live 4xx response, run through
+    /// The production-boundary case the linked issue explicitly requires:
+    /// the real `http_request` tool against a live 4xx response, run through
     /// `execute_one_tool`, proving the response body it builds via
     /// `ToolOutput::json_with_text` (`http_request.rs:661-680`) reaches the
     /// agent-visible outcome rather than being replaced by the bare
