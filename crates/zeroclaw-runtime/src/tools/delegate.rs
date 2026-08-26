@@ -8141,6 +8141,446 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_delegate_with_different_risk_profile_keeps_own_workspace_dir() {
+        // Regression check for #9872: a Bounded delegate whose risk profile
+        // DIFFERS from the caller's must NOT inherit the caller's session
+        // workspace - only same-profile Bounded delegates should (regression
+        // for #7263, covered above). Mirrors the reported
+        // executive_assistant("balanced") -> researcher("research") config.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-delegate-diff-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "balanced".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("research".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "executive_assistant".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "balanced".into(),
+                model_provider: "ollama.executive_assistant".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "researcher".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "research".into(),
+                model_provider: "ollama.researcher".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let session_cwd = PathBuf::from("/tmp/zeroclaw-test-diff-profile-session-cwd");
+        let mut caller_policy = SecurityPolicy::for_agent(&config, "executive_assistant")
+            .expect("caller policy resolves");
+        caller_policy.workspace_dir = session_cwd.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        let target_config_workspace = config.agent_workspace_dir("researcher");
+        assert_ne!(
+            session_cwd, target_config_workspace,
+            "test precondition: session cwd must differ from target's config workspace"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("executive_assistant");
+
+        let target_policy = tool
+            .policy_for_target("researcher")
+            .expect("different-profile bounded target resolves");
+        assert_eq!(
+            target_policy.workspace_dir, target_config_workspace,
+            "bounded delegate with a DIFFERENT risk profile must keep its own \
+             configured workspace, not inherit the caller's session cwd \
+             (issue #9872): got {:?}, expected {:?}",
+            target_policy.workspace_dir, target_config_workspace
+        );
+    }
+
+    struct BoundedDelegateFsFixture {
+        _tmp: TempDir,
+        tool: DelegateTool,
+        target_config: AliasedAgentConfig,
+        caller_workspace: PathBuf,
+        target_workspace: PathBuf,
+    }
+
+    /// Builds a caller ("executive_assistant", risk profile "balanced") that bounded-delegates
+    /// to a target ("fs_researcher", risk profile "research") whose `parent_tools` entry for
+    /// `tool_name` is the REAL production tool, built via `default_tools_with_runtime` (the
+    /// same factory the live runtime uses) and bound to the CALLER's session workspace. This
+    /// mirrors exactly how `DelegateTool::execute_agentic_with_admission`'s `Bounded` branch
+    /// (delegate.rs ~2644-2687) assembles `sub_tools` in production, so it exercises the real
+    /// failing path for #9872 - unlike a `policy_for_target()`-only assertion.
+    async fn bounded_delegate_fs_fixture(
+        tool_name: &str,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> BoundedDelegateFsFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-session-cwd");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // allowed_commands/block_high_risk_commands only matter for the "shell" variant;
+        // harmless wildcards for the "file_write" variant.
+        config.risk_profiles.insert(
+            "balanced".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![tool_name.to_string(), "delegate".to_string()],
+                allowed_commands: vec!["*".to_string()],
+                block_high_risk_commands: false,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "research".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec![tool_name.to_string()],
+                allowed_commands: vec!["*".to_string()],
+                block_high_risk_commands: false,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "fs_agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "executive_assistant".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "balanced".into(),
+                runtime_profile: "fs_agentic_test".into(),
+                model_provider: "ollama.executive_assistant".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "fs_researcher".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            risk_profile: "research".into(),
+            runtime_profile: "fs_agentic_test".into(),
+            model_provider: "ollama.fs_researcher".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config
+            .agents
+            .insert("fs_researcher".to_string(), target_config.clone());
+
+        let target_workspace = config.agent_workspace_dir("fs_researcher");
+        assert_ne!(
+            caller_workspace, target_workspace,
+            "test precondition: caller session cwd must differ from the target's configured workspace"
+        );
+
+        let config = Arc::new(config);
+
+        let mut caller_policy = SecurityPolicy::for_agent(&config, "executive_assistant")
+            .expect("caller policy resolves");
+        // Caller's actual session cwd, which can legitimately differ from its own
+        // configured agent workspace (e.g. a dynamic per-turn session dir) - mirrors
+        // the reported executive_assistant/researcher config in #9872.
+        caller_policy.workspace_dir = caller_workspace.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        // Build parent_tools from the SAME factory production uses
+        // (`default_tools_with_runtime`), so this fixture cannot silently drift from
+        // what a real caller turn actually assembles.
+        let caller_tool_registry =
+            crate::tools::default_tools_with_runtime(Arc::clone(&caller_policy), runtime);
+        let real_tool = caller_tool_registry
+            .into_iter()
+            .find(|t| t.name() == tool_name)
+            .unwrap_or_else(|| panic!("default_tools_with_runtime did not register '{tool_name}'"));
+        let parent_tools: Vec<Arc<dyn Tool>> = vec![Arc::from(real_tool)];
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_workspace_dir(caller_workspace.clone())
+            .with_parent_tools(Arc::new(RwLock::new(parent_tools)))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_caller_alias("executive_assistant");
+
+        BoundedDelegateFsFixture {
+            _tmp: tmp,
+            tool,
+            target_config,
+            caller_workspace,
+            target_workspace,
+        }
+    }
+
+    struct BoundedFileWriteThenFinalModelProvider {
+        path: &'static str,
+        content: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for BoundedFileWriteThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
+            if tool_message_count == 0 {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_write".to_string(),
+                        name: "file_write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": self.path,
+                            "content": self.content
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("bounded fs delegate done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BoundedFileWriteThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "BoundedFileWriteThenFinalModelProvider"
+        }
+    }
+
+    struct BoundedShellThenFinalModelProvider {
+        command: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for BoundedShellThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
+            if tool_message_count == 0 {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_shell".to_string(),
+                        name: "shell".to_string(),
+                        arguments: serde_json::json!({
+                            "command": self.command,
+                            "approved": true
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("bounded shell delegate done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BoundedShellThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "BoundedShellThenFinalModelProvider"
+        }
+    }
+
+    /// Real regression for #9872: drives a REAL bounded delegate turn (through
+    /// `execute_agentic`, hitting the `DelegateExecutionMode::Bounded` branch at
+    /// delegate.rs ~2644-2687) with a target whose risk profile DIFFERS from the
+    /// caller's, and asserts on the actual filesystem side effect of a real
+    /// `file_write` tool call - not just on `policy_for_target()` in isolation.
+    #[tokio::test]
+    async fn bounded_delegate_file_write_lands_in_target_workspace_not_callers() {
+        let fixture = bounded_delegate_fs_fixture("file_write", Arc::new(DelegateTestRuntime)).await;
+        let model_provider = BoundedFileWriteThenFinalModelProvider {
+            path: "proof.txt",
+            content: "written by bounded fs target",
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "write a proof file",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "bounded fs delegate failed: {result:?}");
+
+        assert!(
+            !fixture.caller_workspace.join("proof.txt").exists(),
+            "regression for #9872: a Bounded delegate's file_write must NOT land in the \
+             caller's session workspace ({}) just because its tool instance was reused from \
+             parent_tools",
+            fixture.caller_workspace.display()
+        );
+        let target_file = fixture.target_workspace.join("proof.txt");
+        assert!(
+            target_file.exists(),
+            "regression for #9872: a Bounded delegate's file_write must land in the TARGET's \
+             own configured workspace ({}), not the caller's",
+            fixture.target_workspace.display()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target_file).await.unwrap(),
+            "written by bounded fs target"
+        );
+    }
+
+    /// Same regression as above, through the `shell` tool instead of `file_write`. Uses the
+    /// REAL `NativeRuntime` (not the fake `DelegateTestRuntime`) so the command actually
+    /// executes and its cwd can be observed via a real created file - `DelegateTestRuntime`'s
+    /// `build_shell_command` only echoes the command string back and never runs a real shell,
+    /// so it cannot prove *where* a command executed.
+    #[tokio::test]
+    async fn bounded_delegate_shell_command_executes_in_target_workspace_not_callers() {
+        let fixture =
+            bounded_delegate_fs_fixture("shell", Arc::new(crate::platform::NativeRuntime::new()))
+                .await;
+        let model_provider = BoundedShellThenFinalModelProvider {
+            command: "echo written-by-bounded-shell-target > shell_proof.txt",
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "run a proof command",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "bounded shell delegate failed: {result:?}");
+
+        assert!(
+            !fixture.caller_workspace.join("shell_proof.txt").exists(),
+            "regression for #9872: a Bounded delegate's shell command must NOT execute with \
+             the caller's session workspace ({}) as its cwd",
+            fixture.caller_workspace.display()
+        );
+        assert!(
+            fixture.target_workspace.join("shell_proof.txt").exists(),
+            "regression for #9872: a Bounded delegate's shell command must execute with the \
+             TARGET's own configured workspace ({}) as its cwd, not the caller's",
+            fixture.target_workspace.display()
+        );
+    }
+
+    #[tokio::test]
     async fn independent_delegate_target_uses_target_risk_profile_restrictions() {
         // Independent mode should not be confused with unrestricted mode. It
         // removes the caller ceiling, then applies the target's own policy
