@@ -2653,10 +2653,12 @@ impl DelegateTool {
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
                 {
                     match self.memory_for_target_agent(agent_name).await {
-                        Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
-                            .into_iter()
-                            .map(|tool| (tool.name().to_string(), tool))
-                            .collect(),
+                        Ok(Some(memory)) => {
+                            Self::memory_tools_for_target(memory, Arc::clone(&target_policy))
+                                .into_iter()
+                                .map(|tool| (tool.name().to_string(), tool))
+                                .collect()
+                        }
                         Ok(None) => HashMap::new(),
                         Err(e) => {
                             return Ok(ToolResult {
@@ -2672,6 +2674,49 @@ impl DelegateTool {
                     HashMap::new()
                 };
 
+                // Filesystem-boundary tools (shell/file_read/file_write/...) must be
+                // rebuilt against the TARGET's own SecurityPolicy, never reused from
+                // `self.parent_tools`: those instances were built once for the CALLER
+                // and bake its `workspace_dir`/`allowed_roots`/`forbidden_paths` into a
+                // private field, so a Bounded target with a different risk profile would
+                // otherwise silently act inside the caller's workspace. Built via the
+                // SAME canonical factory production uses for a fresh registry
+                // (`default_tools_with_runtime` + `image_info_tool`), so this can't
+                // drift from the real tool-construction path over time - mirrors the
+                // memory rebuild above.
+                let needs_fs_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && crate::tools::FILESYSTEM_TOOL_NAMES.contains(&tool.name())
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
+                let mut target_fs_tools: HashMap<String, Box<dyn Tool>> = if needs_fs_tools {
+                    let Some(runtime) = self.runtime.as_ref().cloned() else {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Bounded delegation to '{agent_name}' needs a filesystem-boundary \
+                                 tool, but this DelegateTool has no runtime adapter configured to \
+                                 build the target's own tools"
+                            )),
+                        });
+                    };
+                    let mut tools = crate::tools::default_tools_with_runtime(
+                        Arc::clone(&target_policy),
+                        runtime,
+                    );
+                    tools.push(crate::tools::image_info_tool(target_policy));
+                    tools
+                        .into_iter()
+                        .map(|tool| (tool.name().to_string(), tool))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+
                 let parent_tools = self.parent_tools.read();
                 parent_tools
                     .iter()
@@ -2679,9 +2724,12 @@ impl DelegateTool {
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
-                        })
+                        target_memory_tools
+                            .remove(tool.name())
+                            .or_else(|| target_fs_tools.remove(tool.name()))
+                            .unwrap_or_else(|| {
+                                Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                            })
                     })
                     .collect()
             }
@@ -8142,10 +8190,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_with_different_risk_profile_keeps_own_workspace_dir() {
-        // Regression check for #9872: a Bounded delegate whose risk profile
-        // DIFFERS from the caller's must NOT inherit the caller's session
-        // workspace - only same-profile Bounded delegates should (regression
-        // for #7263, covered above). Mirrors the reported
+        // A Bounded delegate whose risk profile DIFFERS from the caller's must
+        // NOT inherit the caller's session workspace - only same-profile
+        // Bounded delegates should (covered above). Mirrors the reported
         // executive_assistant("balanced") -> researcher("research") config.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
@@ -8238,8 +8285,8 @@ mod tests {
     /// `tool_name` is the REAL production tool, built via `default_tools_with_runtime` (the
     /// same factory the live runtime uses) and bound to the CALLER's session workspace. This
     /// mirrors exactly how `DelegateTool::execute_agentic_with_admission`'s `Bounded` branch
-    /// (delegate.rs ~2644-2687) assembles `sub_tools` in production, so it exercises the real
-    /// failing path for #9872 - unlike a `policy_for_target()`-only assertion.
+    /// (delegate.rs ~2644-2687) assembles `sub_tools` in production, so it exercises the
+    /// real failing path - unlike a `policy_for_target()`-only assertion.
     async fn bounded_delegate_fs_fixture(
         tool_name: &str,
         runtime: Arc<dyn RuntimeAdapter>,
@@ -8321,15 +8368,17 @@ mod tests {
             .expect("caller policy resolves");
         // Caller's actual session cwd, which can legitimately differ from its own
         // configured agent workspace (e.g. a dynamic per-turn session dir) - mirrors
-        // the reported executive_assistant/researcher config in #9872.
+        // the reported executive_assistant/researcher configuration.
         caller_policy.workspace_dir = caller_workspace.clone();
         let caller_policy = Arc::new(caller_policy);
 
         // Build parent_tools from the SAME factory production uses
         // (`default_tools_with_runtime`), so this fixture cannot silently drift from
         // what a real caller turn actually assembles.
-        let caller_tool_registry =
-            crate::tools::default_tools_with_runtime(Arc::clone(&caller_policy), runtime);
+        let caller_tool_registry = crate::tools::default_tools_with_runtime(
+            Arc::clone(&caller_policy),
+            Arc::clone(&runtime),
+        );
         let real_tool = caller_tool_registry
             .into_iter()
             .find(|t| t.name() == tool_name)
@@ -8341,10 +8390,14 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
 
+        // `.with_runtime(...)` mirrors production (tools/mod.rs always sets it when
+        // wiring a live DelegateTool) - the Bounded branch's fs-tool rebuild needs it
+        // to construct the target's own instances via the same canonical factory.
         let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
             .with_root_config(Arc::clone(&config))
             .with_workspace_dir(caller_workspace.clone())
             .with_parent_tools(Arc::new(RwLock::new(parent_tools)))
+            .with_runtime(runtime)
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone())
             .with_caller_alias("executive_assistant");
@@ -8487,14 +8540,15 @@ mod tests {
         }
     }
 
-    /// Real regression for #9872: drives a REAL bounded delegate turn (through
+    /// Real regression test: drives a REAL bounded delegate turn (through
     /// `execute_agentic`, hitting the `DelegateExecutionMode::Bounded` branch at
     /// delegate.rs ~2644-2687) with a target whose risk profile DIFFERS from the
     /// caller's, and asserts on the actual filesystem side effect of a real
     /// `file_write` tool call - not just on `policy_for_target()` in isolation.
     #[tokio::test]
     async fn bounded_delegate_file_write_lands_in_target_workspace_not_callers() {
-        let fixture = bounded_delegate_fs_fixture("file_write", Arc::new(DelegateTestRuntime)).await;
+        let fixture =
+            bounded_delegate_fs_fixture("file_write", Arc::new(DelegateTestRuntime)).await;
         let model_provider = BoundedFileWriteThenFinalModelProvider {
             path: "proof.txt",
             content: "written by bounded fs target",
@@ -10100,6 +10154,7 @@ command = "echo hi"
         let tool = DelegateTool::new(HashMap::new(), None, parent_security)
             .with_runtime_profiles(agentic_runtime_profiles(10))
             .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_runtime(Arc::new(DelegateTestRuntime))
             .with_parent_tools(Arc::new(RwLock::new(vec![
                 Arc::new(FileReadTool),
                 Arc::new(FileWriteTool),
@@ -10151,6 +10206,7 @@ command = "echo hi"
                 "shell".to_string(),
                 "file_read".to_string(),
             ]))
+            .with_runtime(Arc::new(DelegateTestRuntime))
             .with_parent_tools(Arc::new(RwLock::new(vec![
                 Arc::new(MockShellTool),
                 Arc::new(FileReadTool),
@@ -10199,6 +10255,7 @@ command = "echo hi"
         let tool = DelegateTool::new(HashMap::new(), None, parent_security)
             .with_runtime_profiles(agentic_runtime_profiles(10))
             .with_risk_profiles(agentic_risk_profiles(vec!["file_read".to_string()]))
+            .with_runtime(Arc::new(DelegateTestRuntime))
             .with_parent_tools(Arc::new(RwLock::new(vec![
                 Arc::new(FileReadTool),
                 Arc::new(FileWriteTool),

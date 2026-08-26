@@ -348,6 +348,36 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+/// Tool names whose construction bakes in a `SecurityPolicy`
+/// (`workspace_dir`/`allowed_roots`/`forbidden_paths`): the set built by
+/// [`default_tools_with_runtime`] plus [`image_info_tool`]. A `Bounded` delegate to a
+/// target whose risk profile differs from the caller's must rebuild exactly these
+/// against the target's own policy rather than reuse the caller's already-built
+/// instances — see `delegate.rs`'s `Bounded` branch. Kept in sync with the
+/// constructors by `filesystem_tool_names_match_constructed_tools` below.
+pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "glob_search",
+    "content_search",
+    "deliver_file",
+    "image_info",
+];
+
+/// The vision `image_info` tool, wrapped exactly like every other filesystem-boundary
+/// tool (`RateLimitedTool` + `PathGuardedTool`). Factored out of the big assembly
+/// function below so a `Bounded` delegate target can rebuild it against its own
+/// `SecurityPolicy` without duplicating the wrapper stack (see
+/// [`FILESYSTEM_TOOL_NAMES`]).
+pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
+    Box::new(RateLimitedTool::new(
+        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        security,
+    ))
+}
+
 pub fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
@@ -1266,10 +1296,7 @@ pub fn all_tools_with_runtime(
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(RateLimitedTool::new(
-        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
-        security.clone(),
-    )));
+    tool_arcs.push(Arc::from(image_info_tool(security.clone())));
 
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
@@ -3455,6 +3482,36 @@ const = true
         assert!(
             !tmp.path().join("new.txt").exists(),
             "file_write must not write anything on ephemeral"
+        );
+    }
+
+    /// `FILESYSTEM_TOOL_NAMES` drives which tools a Bounded delegate rebuilds against
+    /// the target's own `SecurityPolicy` (see delegate.rs). If it drifts from what
+    /// `default_tools_with_runtime`/`image_info_tool` actually construct,
+    /// that rebuild silently misses a filesystem-boundary tool - exactly the class of
+    /// bug this constant exists to prevent. Keep it in lockstep with the constructors.
+    #[test]
+    fn filesystem_tool_names_match_constructed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+
+        let mut tools = default_tools_with_runtime(security.clone(), runtime);
+        tools.push(image_info_tool(security));
+
+        let constructed: std::collections::BTreeSet<&str> =
+            tools.iter().map(|t| t.name()).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            FILESYSTEM_TOOL_NAMES.iter().copied().collect();
+
+        assert_eq!(
+            constructed, declared,
+            "FILESYSTEM_TOOL_NAMES is out of sync with the constructed filesystem-boundary \
+             tools — update the constant (or the constructors) so a Bounded delegate rebuild \
+             cannot silently miss one"
         );
     }
 
