@@ -420,14 +420,14 @@ pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
 /// too; `delegate.rs`'s `Bounded` branch currently only checks
 /// `FILESYSTEM_TOOL_NAMES`, so a target allowed one of these still falls
 /// through to the caller's `ToolArcRef`-wrapped instance. See each
-/// constructor site below for the exact captured field:
-/// `git_operations` (`mod.rs:811-814`, `GitOperationsTool` captures
-/// `workspace_dir`), `backup` (`mod.rs:1182-1186`, `BackupTool`),
-/// `data_management` (`mod.rs:1191-1194`, `DataManagementTool` — the most
-/// severe: its `purge` command deletes files), `linkedin`/`image_gen`
-/// (`mod.rs:1315-1332`), and the coding-CLI tools (`mod.rs:1234-1295`, each
-/// bound to `security` and a `coding_cli_executor` built from the caller's
-/// own `sandbox`). Kept in sync with the constructors by
+/// constructor function above for the exact captured field: `git_operations`,
+/// `backup`, `data_management` (the most severe: its `purge` command deletes
+/// files), `linkedin`, `image_gen`, `pushover` (reads credentials from
+/// `workspace_dir/.env`), `screenshot`, `file_upload`, `file_upload_bundle`,
+/// and `file_download` (all capture `workspace_dir`/`SecurityPolicy`
+/// directly), and the coding-CLI tools (each bound to `security` and a
+/// `coding_cli_executor` built from the caller's own `sandbox`). Kept in sync
+/// with the constructors by
 /// `workspace_bound_tool_names_beyond_default_are_actually_constructed`
 /// below.
 pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
@@ -436,6 +436,11 @@ pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
     "data_management",
     "linkedin",
     "image_gen",
+    "pushover",
+    "screenshot",
+    "file_upload",
+    "file_upload_bundle",
+    "file_download",
     "claude_code",
     "claude_code_runner",
     "codex_cli",
@@ -457,7 +462,7 @@ pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
 
 // ── Factories for WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT ─────────────────
 //
-// Each function below rebuilds exactly one of the 10 tools from
+// Each function below rebuilds exactly one of the tools from
 // `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`, gated the same way
 // `all_tools_with_runtime` gates it. Factored out (same principle as
 // `image_info_tool`/`build_sandboxed_shell_tool` above) so a `Bounded`
@@ -465,83 +470,96 @@ pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
 // construction code `all_tools_with_runtime` does, instead of a hand-rebuilt
 // copy that could silently drift from it.
 
-/// Rebuilds `git_operations` bound to `security`'s own workspace - unconditional
+/// Rebuilds `git_operations` bound to the given `workspace_dir` - unconditional
 /// in production (`all_tools_with_runtime` never gates it), so this always
-/// returns a tool.
-pub(crate) fn git_operations_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
-    let workspace_dir = security.workspace_dir.clone();
-    Arc::new(GitOperationsTool::new(security, workspace_dir))
+/// returns a tool. `workspace_dir` is passed explicitly (not read from
+/// `security.workspace_dir`) because in the normal (non-delegate) registry the
+/// two can differ - callers pass the shared data dir here, while
+/// `security.workspace_dir` is the per-agent workspace.
+pub(crate) fn git_operations_tool(
+    security: Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
+) -> Arc<dyn Tool> {
+    Arc::new(GitOperationsTool::new(
+        security,
+        workspace_dir.to_path_buf(),
+    ))
 }
 
-/// Rebuilds `backup` bound to `security`'s own workspace, gated like
+/// Rebuilds `backup` bound to the given `workspace_dir`, gated like
 /// `all_tools_with_runtime` gates it (`root_config.backup.enabled`, true by
-/// default). `None` when disabled.
+/// default). `None` when disabled. See [`git_operations_tool`] for why
+/// `workspace_dir` is a separate parameter rather than read from a policy.
 pub(crate) fn backup_tool(
-    security: &SecurityPolicy,
+    workspace_dir: &std::path::Path,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.backup.enabled {
         return None;
     }
     Some(Arc::new(BackupTool::new(
-        security.workspace_dir.clone(),
+        workspace_dir.to_path_buf(),
         root_config.backup.include_dirs.clone(),
         root_config.backup.max_keep,
     )))
 }
 
-/// Rebuilds `data_management` bound to `security`'s own workspace, gated like
+/// Rebuilds `data_management` bound to the given `workspace_dir`, gated like
 /// `all_tools_with_runtime` gates it (`root_config.data_retention.enabled`,
-/// false by default). `None` when disabled.
+/// false by default). `None` when disabled. See [`git_operations_tool`] for
+/// why `workspace_dir` is a separate parameter rather than read from a policy.
 pub(crate) fn data_management_tool(
-    security: &SecurityPolicy,
+    workspace_dir: &std::path::Path,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.data_retention.enabled {
         return None;
     }
     Some(Arc::new(DataManagementTool::new(
-        security.workspace_dir.clone(),
+        workspace_dir.to_path_buf(),
         root_config.data_retention.retention_days,
     )))
 }
 
-/// Rebuilds `linkedin` bound to `security`'s own workspace, gated like
+/// Rebuilds `linkedin` bound to the given `workspace_dir`, gated like
 /// `all_tools_with_runtime` gates it (`root_config.linkedin.enabled`). `None`
-/// when disabled.
+/// when disabled. See [`git_operations_tool`] for why `workspace_dir` is a
+/// separate parameter rather than read from `security.workspace_dir`.
 pub(crate) fn linkedin_tool(
     security: Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.linkedin.enabled {
         return None;
     }
-    let workspace_dir = security.workspace_dir.clone();
     Some(Arc::new(LinkedInTool::new(
         security,
-        workspace_dir,
+        workspace_dir.to_path_buf(),
         root_config.linkedin.api_version.clone(),
         root_config.linkedin.content.clone(),
         root_config.linkedin.image.clone(),
     )))
 }
 
-/// Rebuilds `image_gen` bound to `security`'s own workspace, gated like
+/// Rebuilds `image_gen` bound to the given `workspace_dir`, gated like
 /// `all_tools_with_runtime` gates it (`root_config.image_gen.enabled`). `None`
 /// when disabled OR when construction fails (logged, mirroring the
-/// production registration path).
+/// production registration path). See [`git_operations_tool`] for why
+/// `workspace_dir` is a separate parameter rather than read from
+/// `security.workspace_dir`.
 pub(crate) fn image_gen_tool(
     security: Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
     root_config: &zeroclaw_config::schema::Config,
     persistent_writes: bool,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.image_gen.enabled {
         return None;
     }
-    let workspace_dir = security.workspace_dir.clone();
     match ImageGenTool::new_with_persistence(
         security,
-        workspace_dir,
+        workspace_dir.to_path_buf(),
         root_config.image_gen.default_model.clone(),
         root_config.image_gen.api_key_env.clone(),
         persistent_writes,
@@ -559,6 +577,95 @@ pub(crate) fn image_gen_tool(
             None
         }
     }
+}
+
+/// Rebuilds `pushover` bound to the given `workspace_dir` - unconditional in
+/// production (`all_tools_with_runtime` never gates it), so this always
+/// returns a tool. `PushoverTool` reads `PUSHOVER_TOKEN`/`PUSHOVER_USER_KEY`
+/// from `workspace_dir/.env`, so a `Bounded` cross-profile target must get its
+/// own workspace here, not the caller's.
+pub(crate) fn pushover_tool(
+    security: Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
+) -> Arc<dyn Tool> {
+    Arc::new(PushoverTool::new(security, workspace_dir.to_path_buf()))
+}
+
+/// Rebuilds `screenshot` bound to `security` - unconditional in production
+/// (`all_tools_with_runtime` never gates it). `ScreenshotTool` writes its
+/// output under `security.workspace_dir`, so a `Bounded` cross-profile target
+/// must get a `security` bound to its own workspace here, not the caller's.
+pub(crate) fn screenshot_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
+    Arc::new(ScreenshotTool::new(security))
+}
+
+/// Rebuilds `file_upload` bound to `security`, gated like
+/// `all_tools_with_runtime` gates it (`root_config.file_upload.url` set and
+/// non-blank). `None` when disabled. `FileUploadTool` resolves its source
+/// file path through the captured `SecurityPolicy`, so a `Bounded`
+/// cross-profile target must get its own policy here, not the caller's.
+pub(crate) fn file_upload_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config
+        .file_upload
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        return None;
+    }
+    Some(Arc::new(FileUploadTool::new(
+        security,
+        root_config.file_upload.clone(),
+    )))
+}
+
+/// Rebuilds `file_upload_bundle` bound to `security`, gated like
+/// `all_tools_with_runtime` gates it (`root_config.file_upload_bundle.url` set
+/// and non-blank). `None` when disabled. See [`file_upload_tool`] for why
+/// `security` must be the target's own policy.
+pub(crate) fn file_upload_bundle_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config
+        .file_upload_bundle
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        return None;
+    }
+    Some(Arc::new(FileUploadBundleTool::new(
+        security,
+        root_config.file_upload_bundle.clone(),
+    )))
+}
+
+/// Rebuilds `file_download` bound to `security`, gated like
+/// `all_tools_with_runtime` gates it (`root_config.file_download.url` set and
+/// non-blank). `None` when disabled. See [`file_upload_tool`] for why
+/// `security` must be the target's own policy.
+pub(crate) fn file_download_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    persistent_writes: bool,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config
+        .file_download
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        return None;
+    }
+    Some(Arc::new(FileDownloadTool::new_with_persistence(
+        security,
+        root_config.file_download.clone(),
+        persistent_writes,
+    )))
 }
 
 /// Rebuilds `claude_code_runner` bound to `security`, gated like
@@ -1099,11 +1206,8 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        git_operations_tool(security.clone()),
-        Arc::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        git_operations_tool(security.clone(), workspace_dir),
+        pushover_tool(security.clone(), workspace_dir),
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
@@ -1466,12 +1570,12 @@ pub fn all_tools_with_runtime(
     }
 
     // Backup tool (enabled by default)
-    if let Some(tool) = backup_tool(security, root_config) {
+    if let Some(tool) = backup_tool(workspace_dir, root_config) {
         tool_arcs.push(tool);
     }
 
     // Data management tool (disabled by default)
-    if let Some(tool) = data_management_tool(security, root_config) {
+    if let Some(tool) = data_management_tool(workspace_dir, root_config) {
         tool_arcs.push(tool);
     }
 
@@ -1557,7 +1661,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Vision tools are always available
-    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
+    tool_arcs.push(screenshot_tool(security.clone()));
     tool_arcs.push(Arc::from(image_info_tool(security.clone())));
 
     if let Ok(backend) =
@@ -1573,53 +1677,33 @@ pub fn all_tools_with_runtime(
     }
 
     // LinkedIn integration (config-gated)
-    if let Some(tool) = linkedin_tool(security.clone(), root_config) {
+    if let Some(tool) = linkedin_tool(security.clone(), workspace_dir, root_config) {
         tool_arcs.push(tool);
     }
 
     // Standalone image generation tool (config-gated)
-    if let Some(tool) = image_gen_tool(security.clone(), root_config, persistent_writes) {
+    if let Some(tool) = image_gen_tool(
+        security.clone(),
+        workspace_dir,
+        root_config,
+        persistent_writes,
+    ) {
         tool_arcs.push(tool);
     }
 
     // File upload tool — enabled iff [file_upload].url is set
-    if root_config
-        .file_upload
-        .url
-        .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
-    {
-        tool_arcs.push(Arc::new(FileUploadTool::new(
-            security.clone(),
-            root_config.file_upload.clone(),
-        )));
+    if let Some(tool) = file_upload_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // File upload bundle tool — enabled iff [file_upload_bundle].url is set
-    if root_config
-        .file_upload_bundle
-        .url
-        .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
-    {
-        tool_arcs.push(Arc::new(FileUploadBundleTool::new(
-            security.clone(),
-            root_config.file_upload_bundle.clone(),
-        )));
+    if let Some(tool) = file_upload_bundle_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // File download tool — enabled iff [file_download].url is set
-    if root_config
-        .file_download
-        .url
-        .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
-    {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+    if let Some(tool) = file_download_tool(security.clone(), root_config, persistent_writes) {
+        tool_arcs.push(tool);
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -3785,6 +3869,9 @@ const = true
         cfg.codex_cli.enabled = true;
         cfg.gemini_cli.enabled = true;
         cfg.opencode_cli.enabled = true;
+        cfg.file_upload.url = Some("https://example.com/upload".into());
+        cfg.file_upload_bundle.url = Some("https://example.com/upload-bundle".into());
+        cfg.file_download.url = Some("https://example.com/download".into());
 
         let tools = all_tools_with_runtime(
             Arc::new(cfg.clone()),

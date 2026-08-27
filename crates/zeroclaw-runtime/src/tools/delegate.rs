@@ -2801,23 +2801,29 @@ impl DelegateTool {
                         "git_operations".to_string(),
                         Box::new(ToolArcRef::new(crate::tools::git_operations_tool(
                             Arc::clone(&target_policy),
+                            &target_policy.workspace_dir,
                         ))) as Box<dyn Tool>,
                     );
-                    if let Some(tool) = crate::tools::backup_tool(&target_policy, root_config) {
+                    if let Some(tool) =
+                        crate::tools::backup_tool(&target_policy.workspace_dir, root_config)
+                    {
                         target_workspace_bound_tools
                             .insert("backup".to_string(), Box::new(ToolArcRef::new(tool)));
                     }
-                    if let Some(tool) =
-                        crate::tools::data_management_tool(&target_policy, root_config)
-                    {
+                    if let Some(tool) = crate::tools::data_management_tool(
+                        &target_policy.workspace_dir,
+                        root_config,
+                    ) {
                         target_workspace_bound_tools.insert(
                             "data_management".to_string(),
                             Box::new(ToolArcRef::new(tool)),
                         );
                     }
-                    if let Some(tool) =
-                        crate::tools::linkedin_tool(Arc::clone(&target_policy), root_config)
-                    {
+                    if let Some(tool) = crate::tools::linkedin_tool(
+                        Arc::clone(&target_policy),
+                        &target_policy.workspace_dir,
+                        root_config,
+                    ) {
                         target_workspace_bound_tools
                             .insert("linkedin".to_string(), Box::new(ToolArcRef::new(tool)));
                     }
@@ -2830,11 +2836,50 @@ impl DelegateTool {
                             Box::new(ToolArcRef::new(tool)),
                         );
                     }
+                    target_workspace_bound_tools.insert(
+                        "pushover".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::pushover_tool(
+                            Arc::clone(&target_policy),
+                            &target_policy.workspace_dir,
+                        ))),
+                    );
+                    target_workspace_bound_tools.insert(
+                        "screenshot".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::screenshot_tool(Arc::clone(
+                            &target_policy,
+                        )))),
+                    );
+                    if let Some(tool) =
+                        crate::tools::file_upload_tool(Arc::clone(&target_policy), root_config)
+                    {
+                        target_workspace_bound_tools
+                            .insert("file_upload".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
+                    if let Some(tool) = crate::tools::file_upload_bundle_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ) {
+                        target_workspace_bound_tools.insert(
+                            "file_upload_bundle".to_string(),
+                            Box::new(ToolArcRef::new(tool)),
+                        );
+                    }
 
                     if let Some(runtime) = self.runtime.as_ref() {
                         let persistent_writes = runtime.has_filesystem_access();
+                        if let Some(tool) = crate::tools::file_download_tool(
+                            Arc::clone(&target_policy),
+                            root_config,
+                            persistent_writes,
+                        ) {
+                            target_workspace_bound_tools.insert(
+                                "file_download".to_string(),
+                                Box::new(ToolArcRef::new(tool)),
+                            );
+                        }
                         if let Some(tool) = crate::tools::image_gen_tool(
                             Arc::clone(&target_policy),
+                            &target_policy.workspace_dir,
                             root_config,
                             persistent_writes,
                         ) {
@@ -9393,6 +9438,64 @@ mod tests {
             "regression: a Bounded delegate's git_operations must run 'git status' \
              against the TARGET's own workspace (branch 'target-branch'), not the \
              caller's - got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_pushover_reads_credentials_from_target_workspace_not_callers() {
+        // Regression: `pushover` was absent from both `FILESYSTEM_TOOL_NAMES`
+        // and `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`, so a Bounded
+        // cross-profile target got the CALLER's `PushoverTool` instance
+        // (pushover.rs:17-22 bakes in `workspace_dir` at construction), and
+        // `get_credentials` (pushover.rs:44-58) always reads
+        // `self.workspace_dir.join(".env")` for PUSHOVER_TOKEN/PUSHOVER_USER_KEY.
+        //
+        // Neither workspace gets a `.env` file here on purpose: `get_credentials`
+        // fails and returns before any HTTP request is built, so this assertion
+        // is safe (no real network call to Pushover) whether the bug is present
+        // or fixed. The failure text embeds the exact `.env` path it tried to
+        // read (`pushover.rs:57`), which is enough to prove which workspace's
+        // credentials a bounded target would actually read from.
+        let fixture = bounded_delegate_full_fixture("pushover", |_cfg| {}).await;
+        std::fs::create_dir_all(&fixture.target_workspace).unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "pushover",
+            tool_args: serde_json::json!({ "message": "hello" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "send a notification",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        // The tool message this echoes is itself JSON-encoded (see
+        // `ToolExecutionOutcome`/the turn's tool-result envelope), so a
+        // Windows path's backslashes appear doubled (`\\`) inside `output`.
+        let json_escape = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
+        let caller_env = json_escape(&fixture.caller_workspace.join(".env"));
+        let target_env = json_escape(&fixture.target_workspace.join(".env"));
+        assert!(
+            !output.contains(&caller_env),
+            "regression: a Bounded delegate's pushover must NOT look for credentials \
+             in the CALLER's .env ({caller_env}) just because its tool instance was \
+             reused from parent_tools - got: {output}"
+        );
+        assert!(
+            output.contains(&target_env),
+            "regression: a Bounded delegate's pushover must look for credentials in \
+             the TARGET's own workspace's .env ({target_env}), not the caller's - \
+             got: {output}"
         );
     }
 
