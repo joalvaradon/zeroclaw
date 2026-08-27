@@ -8861,7 +8861,7 @@ mod tests {
         );
     }
 
-    // ── Follow-up regressions: maintainer-review findings on PR #10391 ──────
+    // ── Follow-up regressions: maintainer-review findings on this PR ────────
     //
     // The two tests above only prove WHERE a rebuilt tool's effect lands.
     // They do not prove the rebuilt `ShellTool` keeps the target's own OS
@@ -9443,7 +9443,8 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_data_management_purge_does_not_delete_callers_files() {
-        // Regression (most severe variant of #9872): `data_management` is not
+        // Regression (most severe variant of the bounded cross-profile workspace
+        // boundary bug): `data_management` is not
         // in `FILESYSTEM_TOOL_NAMES` either, and unlike file_write/backup this
         // tool is DESTRUCTIVE - `cmd_purge` (data_management.rs:41-59) calls
         // `fs::remove_file` (data_management.rs:205) against
