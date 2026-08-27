@@ -717,6 +717,49 @@ impl DelegateTool {
         ]
     }
 
+    /// Rebuilds a `Bounded` delegate target's shell tool with the target's
+    /// OWN OS sandbox and shell timeout, instead of the `NoopSandbox`
+    /// `default_tools_with_runtime` always builds (that factory is also used
+    /// by several sandbox-free SOP/automation registries, so it cannot become
+    /// sandbox-aware itself). Resolves sandbox/timeout the same way
+    /// `all_tools_with_runtime` does for a fresh registry
+    /// (`crate::tools::build_sandboxed_shell_tool`), just starting from a
+    /// `SecurityPolicy` (all a `Bounded` target has) instead of a
+    /// `RiskProfileConfig`.
+    ///
+    /// Returns `None` only when this `DelegateTool` has no `root_config`
+    /// snapshot to resolve `runtime_kind`/the global shell timeout from. Per
+    /// `policy_for_target` above, `root_config` being absent is the ONLY way
+    /// `target_policy` can be produced without going through the
+    /// root_config-requiring resolution path at all - in that case
+    /// `target_policy` is literally `Arc::clone(&self.security)` (the exact
+    /// same policy object as the caller's), so there is no real cross-profile
+    /// privilege boundary being crossed here and the plain shell
+    /// `default_tools_with_runtime` already built is safe to leave as-is.
+    /// Production always sets `root_config` alongside `runtime`
+    /// (`tools/mod.rs`) whenever a genuine cross-profile `target_policy` is
+    /// reachable, so this `None` case is test-construction-only.
+    fn rebuild_target_shell_tool(
+        &self,
+        target_policy: Arc<SecurityPolicy>,
+        runtime: Arc<dyn crate::platform::RuntimeAdapter>,
+    ) -> Option<crate::tools::ShellTool> {
+        let root_config = self.root_config.as_ref()?;
+        let runtime_kind = root_config.runtime.kind.as_wire();
+        let sandbox_cfg = target_policy.sandbox_config();
+        let sandbox = crate::security::create_sandbox(
+            &sandbox_cfg,
+            runtime_kind,
+            Some(&target_policy.workspace_dir),
+        );
+        Some(crate::tools::build_sandboxed_shell_tool(
+            target_policy,
+            runtime,
+            sandbox,
+            root_config.shell_tool.timeout_secs,
+        ))
+    }
+
     pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
@@ -2706,16 +2749,185 @@ impl DelegateTool {
                     };
                     let mut tools = crate::tools::default_tools_with_runtime(
                         Arc::clone(&target_policy),
-                        runtime,
+                        runtime.clone(),
                     );
-                    tools.push(crate::tools::image_info_tool(target_policy));
-                    tools
+                    tools.push(crate::tools::image_info_tool(Arc::clone(&target_policy)));
+                    let mut tools: HashMap<String, Box<dyn Tool>> = tools
                         .into_iter()
                         .map(|tool| (tool.name().to_string(), tool))
-                        .collect()
+                        .collect();
+                    // The shell entry `default_tools_with_runtime` just built carries
+                    // `NoopSandbox` unconditionally (that factory also backs several
+                    // sandbox-free SOP/automation registries, so it can't become
+                    // sandbox-aware itself) - swap it for one rebuilt with the target's
+                    // own configured OS sandbox and shell-timeout contract.
+                    if let Some(shell) =
+                        self.rebuild_target_shell_tool(Arc::clone(&target_policy), runtime)
+                    {
+                        tools.insert(
+                            "shell".to_string(),
+                            Box::new(crate::tools::RateLimitedTool::new(
+                                shell,
+                                Arc::clone(&target_policy),
+                            )) as Box<dyn Tool>,
+                        );
+                    }
+                    tools
                 } else {
                     HashMap::new()
                 };
+
+                // Tools that bind `workspace_dir`/`SecurityPolicy` state at construction
+                // time the exact same way as the filesystem tools above, but are only
+                // built by `all_tools_with_runtime` (config-gated, several disabled by
+                // default) - see `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`. Rebuilt via
+                // the SAME per-tool factories `all_tools_with_runtime` calls
+                // (`crate::tools::git_operations_tool`, `backup_tool`, ...), so this can't
+                // drift from the real construction path either.
+                let needs_workspace_bound_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && crate::tools::WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT
+                                .contains(&tool.name())
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
+                let mut target_workspace_bound_tools: HashMap<String, Box<dyn Tool>> =
+                    HashMap::new();
+                if needs_workspace_bound_tools && let Some(root_config) = self.root_config.as_ref()
+                {
+                    target_workspace_bound_tools.insert(
+                        "git_operations".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::git_operations_tool(
+                            Arc::clone(&target_policy),
+                        ))) as Box<dyn Tool>,
+                    );
+                    if let Some(tool) = crate::tools::backup_tool(&target_policy, root_config) {
+                        target_workspace_bound_tools
+                            .insert("backup".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
+                    if let Some(tool) =
+                        crate::tools::data_management_tool(&target_policy, root_config)
+                    {
+                        target_workspace_bound_tools.insert(
+                            "data_management".to_string(),
+                            Box::new(ToolArcRef::new(tool)),
+                        );
+                    }
+                    if let Some(tool) =
+                        crate::tools::linkedin_tool(Arc::clone(&target_policy), root_config)
+                    {
+                        target_workspace_bound_tools
+                            .insert("linkedin".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
+                    if let Some(tool) = crate::tools::claude_code_runner_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ) {
+                        target_workspace_bound_tools.insert(
+                            "claude_code_runner".to_string(),
+                            Box::new(ToolArcRef::new(tool)),
+                        );
+                    }
+
+                    if let Some(runtime) = self.runtime.as_ref() {
+                        let persistent_writes = runtime.has_filesystem_access();
+                        if let Some(tool) = crate::tools::image_gen_tool(
+                            Arc::clone(&target_policy),
+                            root_config,
+                            persistent_writes,
+                        ) {
+                            target_workspace_bound_tools
+                                .insert("image_gen".to_string(), Box::new(ToolArcRef::new(tool)));
+                        }
+
+                        let register_coding_cli_tools =
+                            runtime.has_shell_access() && persistent_writes;
+                        let needs_shared_coding_cli_executor = {
+                            let parent_tools = self.parent_tools.read();
+                            ["claude_code", "codex_cli", "gemini_cli", "opencode_cli"]
+                                .iter()
+                                .any(|name| {
+                                    parent_tools.iter().any(|tool| {
+                                        tool.name() == *name
+                                            && self.security.is_tool_allowed(tool.name())
+                                            && Self::delegate_admits_with_mcp(
+                                                &tool_policy,
+                                                tool.name(),
+                                            )
+                                    })
+                                })
+                        };
+                        if needs_shared_coding_cli_executor {
+                            // Same sandbox-resolution recipe as `rebuild_target_shell_tool`.
+                            // Resolved independently here rather than sharing that call's
+                            // result: both are cheap, pure, deterministic computations from
+                            // the same `target_policy`, so a second call cannot diverge from
+                            // the first - reusing one object would only save a little work,
+                            // not add any correctness guarantee.
+                            let runtime_kind = root_config.runtime.kind.as_wire();
+                            let sandbox_cfg = target_policy.sandbox_config();
+                            let sandbox = crate::security::create_sandbox(
+                                &sandbox_cfg,
+                                runtime_kind,
+                                Some(&target_policy.workspace_dir),
+                            );
+                            let executor =
+                                crate::tools::coding_cli_executor::RuntimeCodingCliExecutor::shared(
+                                    Arc::clone(runtime),
+                                    sandbox,
+                                    root_config.runtime.kind
+                                        == zeroclaw_config::schema::RuntimeKind::Native,
+                                );
+
+                            if let Some(tool) = crate::tools::claude_code_tool(
+                                Arc::clone(&target_policy),
+                                root_config,
+                                register_coding_cli_tools,
+                                &executor,
+                            ) {
+                                target_workspace_bound_tools.insert(
+                                    "claude_code".to_string(),
+                                    Box::new(ToolArcRef::new(tool)),
+                                );
+                            }
+                            if let Some(tool) = crate::tools::codex_cli_tool(
+                                Arc::clone(&target_policy),
+                                root_config,
+                                register_coding_cli_tools,
+                                &executor,
+                            ) {
+                                target_workspace_bound_tools.insert(
+                                    "codex_cli".to_string(),
+                                    Box::new(ToolArcRef::new(tool)),
+                                );
+                            }
+                            if let Some(tool) = crate::tools::gemini_cli_tool(
+                                Arc::clone(&target_policy),
+                                root_config,
+                                register_coding_cli_tools,
+                                &executor,
+                            ) {
+                                target_workspace_bound_tools.insert(
+                                    "gemini_cli".to_string(),
+                                    Box::new(ToolArcRef::new(tool)),
+                                );
+                            }
+                            if let Some(tool) = crate::tools::opencode_cli_tool(
+                                Arc::clone(&target_policy),
+                                root_config,
+                                register_coding_cli_tools,
+                                &executor,
+                            ) {
+                                target_workspace_bound_tools.insert(
+                                    "opencode_cli".to_string(),
+                                    Box::new(ToolArcRef::new(tool)),
+                                );
+                            }
+                        }
+                    }
+                }
 
                 let parent_tools = self.parent_tools.read();
                 parent_tools
@@ -2727,6 +2939,7 @@ impl DelegateTool {
                         target_memory_tools
                             .remove(tool.name())
                             .or_else(|| target_fs_tools.remove(tool.name()))
+                            .or_else(|| target_workspace_bound_tools.remove(tool.name()))
                             .unwrap_or_else(|| {
                                 Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
                             })
@@ -8291,6 +8504,19 @@ mod tests {
         tool_name: &str,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> BoundedDelegateFsFixture {
+        bounded_delegate_fs_fixture_with_config(tool_name, runtime, |_| {}).await
+    }
+
+    /// Same as [`bounded_delegate_fs_fixture`], but lets the caller tweak the
+    /// assembled `Config` before it's frozen into an `Arc` (e.g. to set the
+    /// target's `sandbox_backend`/`sandbox_enabled` on its `"research"` risk
+    /// profile) - mirrors the `configure` closure already used by
+    /// `bounded_delegate_full_fixture` below.
+    async fn bounded_delegate_fs_fixture_with_config(
+        tool_name: &str,
+        runtime: Arc<dyn RuntimeAdapter>,
+        configure: impl FnOnce(&mut Config),
+    ) -> BoundedDelegateFsFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let tmp = TempDir::new().unwrap();
@@ -8362,6 +8588,7 @@ mod tests {
             "test precondition: caller session cwd must differ from the target's configured workspace"
         );
 
+        configure(&mut config);
         let config = Arc::new(config);
 
         let mut caller_policy = SecurityPolicy::for_agent(&config, "executive_assistant")
@@ -8631,6 +8858,863 @@ mod tests {
             "regression for #9872: a Bounded delegate's shell command must execute with the \
              TARGET's own configured workspace ({}) as its cwd, not the caller's",
             fixture.target_workspace.display()
+        );
+    }
+
+    // ── Follow-up regressions: maintainer-review findings on PR #10391 ──────
+    //
+    // The two tests above only prove WHERE a rebuilt tool's effect lands.
+    // They do not prove the rebuilt `ShellTool` keeps the target's own OS
+    // sandbox (it doesn't - `default_tools_with_runtime`, tools/mod.rs:300-349,
+    // always builds `ShellTool::new`, which hardcodes `NoopSandbox`,
+    // shell.rs:103-113), and `FILESYSTEM_TOOL_NAMES` only covers the 8 tools
+    // that factory builds - `git_operations`, `backup`, and `data_management`
+    // (among others) capture `workspace_dir` the exact same way but are not on
+    // that list, so they still fall through to the caller's `ToolArcRef`
+    // fallback (delegate.rs:2720-2732).
+
+    /// Minimal `DelegateTool` wired with a `root_config`, enough to exercise
+    /// `rebuild_target_shell_tool` directly - the SAME method the `Bounded`
+    /// branch of `execute_agentic` calls, so these tests prove the actual
+    /// wiring (not a hand-rebuilt approximation of it), without needing a
+    /// full caller/target/model-provider fixture.
+    fn delegate_tool_for_shell_rebuild_tests(shell_timeout_secs: u64) -> DelegateTool {
+        let mut root_config = zeroclaw_config::schema::Config::default();
+        root_config.shell_tool.timeout_secs = shell_timeout_secs;
+        DelegateTool::new(HashMap::new(), None, test_security())
+            .with_root_config(Arc::new(root_config))
+    }
+
+    #[test]
+    fn bounded_delegate_shell_loses_targets_configured_sandbox() {
+        // Regression: a Bounded delegate target explicitly configured with
+        // `sandbox_backend = "docker"` must keep that OS-level sandbox when
+        // its shell tool is rebuilt for a cross-profile delegation via
+        // `DelegateTool::rebuild_target_shell_tool` - today it silently gets
+        // `NoopSandbox` instead, because `default_tools_with_runtime` never
+        // reads `SecurityPolicy.sandbox_backend`/`sandbox_enabled` at all.
+        //
+        // The oracle (`sandbox_posture`) is queried first and the test skips
+        // itself when Docker isn't available in this environment, rather than
+        // asserting against a specific backend name that only a real,
+        // installed sandbox can produce - mirrors why the project's own
+        // Landlock coverage lives in a separate, environment-gated CI job
+        // (`Test (Landlock)`) instead of the default `cargo test` run.
+        let tmp = TempDir::new().unwrap();
+        let target_policy = Arc::new(SecurityPolicy {
+            sandbox_backend: Some("docker".to_string()),
+            sandbox_enabled: Some(true),
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+
+        let posture = crate::security::detect::sandbox_posture(
+            &target_policy.sandbox_config(),
+            "native",
+            Some(&target_policy.workspace_dir),
+        );
+        if posture.active_backend == "none" {
+            eprintln!(
+                "skipping bounded_delegate_shell_loses_targets_configured_sandbox: \
+                 no Docker available in this environment (`docker --version` failed) - \
+                 this regression is only observable where at least one real sandbox \
+                 backend is installed"
+            );
+            return;
+        }
+
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+        let delegate = delegate_tool_for_shell_rebuild_tests(60);
+        let actual = delegate
+            .rebuild_target_shell_tool(Arc::clone(&target_policy), runtime)
+            .expect("rebuild_target_shell_tool should succeed with a root_config configured")
+            .sandbox_name()
+            .to_string();
+
+        assert_eq!(
+            actual, posture.active_backend,
+            "regression: a Bounded delegate target's own configured OS sandbox \
+             ({}) must be attached to its rebuilt shell tool by \
+             DelegateTool::rebuild_target_shell_tool, not silently replaced with NoopSandbox",
+            posture.active_backend
+        );
+    }
+
+    #[test]
+    fn bounded_delegate_shell_explicit_sandbox_disable_still_resolves_to_noop() {
+        // Control case for the test above: an explicitly DISABLED sandbox
+        // must keep resolving to NoopSandbox once the sandbox-resolution fix
+        // lands too - this must never start failing as a side effect of
+        // fixing the regression above.
+        let tmp = TempDir::new().unwrap();
+        let target_policy = Arc::new(SecurityPolicy {
+            sandbox_backend: Some("docker".to_string()),
+            sandbox_enabled: Some(false),
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+        let delegate = delegate_tool_for_shell_rebuild_tests(60);
+        let actual = delegate
+            .rebuild_target_shell_tool(Arc::clone(&target_policy), runtime)
+            .expect("rebuild_target_shell_tool should succeed with a root_config configured")
+            .sandbox_name()
+            .to_string();
+        assert_eq!(
+            actual, "none",
+            "sandbox_enabled = Some(false) must always resolve to NoopSandbox"
+        );
+    }
+
+    #[test]
+    fn bounded_delegate_shell_zero_timeout_does_not_inherit_global_default() {
+        // Regression (Warning-level finding): production resolves
+        // `shell_timeout_secs == 0` to `root_config.shell_tool.timeout_secs`
+        // (tools/mod.rs) - the documented "0 means inherit the global
+        // timeout" contract (zeroclaw-config/src/schema.rs). A target's
+        // rebuilt shell tool must honor the same contract via
+        // `DelegateTool::rebuild_target_shell_tool`; today it doesn't,
+        // because `ShellTool::new` (via `default_tools_with_runtime`) takes
+        // `security.shell_timeout_secs` verbatim (shell.rs).
+        let tmp = TempDir::new().unwrap();
+        let target_policy = Arc::new(SecurityPolicy {
+            shell_timeout_secs: 0,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+        let delegate = delegate_tool_for_shell_rebuild_tests(42);
+        let timeout = delegate
+            .rebuild_target_shell_tool(Arc::clone(&target_policy), runtime)
+            .expect("rebuild_target_shell_tool should succeed with a root_config configured")
+            .timeout_secs();
+
+        assert_eq!(
+            timeout, 42,
+            "regression: a Bounded delegate target whose shell_timeout_secs is 0 must \
+             inherit the root_config's global default timeout (42), not literally run \
+             with a 0-second timeout"
+        );
+    }
+
+    struct BoundedSingleToolCallThenFinalModelProvider {
+        tool_name: &'static str,
+        tool_args: serde_json::Value,
+    }
+
+    #[async_trait]
+    impl ModelProvider for BoundedSingleToolCallThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages: Vec<&str> = request
+                .messages
+                .iter()
+                .filter(|m| m.role == "tool")
+                .map(|m| m.content.as_str())
+                .collect();
+            if tool_messages.is_empty() {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: self.tool_name.to_string(),
+                        arguments: self.tool_args.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                // Echo the tool's ACTUAL result content back as the final text
+                // (prefixed with plain prose - a raw JSON-shaped final message
+                // trips the turn's own tool-call-envelope safety net, which
+                // replaces it with a generic "internal tool-call format error"
+                // notice), so tests can assert on what the tool itself
+                // reported rather than on the overall turn's success (which
+                // this mock always drives to completion regardless of the
+                // tool's actual outcome).
+                Ok(ChatResponse {
+                    text: Some(format!("Tool reported: {}", tool_messages.join(" | "))),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BoundedSingleToolCallThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "BoundedSingleToolCallThenFinalModelProvider"
+        }
+    }
+
+    /// Real regression test: proves `DelegateTool::execute_agentic`'s `Bounded`
+    /// branch actually attaches the target's OWN configured OS sandbox to its
+    /// rebuilt shell tool through the real path - not just that
+    /// `rebuild_target_shell_tool` CAN produce a sandboxed tool in isolation
+    /// (the 3 tests above this fixture's definitions). That distinction
+    /// matters: a policy-only assertion already turned out insufficient once
+    /// in this same issue, per the maintainer's own review.
+    ///
+    /// Docker's real sandbox bind-mounts the target workspace READ-ONLY
+    /// (`security/docker.rs`'s `wrap_command`, `-v ...:ro`) and replaces the
+    /// entire command (including the host's native shell-dialect wrapper)
+    /// with `docker run ... <image> <original argv>`. So once the sandbox is
+    /// genuinely attached through this real `execute_agentic` path, a shell
+    /// command that writes inside its own workspace must fail - on Linux this
+    /// is the read-only mount rejecting the write; on a non-Linux host it can
+    /// instead be the native dialect wrapper (e.g. `cmd.exe`) not existing
+    /// inside the Linux container image. Either way the file must never be
+    /// created, unlike today's bug (`NoopSandbox`), where the write succeeds.
+    #[tokio::test]
+    async fn bounded_delegate_shell_command_uses_targets_configured_sandbox() {
+        let probe_tmp = TempDir::new().unwrap();
+        let posture = crate::security::detect::sandbox_posture(
+            &zeroclaw_config::schema::SandboxConfig {
+                enabled: Some(true),
+                backend: zeroclaw_config::schema::SandboxBackend::Docker,
+                firejail_args: vec![],
+            },
+            "native",
+            Some(probe_tmp.path()),
+        );
+        if posture.active_backend != "docker" {
+            eprintln!(
+                "skipping bounded_delegate_shell_command_uses_targets_configured_sandbox: \
+                 no Docker available in this environment (`docker --version` failed) - this \
+                 regression is only observable where Docker is installed"
+            );
+            return;
+        }
+
+        let fixture = bounded_delegate_fs_fixture_with_config(
+            "shell",
+            Arc::new(crate::platform::NativeRuntime::new()),
+            |config| {
+                let research = config
+                    .risk_profiles
+                    .get_mut("research")
+                    .expect("fixture always registers a 'research' risk profile");
+                research.sandbox_backend = Some("docker".to_string());
+                research.sandbox_enabled = Some(true);
+            },
+        )
+        .await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "shell",
+            tool_args: serde_json::json!({
+                "command": "echo written-by-bounded-shell-target > shell_proof.txt",
+                "approved": true
+            }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "run a proof command",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "the bounded delegate turn itself must still complete (this mock always drives \
+             it to completion regardless of the tool's own outcome): {result:?}"
+        );
+        assert!(
+            !fixture.target_workspace.join("shell_proof.txt").exists(),
+            "regression: with the target's OWN configured Docker sandbox genuinely attached \
+             through execute_agentic's Bounded branch, a shell write inside its workspace \
+             must fail (read-only mount, or a dialect mismatch inside the container) - today \
+             the rebuilt shell tool silently gets NoopSandbox instead, so the write succeeds \
+             and the file lands at {}",
+            fixture.target_workspace.join("shell_proof.txt").display()
+        );
+    }
+
+    /// Same shape as `bounded_delegate_fs_fixture`, but assembles the
+    /// caller's `parent_tools` through the FULL production registry
+    /// (`all_tools_with_runtime`) instead of the smaller
+    /// `default_tools_with_runtime`, so tools outside `FILESYSTEM_TOOL_NAMES`
+    /// (`git_operations`, `backup`, `data_management`, ...) are present too -
+    /// exactly like a real caller turn with those features enabled.
+    /// `configure` lets each test flip config flags (e.g.
+    /// `data_retention.enabled`) before the registry is built.
+    async fn bounded_delegate_full_fixture(
+        tool_name: &str,
+        configure: impl FnOnce(&mut Config),
+    ) -> BoundedDelegateFsFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-session-cwd");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "balanced".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![tool_name.to_string(), "delegate".to_string()],
+                allowed_commands: vec!["*".to_string()],
+                block_high_risk_commands: false,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "research".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec![tool_name.to_string()],
+                allowed_commands: vec!["*".to_string()],
+                block_high_risk_commands: false,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "fs_agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "executive_assistant".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "balanced".into(),
+                runtime_profile: "fs_agentic_test".into(),
+                model_provider: "ollama.executive_assistant".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "fs_researcher".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            risk_profile: "research".into(),
+            runtime_profile: "fs_agentic_test".into(),
+            model_provider: "ollama.fs_researcher".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config
+            .agents
+            .insert("fs_researcher".to_string(), target_config.clone());
+
+        configure(&mut config);
+
+        let target_workspace = config.agent_workspace_dir("fs_researcher");
+        assert_ne!(
+            caller_workspace, target_workspace,
+            "test precondition: caller session cwd must differ from the target's configured workspace"
+        );
+
+        let config = Arc::new(config);
+
+        let mut caller_policy = SecurityPolicy::for_agent(&config, "executive_assistant")
+            .expect("caller policy resolves");
+        caller_policy.workspace_dir = caller_workspace.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(crate::platform::NativeRuntime::new());
+        let memory: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("bounded-full-fixture", &config.data_dir).unwrap());
+        let caller_risk_profile = config
+            .risk_profiles
+            .get("balanced")
+            .expect("balanced profile inserted above")
+            .clone();
+        let browser = zeroclaw_config::schema::BrowserConfig {
+            enabled: false,
+            ..zeroclaw_config::schema::BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+
+        // Build via the SAME factory production uses for a caller's full
+        // registry (`all_tools_with_runtime`), so this fixture cannot
+        // silently drift from what a real caller turn actually assembles.
+        let caller_tool_registry = crate::tools::all_tools_with_runtime(
+            Arc::clone(&config),
+            &caller_policy,
+            &caller_risk_profile,
+            "executive_assistant",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &browser,
+            &http,
+            &web_fetch,
+            &caller_workspace,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let real_tool = caller_tool_registry
+            .into_iter()
+            .find(|t| t.name() == tool_name)
+            .unwrap_or_else(|| panic!("all_tools_with_runtime did not register '{tool_name}'"));
+        let parent_tools: Vec<Arc<dyn Tool>> = vec![Arc::from(real_tool)];
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_workspace_dir(caller_workspace.clone())
+            .with_parent_tools(Arc::new(RwLock::new(parent_tools)))
+            .with_runtime(runtime)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_caller_alias("executive_assistant");
+
+        BoundedDelegateFsFixture {
+            _tmp: tmp,
+            tool,
+            target_config,
+            caller_workspace,
+            target_workspace,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_git_operations_operates_in_target_workspace_not_callers() {
+        // Regression: `git_operations` is not in `FILESYSTEM_TOOL_NAMES`
+        // (tools/mod.rs:358-367), so the Bounded rebuild's fallback
+        // (delegate.rs:2720-2732) hands the target the CALLER's already-built
+        // `GitOperationsTool` instance (git_operations.rs:11-20 bakes in
+        // `workspace_dir` at construction) instead of one bound to the
+        // target's own workspace.
+        let fixture = bounded_delegate_full_fixture("git_operations", |_cfg| {}).await;
+
+        // Unlike the caller's session cwd (created explicitly by the
+        // fixture), a target's configured workspace is only ever created
+        // lazily by real filesystem tools - `git init` needs the directory to
+        // already exist.
+        std::fs::create_dir_all(&fixture.target_workspace).unwrap();
+
+        // Both workspaces get a valid repo (an uninitialized target would make
+        // `git status` error out through `Tool::execute()`'s `Err` path,
+        // which the agentic loop's own max-iterations safety net handles
+        // very differently from a plain `ToolResult{success:false}` - a
+        // distinct, real finding, but not what this test is about). Each
+        // repo gets its OWN branch name, so the reported branch tells us
+        // which workspace `git_operations` actually read from.
+        for (dir, branch) in [
+            (&fixture.caller_workspace, "caller-branch"),
+            (&fixture.target_workspace, "target-branch"),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(["init", "-q", "-b", branch])
+                .current_dir(dir)
+                .status()
+                .expect("git must be available to run this test");
+            assert!(status.success(), "git init failed in {}", dir.display());
+        }
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "git_operations",
+            tool_args: serde_json::json!({ "operation": "status" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "check status",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        assert!(
+            !output.contains("caller-branch"),
+            "regression: a Bounded delegate's git_operations must NOT report the \
+             CALLER's branch ('caller-branch') just because its tool instance was \
+             reused from parent_tools - got: {output}"
+        );
+        assert!(
+            output.contains("target-branch"),
+            "regression: a Bounded delegate's git_operations must run 'git status' \
+             against the TARGET's own workspace (branch 'target-branch'), not the \
+             caller's - got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_backup_creates_archive_in_target_workspace_not_callers() {
+        // Regression: `backup` is not in `FILESYSTEM_TOOL_NAMES` either, so a
+        // Bounded cross-profile target gets the CALLER's `BackupTool`
+        // instance (tools/mod.rs:1182-1186 bakes in `workspace_dir` at
+        // construction), and `cmd_create` (backup_tool.rs:30-62) always
+        // archives into `self.workspace_dir.join("backups")`.
+        let fixture = bounded_delegate_full_fixture("backup", |_cfg| {}).await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "backup",
+            tool_args: serde_json::json!({ "command": "create" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "create a backup",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "bounded backup delegate failed: {result:?}");
+
+        assert!(
+            !fixture.caller_workspace.join("backups").exists(),
+            "regression: a Bounded delegate's backup must NOT create its archive \
+             under the caller's session workspace ({}) just because its tool \
+             instance was reused from parent_tools",
+            fixture.caller_workspace.display()
+        );
+        assert!(
+            fixture.target_workspace.join("backups").exists(),
+            "regression: a Bounded delegate's backup must create its archive \
+             under the TARGET's own configured workspace ({}), not the caller's",
+            fixture.target_workspace.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_data_management_purge_does_not_delete_callers_files() {
+        // Regression (most severe variant of #9872): `data_management` is not
+        // in `FILESYSTEM_TOOL_NAMES` either, and unlike file_write/backup this
+        // tool is DESTRUCTIVE - `cmd_purge` (data_management.rs:41-59) calls
+        // `fs::remove_file` (data_management.rs:205) against
+        // `self.workspace_dir`. A Bounded cross-profile target reusing the
+        // caller's instance can delete files from the CALLER's workspace.
+        let fixture = bounded_delegate_full_fixture("data_management", |cfg| {
+            cfg.data_retention.enabled = true;
+            cfg.data_retention.retention_days = 0;
+        })
+        .await;
+
+        let canary = fixture.caller_workspace.join("do_not_delete.txt");
+        tokio::fs::write(&canary, b"caller data").await.unwrap();
+        // Guarantee the canary's mtime second is strictly before the purge
+        // cutoff (`retention_days = 0` makes the cutoff "now", truncated to
+        // whole seconds) instead of racing the clock.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "data_management",
+            tool_args: serde_json::json!({ "command": "purge", "dry_run": false }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "purge old data",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bounded data_management delegate failed: {result:?}"
+        );
+
+        assert!(
+            canary.exists(),
+            "CRITICAL regression: a Bounded delegate's data_management purge must \
+             NEVER delete files from the caller's workspace ({}) just because its \
+             tool instance was reused from parent_tools - this is a destructive \
+             variant of #9872, not just a read/write leak",
+            fixture.caller_workspace.display()
+        );
+    }
+
+    /// Test double for `zeroclaw_tools::coding_cli::CodingCliExecutor` used ONLY by
+    /// `bounded_delegate_claude_code_...` below. `claude_code` (like the other
+    /// coding-CLI tools) shells out to a real external binary via this trait -
+    /// unlike `git_operations`/`backup`/`data_management` above, a real executor
+    /// (`DirectCodingCliExecutor`/`RuntimeCodingCliExecutor`) would risk actually
+    /// invoking a real `claude`/`codex`/`gemini`/`opencode` process once the
+    /// containment check below passes. This fake just records the working
+    /// directory it was asked to run in and returns a canned success - it never
+    /// spawns anything, so this test stays safe both BEFORE and AFTER the
+    /// Bloqueante 2 fix lands (before: the containment check rejects the call and
+    /// this executor is never even reached; after: it's reached, but is inert).
+    #[derive(Default)]
+    struct FakeCodingCliExecutor {
+        received_working_dir: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_tools::coding_cli::CodingCliExecutor for FakeCodingCliExecutor {
+        async fn output(
+            &self,
+            command: zeroclaw_tools::coding_cli::CodingCliCommand,
+        ) -> Result<std::process::Output, zeroclaw_tools::coding_cli::CodingCliExecutionError>
+        {
+            *self.received_working_dir.lock().unwrap() = Some(command.working_dir);
+            Ok(fake_success_process_output())
+        }
+    }
+
+    fn fake_success_process_output() -> std::process::Output {
+        std::process::Output {
+            status: fake_success_exit_status(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn fake_success_exit_status() -> std::process::ExitStatus {
+        std::os::windows::process::ExitStatusExt::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn fake_success_exit_status() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(0)
+    }
+
+    /// Real regression test for the coding-CLI class of the Bloqueante 2 gap,
+    /// exercised through the real `DelegateTool::execute_agentic` Bounded branch -
+    /// but with `parent_tools` built by hand (the ONE deliberate exception to
+    /// "always build via the real factory" in this file) so a `FakeCodingCliExecutor`
+    /// can be injected instead of the real one `all_tools_with_runtime` would wire in.
+    ///
+    /// SAFETY-CRITICAL DESIGN NOTE - do not "simplify" this back to asserting a
+    /// TARGET-valid `working_directory` gets ACCEPTED: an earlier version of this
+    /// test did exactly that, and once the fix correctly rebuilds `claude_code`
+    /// against `target_policy`, containment passes and execution proceeds past the
+    /// injected fake straight into a BRAND NEW, REAL `RuntimeCodingCliExecutor`
+    /// (the reconstruction never reuses the caller's original executor, fake or
+    /// not - see `crate::tools::claude_code_tool`). That earlier version very
+    /// likely spawned the real `claude` CLI installed on the dev machine via
+    /// `which::which("claude")` (`zeroclaw-tools/src/coding_cli.rs`). This version
+    /// instead asserts the OPPOSITE direction: a `working_directory` valid only
+    /// under the CALLER's own workspace must be REJECTED. That is safe in BOTH
+    /// possible code states - if this regression were ever reintroduced, the
+    /// reused caller instance (wrapping THIS test's fake executor) would accept
+    /// the path and hit the fake, not a real process; with the fix in place, the
+    /// path is rejected before any executor - real or fake - is ever reached. The
+    /// assertion on `fake_executor.received_working_dir` staying `None` is the
+    /// direct proof no executor path was reached either way.
+    #[tokio::test]
+    async fn bounded_delegate_claude_code_working_directory_is_scoped_to_target_workspace_not_callers()
+     {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-session-cwd");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // Production only ever puts `claude_code` in a caller's `parent_tools` when
+        // this is enabled (`all_tools_with_runtime` gates it) - the reconstruction
+        // path being tested gates on the SAME flag, so leaving it unset here would
+        // make `claude_code_tool()` return `None` and silently fall through to the
+        // pre-fix `ToolArcRef` fallback, which is not what this test means to probe.
+        config.claude_code.enabled = true;
+        config.risk_profiles.insert(
+            "balanced".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["claude_code".to_string(), "delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "research".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["claude_code".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "fs_agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "executive_assistant".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "balanced".into(),
+                runtime_profile: "fs_agentic_test".into(),
+                model_provider: "ollama.executive_assistant".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "fs_researcher".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            risk_profile: "research".into(),
+            runtime_profile: "fs_agentic_test".into(),
+            model_provider: "ollama.fs_researcher".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config
+            .agents
+            .insert("fs_researcher".to_string(), target_config.clone());
+
+        let target_workspace = config.agent_workspace_dir("fs_researcher");
+        assert_ne!(
+            caller_workspace, target_workspace,
+            "test precondition: caller session cwd must differ from the target's configured workspace"
+        );
+
+        let config = Arc::new(config);
+        let mut caller_policy = SecurityPolicy::for_agent(&config, "executive_assistant")
+            .expect("caller policy resolves");
+        caller_policy.workspace_dir = caller_workspace.clone();
+        let caller_policy = Arc::new(caller_policy);
+
+        let fake_executor = Arc::new(FakeCodingCliExecutor::default());
+        let claude_code_tool: Arc<dyn Tool> = Arc::new(crate::tools::RateLimitedTool::new(
+            crate::tools::ClaudeCodeTool::new_with_executor(
+                Arc::clone(&caller_policy),
+                zeroclaw_config::schema::ClaudeCodeConfig::default(),
+                Arc::clone(&fake_executor)
+                    as Arc<dyn zeroclaw_tools::coding_cli::CodingCliExecutor>,
+            ),
+            Arc::clone(&caller_policy),
+        ));
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_workspace_dir(caller_workspace.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![claude_code_tool])))
+            .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_caller_alias("executive_assistant");
+
+        std::fs::create_dir_all(&target_workspace).unwrap();
+        // Deliberately create this ONLY under the caller's workspace, not the
+        // target's - see the safety note on this test above. A path valid under
+        // the caller's workspace must be rejected once `claude_code` is correctly
+        // rebound to the target's own policy.
+        let caller_only_subdir = caller_workspace.join("caller_only");
+        std::fs::create_dir_all(&caller_only_subdir).unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "claude_code",
+            tool_args: serde_json::json!({
+                "prompt": "irrelevant - execution must never reach any executor, real or fake",
+                "working_directory": caller_only_subdir.to_string_lossy(),
+            }),
+        };
+
+        let result = tool
+            .execute_agentic(
+                "fs_researcher",
+                &target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "run a coding task",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        assert!(
+            output.contains("is outside the workspace"),
+            "regression: a Bounded delegate's claude_code must validate `working_directory` \
+             against the TARGET's own configured workspace, not the caller's - a directory \
+             that only exists under the caller's workspace must be REJECTED, but got: {output}"
+        );
+        assert_eq!(
+            *fake_executor.received_working_dir.lock().unwrap(),
+            None,
+            "the CLI executor must NEVER be reached when working_directory is outside the \
+             target's own workspace - if this fails, execution reached the executor stage \
+             (a REAL RuntimeCodingCliExecutor in the fixed code path, not this fake)"
         );
     }
 

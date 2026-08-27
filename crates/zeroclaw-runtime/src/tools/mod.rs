@@ -296,6 +296,52 @@ pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
 }
 
+/// Builds the plain (non-sandbox-aware) shell tool `default_tools_with_runtime`
+/// registers, as a concrete `ShellTool` rather than a boxed `dyn Tool`. Kept as
+/// its own function so tests can inspect fields (`sandbox_name()`,
+/// `timeout_secs()`) a `Box<dyn Tool>` would otherwise erase, with zero risk
+/// of drifting from what production actually constructs — this function IS
+/// the construction production uses, not a hand-rebuilt mirror of it.
+pub(crate) fn build_default_shell_tool(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+) -> ShellTool {
+    let persistent_writes = runtime.has_filesystem_access();
+    ShellTool::new(security, runtime).with_persistent_writes(persistent_writes)
+}
+
+/// Assembles a shell tool from an already-resolved `sandbox`, applying the
+/// same `shell_timeout_secs == 0 -> inherit the global default` contract
+/// production uses. Single source of truth for that assembly, reused by both
+/// [`all_tools_with_runtime`] (which resolves `sandbox` from the caller's own
+/// `RiskProfileConfig`, unchanged) and `delegate.rs`'s `Bounded` cross-profile
+/// target reconstruction (which resolves it from the target's
+/// `SecurityPolicy` via [`SecurityPolicy::sandbox_config`], since a Bounded
+/// delegate only has a `SecurityPolicy`, not the `RiskProfileConfig` it came
+/// from) — so the two paths cannot silently diverge on this assembly step
+/// again. Sandbox *resolution* deliberately stays at each call site rather
+/// than moving into this function, since the two callers resolve it from
+/// different source types and `all_tools_with_runtime` already needs the
+/// resolved `Arc<dyn Sandbox>` for its `coding_cli_executor` too — resolving
+/// it again in here would mean two independent `create_sandbox` calls inside
+/// the same registry build, not one.
+pub(crate) fn build_sandboxed_shell_tool(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    sandbox: Arc<dyn crate::security::Sandbox>,
+    global_shell_timeout_secs: u64,
+) -> ShellTool {
+    let persistent_writes = runtime.has_filesystem_access();
+    let timeout_secs = if security.shell_timeout_secs > 0 {
+        security.shell_timeout_secs
+    } else {
+        global_shell_timeout_secs
+    };
+    ShellTool::new_with_sandbox(security, runtime, sandbox)
+        .with_timeout_secs(timeout_secs)
+        .with_persistent_writes(persistent_writes)
+}
+
 /// Create the default tool registry with explicit runtime adapter.
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
@@ -309,7 +355,7 @@ pub fn default_tools_with_runtime(
         // would run a dialect-less path scan ahead of the tool and wrongly reject
         // the Windows `\\.\nul` device on a native cmd.exe sink.
         Box::new(RateLimitedTool::new(
-            ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
+            build_default_shell_tool(security.clone(), runtime),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -366,6 +412,37 @@ pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
     "image_info",
 ];
 
+/// Tool names that bind `workspace_dir`/`SecurityPolicy` state at construction
+/// time the exact same way as `FILESYSTEM_TOOL_NAMES`, but are only built by
+/// [`all_tools_with_runtime`] (config-gated, several disabled by default) —
+/// not by the smaller [`default_tools_with_runtime`]. A `Bounded` delegate to
+/// a cross-profile target must rebuild these against the target's own policy
+/// too; `delegate.rs`'s `Bounded` branch currently only checks
+/// `FILESYSTEM_TOOL_NAMES`, so a target allowed one of these still falls
+/// through to the caller's `ToolArcRef`-wrapped instance. See each
+/// constructor site below for the exact captured field:
+/// `git_operations` (`mod.rs:811-814`, `GitOperationsTool` captures
+/// `workspace_dir`), `backup` (`mod.rs:1182-1186`, `BackupTool`),
+/// `data_management` (`mod.rs:1191-1194`, `DataManagementTool` — the most
+/// severe: its `purge` command deletes files), `linkedin`/`image_gen`
+/// (`mod.rs:1315-1332`), and the coding-CLI tools (`mod.rs:1234-1295`, each
+/// bound to `security` and a `coding_cli_executor` built from the caller's
+/// own `sandbox`). Kept in sync with the constructors by
+/// `workspace_bound_tool_names_beyond_default_are_actually_constructed`
+/// below.
+pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
+    "git_operations",
+    "backup",
+    "data_management",
+    "linkedin",
+    "image_gen",
+    "claude_code",
+    "claude_code_runner",
+    "codex_cli",
+    "gemini_cli",
+    "opencode_cli",
+];
+
 /// The vision `image_info` tool, wrapped exactly like every other filesystem-boundary
 /// tool (`RateLimitedTool` + `PathGuardedTool`). Factored out of the big assembly
 /// function below so a `Bounded` delegate target can rebuild it against its own
@@ -376,6 +453,221 @@ pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
         PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
         security,
     ))
+}
+
+// ── Factories for WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT ─────────────────
+//
+// Each function below rebuilds exactly one of the 10 tools from
+// `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`, gated the same way
+// `all_tools_with_runtime` gates it. Factored out (same principle as
+// `image_info_tool`/`build_sandboxed_shell_tool` above) so a `Bounded`
+// delegate's target reconstruction (`delegate.rs`) calls the SAME
+// construction code `all_tools_with_runtime` does, instead of a hand-rebuilt
+// copy that could silently drift from it.
+
+/// Rebuilds `git_operations` bound to `security`'s own workspace - unconditional
+/// in production (`all_tools_with_runtime` never gates it), so this always
+/// returns a tool.
+pub(crate) fn git_operations_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
+    let workspace_dir = security.workspace_dir.clone();
+    Arc::new(GitOperationsTool::new(security, workspace_dir))
+}
+
+/// Rebuilds `backup` bound to `security`'s own workspace, gated like
+/// `all_tools_with_runtime` gates it (`root_config.backup.enabled`, true by
+/// default). `None` when disabled.
+pub(crate) fn backup_tool(
+    security: &SecurityPolicy,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.backup.enabled {
+        return None;
+    }
+    Some(Arc::new(BackupTool::new(
+        security.workspace_dir.clone(),
+        root_config.backup.include_dirs.clone(),
+        root_config.backup.max_keep,
+    )))
+}
+
+/// Rebuilds `data_management` bound to `security`'s own workspace, gated like
+/// `all_tools_with_runtime` gates it (`root_config.data_retention.enabled`,
+/// false by default). `None` when disabled.
+pub(crate) fn data_management_tool(
+    security: &SecurityPolicy,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.data_retention.enabled {
+        return None;
+    }
+    Some(Arc::new(DataManagementTool::new(
+        security.workspace_dir.clone(),
+        root_config.data_retention.retention_days,
+    )))
+}
+
+/// Rebuilds `linkedin` bound to `security`'s own workspace, gated like
+/// `all_tools_with_runtime` gates it (`root_config.linkedin.enabled`). `None`
+/// when disabled.
+pub(crate) fn linkedin_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.linkedin.enabled {
+        return None;
+    }
+    let workspace_dir = security.workspace_dir.clone();
+    Some(Arc::new(LinkedInTool::new(
+        security,
+        workspace_dir,
+        root_config.linkedin.api_version.clone(),
+        root_config.linkedin.content.clone(),
+        root_config.linkedin.image.clone(),
+    )))
+}
+
+/// Rebuilds `image_gen` bound to `security`'s own workspace, gated like
+/// `all_tools_with_runtime` gates it (`root_config.image_gen.enabled`). `None`
+/// when disabled OR when construction fails (logged, mirroring the
+/// production registration path).
+pub(crate) fn image_gen_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    persistent_writes: bool,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.image_gen.enabled {
+        return None;
+    }
+    let workspace_dir = security.workspace_dir.clone();
+    match ImageGenTool::new_with_persistence(
+        security,
+        workspace_dir,
+        root_config.image_gen.default_model.clone(),
+        root_config.image_gen.api_key_env.clone(),
+        persistent_writes,
+        root_config.security.nat64_prefixes.clone(),
+    ) {
+        Ok(tool) => Some(Arc::new(tool)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "image_gen: failed to construct tool for a Bounded delegate target, skipping"
+            );
+            None
+        }
+    }
+}
+
+/// Rebuilds `claude_code_runner` bound to `security`, gated like
+/// `all_tools_with_runtime` gates it (`root_config.claude_code_runner.enabled`
+/// alone - unlike the 4 tools below, it never uses `coding_cli_executor`).
+/// `None` when disabled.
+pub(crate) fn claude_code_runner_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.claude_code_runner.enabled {
+        return None;
+    }
+    let gateway_url = format!(
+        "http://{}:{}",
+        root_config.gateway.host, root_config.gateway.port
+    );
+    Some(Arc::new(RateLimitedTool::new(
+        ClaudeCodeRunnerTool::new(
+            security.clone(),
+            root_config.claude_code_runner.clone(),
+            gateway_url,
+        ),
+        security,
+    )))
+}
+
+/// Rebuilds `claude_code` bound to `security` and the given (already
+/// target-resolved) `executor`, gated like `all_tools_with_runtime` gates it
+/// (`register_coding_cli_tools && root_config.claude_code.enabled`). `None`
+/// when disabled.
+pub(crate) fn claude_code_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    register_coding_cli_tools: bool,
+    executor: &Arc<dyn zeroclaw_tools::coding_cli::CodingCliExecutor>,
+) -> Option<Arc<dyn Tool>> {
+    if !(register_coding_cli_tools && root_config.claude_code.enabled) {
+        return None;
+    }
+    Some(Arc::new(RateLimitedTool::new(
+        ClaudeCodeTool::new_with_executor(
+            security.clone(),
+            root_config.claude_code.clone(),
+            executor.clone(),
+        ),
+        security,
+    )))
+}
+
+/// Rebuilds `codex_cli` - see [`claude_code_tool`] above for the shared
+/// gating/wiring rationale.
+pub(crate) fn codex_cli_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    register_coding_cli_tools: bool,
+    executor: &Arc<dyn zeroclaw_tools::coding_cli::CodingCliExecutor>,
+) -> Option<Arc<dyn Tool>> {
+    if !(register_coding_cli_tools && root_config.codex_cli.enabled) {
+        return None;
+    }
+    Some(Arc::new(RateLimitedTool::new(
+        CodexCliTool::new_with_executor(
+            security.clone(),
+            root_config.codex_cli.clone(),
+            executor.clone(),
+        ),
+        security,
+    )))
+}
+
+/// Rebuilds `gemini_cli` - see [`claude_code_tool`] above.
+pub(crate) fn gemini_cli_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    register_coding_cli_tools: bool,
+    executor: &Arc<dyn zeroclaw_tools::coding_cli::CodingCliExecutor>,
+) -> Option<Arc<dyn Tool>> {
+    if !(register_coding_cli_tools && root_config.gemini_cli.enabled) {
+        return None;
+    }
+    Some(Arc::new(RateLimitedTool::new(
+        GeminiCliTool::new_with_executor(
+            security.clone(),
+            root_config.gemini_cli.clone(),
+            executor.clone(),
+        ),
+        security,
+    )))
+}
+
+/// Rebuilds `opencode_cli` - see [`claude_code_tool`] above.
+pub(crate) fn opencode_cli_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+    register_coding_cli_tools: bool,
+    executor: &Arc<dyn zeroclaw_tools::coding_cli::CodingCliExecutor>,
+) -> Option<Arc<dyn Tool>> {
+    if !(register_coding_cli_tools && root_config.opencode_cli.enabled) {
+        return None;
+    }
+    Some(Arc::new(RateLimitedTool::new(
+        OpenCodeCliTool::new_with_executor(
+            security.clone(),
+            root_config.opencode_cli.clone(),
+            executor.clone(),
+        ),
+        security,
+    )))
 }
 
 pub fn register_skill_tools(
@@ -716,14 +1008,13 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
-                .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                    security.shell_timeout_secs
-                } else {
-                    root_config.shell_tool.timeout_secs
-                })
-                .with_tui_env(tui_env)
-                .with_persistent_writes(persistent_writes),
+            build_sandboxed_shell_tool(
+                security.clone(),
+                runtime.clone(),
+                sandbox.clone(),
+                root_config.shell_tool.timeout_secs,
+            )
+            .with_tui_env(tui_env),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -808,10 +1099,7 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        git_operations_tool(security.clone()),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -1178,20 +1466,13 @@ pub fn all_tools_with_runtime(
     }
 
     // Backup tool (enabled by default)
-    if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new(
-            workspace_dir.to_path_buf(),
-            root_config.backup.include_dirs.clone(),
-            root_config.backup.max_keep,
-        )));
+    if let Some(tool) = backup_tool(security, root_config) {
+        tool_arcs.push(tool);
     }
 
     // Data management tool (disabled by default)
-    if root_config.data_retention.enabled {
-        tool_arcs.push(Arc::new(DataManagementTool::new(
-            workspace_dir.to_path_buf(),
-            root_config.data_retention.retention_days,
-        )));
+    if let Some(tool) = data_management_tool(security, root_config) {
+        tool_arcs.push(tool);
     }
 
     // Cloud operations advisory tools (read-only analysis)
@@ -1231,67 +1512,48 @@ pub fn all_tools_with_runtime(
     }
 
     // Claude Code delegation tool
-    if register_coding_cli_tools && root_config.claude_code.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            ClaudeCodeTool::new_with_executor(
-                security.clone(),
-                root_config.claude_code.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+    if let Some(tool) = claude_code_tool(
+        security.clone(),
+        root_config,
+        register_coding_cli_tools,
+        &coding_cli_executor,
+    ) {
+        tool_arcs.push(tool);
     }
 
     // Claude Code task runner with Slack progress and SSH handoff
-    if root_config.claude_code_runner.enabled {
-        let gateway_url = format!(
-            "http://{}:{}",
-            root_config.gateway.host, root_config.gateway.port
-        );
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            ClaudeCodeRunnerTool::new(
-                security.clone(),
-                root_config.claude_code_runner.clone(),
-                gateway_url,
-            ),
-            security.clone(),
-        )));
+    if let Some(tool) = claude_code_runner_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // Codex CLI delegation tool
-    if register_coding_cli_tools && root_config.codex_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            CodexCliTool::new_with_executor(
-                security.clone(),
-                root_config.codex_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+    if let Some(tool) = codex_cli_tool(
+        security.clone(),
+        root_config,
+        register_coding_cli_tools,
+        &coding_cli_executor,
+    ) {
+        tool_arcs.push(tool);
     }
 
     // Gemini CLI delegation tool
-    if register_coding_cli_tools && root_config.gemini_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            GeminiCliTool::new_with_executor(
-                security.clone(),
-                root_config.gemini_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+    if let Some(tool) = gemini_cli_tool(
+        security.clone(),
+        root_config,
+        register_coding_cli_tools,
+        &coding_cli_executor,
+    ) {
+        tool_arcs.push(tool);
     }
 
     // OpenCode CLI delegation tool
-    if register_coding_cli_tools && root_config.opencode_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            OpenCodeCliTool::new_with_executor(
-                security.clone(),
-                root_config.opencode_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+    if let Some(tool) = opencode_cli_tool(
+        security.clone(),
+        root_config,
+        register_coding_cli_tools,
+        &coding_cli_executor,
+    ) {
+        tool_arcs.push(tool);
     }
 
     // Vision tools are always available
@@ -1311,37 +1573,13 @@ pub fn all_tools_with_runtime(
     }
 
     // LinkedIn integration (config-gated)
-    if root_config.linkedin.enabled {
-        tool_arcs.push(Arc::new(LinkedInTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-            root_config.linkedin.api_version.clone(),
-            root_config.linkedin.content.clone(),
-            root_config.linkedin.image.clone(),
-        )));
+    if let Some(tool) = linkedin_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // Standalone image generation tool (config-gated)
-    if root_config.image_gen.enabled {
-        match ImageGenTool::new_with_persistence(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-            root_config.image_gen.default_model.clone(),
-            root_config.image_gen.api_key_env.clone(),
-            persistent_writes,
-            root_config.security.nat64_prefixes.clone(),
-        ) {
-            Ok(tool) => tool_arcs.push(Arc::new(tool)),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "image_gen: failed to construct tool, skipping registration"
-                );
-            }
-        }
+    if let Some(tool) = image_gen_tool(security.clone(), root_config, persistent_writes) {
+        tool_arcs.push(tool);
     }
 
     // File upload tool — enabled iff [file_upload].url is set
@@ -3513,6 +3751,76 @@ const = true
              tools — update the constant (or the constructors) so a Bounded delegate rebuild \
              cannot silently miss one"
         );
+    }
+
+    /// Companion to `filesystem_tool_names_match_constructed_tools`: proves
+    /// `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT` doesn't reference a typo or
+    /// a tool that no longer exists, using the SAME full-registry factory
+    /// production uses, with every optional feature that gates one of these
+    /// tools turned on.
+    #[test]
+    fn workspace_bound_tool_names_beyond_default_are_actually_constructed() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.data_retention.enabled = true;
+        cfg.linkedin.enabled = true;
+        cfg.image_gen.enabled = true;
+        cfg.claude_code.enabled = true;
+        cfg.claude_code_runner.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let constructed: std::collections::BTreeSet<&str> =
+            tools.iter().map(|t| t.name()).collect();
+        for name in WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT {
+            assert!(
+                constructed.contains(name),
+                "'{name}' listed in WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT was not \
+                 constructed by all_tools_with_runtime with every relevant feature \
+                 enabled - the name is stale or its enabling config flag changed"
+            );
+        }
     }
 
     #[test]
