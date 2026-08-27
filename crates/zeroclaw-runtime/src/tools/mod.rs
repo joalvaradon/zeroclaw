@@ -608,11 +608,11 @@ pub(crate) fn file_upload_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
-    if !root_config
+    if root_config
         .file_upload
         .url
         .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
+        .is_none_or(|u| u.trim().is_empty())
     {
         return None;
     }
@@ -630,11 +630,11 @@ pub(crate) fn file_upload_bundle_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
-    if !root_config
+    if root_config
         .file_upload_bundle
         .url
         .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
+        .is_none_or(|u| u.trim().is_empty())
     {
         return None;
     }
@@ -653,11 +653,11 @@ pub(crate) fn file_download_tool(
     root_config: &zeroclaw_config::schema::Config,
     persistent_writes: bool,
 ) -> Option<Arc<dyn Tool>> {
-    if !root_config
+    if root_config
         .file_download
         .url
         .as_deref()
-        .is_some_and(|u| !u.trim().is_empty())
+        .is_none_or(|u| u.trim().is_empty())
     {
         return None;
     }
