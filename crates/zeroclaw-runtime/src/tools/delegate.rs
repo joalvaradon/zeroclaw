@@ -2864,6 +2864,12 @@ impl DelegateTool {
                             Box::new(ToolArcRef::new(tool)),
                         );
                     }
+                    if let Some(tool) =
+                        crate::tools::browser_tool(Arc::clone(&target_policy), &root_config.browser)
+                    {
+                        target_workspace_bound_tools
+                            .insert("browser".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
 
                     if let Some(runtime) = self.runtime.as_ref() {
                         let persistent_writes = runtime.has_filesystem_access();

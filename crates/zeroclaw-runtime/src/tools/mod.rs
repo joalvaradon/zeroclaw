@@ -424,11 +424,12 @@ pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
 /// `backup`, `data_management` (the most severe: its `purge` command deletes
 /// files), `linkedin`, `image_gen`, `pushover` (reads credentials from
 /// `workspace_dir/.env`), `screenshot`, `file_upload`, `file_upload_bundle`,
-/// and `file_download` (all capture `workspace_dir`/`SecurityPolicy`
-/// directly), and the coding-CLI tools (each bound to `security` and a
-/// `coding_cli_executor` built from the caller's own `sandbox`). Kept in sync
-/// with the constructors by
-/// `workspace_bound_tool_names_beyond_default_are_actually_constructed`
+/// `file_download` (all capture `workspace_dir`/`SecurityPolicy` directly),
+/// `browser` (resolves screenshot destinations through the captured
+/// `SecurityPolicy` with the same guards as `file_write`/`file_edit`), and the
+/// coding-CLI tools (each bound to `security` and a `coding_cli_executor`
+/// built from the caller's own `sandbox`). Kept in sync with the constructors
+/// by `workspace_bound_tool_names_beyond_default_are_actually_constructed`
 /// below.
 pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
     "git_operations",
@@ -441,6 +442,7 @@ pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
     "file_upload",
     "file_upload_bundle",
     "file_download",
+    "browser",
     "claude_code",
     "claude_code_runner",
     "codex_cli",
@@ -666,6 +668,56 @@ pub(crate) fn file_download_tool(
         root_config.file_download.clone(),
         persistent_writes,
     )))
+}
+
+/// Rebuilds `browser` bound to `security`, gated like `all_tools_with_runtime`
+/// gates it (`browser_config.enabled`). `None` when disabled OR when
+/// construction fails (logged, mirroring the production registration path).
+/// `BrowserTool` resolves screenshot destinations through the captured
+/// `SecurityPolicy` with the same guards as `file_write`/`file_edit`
+/// (`browser.rs`'s `validate_screenshot_target`), so a `Bounded`
+/// cross-profile target must get its own policy here, not the caller's.
+/// `browser_config` itself is not workspace-scoped (same config object for
+/// caller and target), unlike `security`.
+pub(crate) fn browser_tool(
+    security: Arc<SecurityPolicy>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+) -> Option<Arc<dyn Tool>> {
+    if !browser_config.enabled {
+        return None;
+    }
+    match BrowserTool::new_with_backend(
+        security.clone(),
+        browser_config.allowed_domains.clone(),
+        browser_config.session_name.clone(),
+        browser_config.backend.clone(),
+        browser_config.headed,
+        browser_config.native_headless,
+        browser_config.native_webdriver_url.clone(),
+        browser_config.native_chrome_path.clone(),
+        ComputerUseConfig {
+            endpoint: browser_config.computer_use.endpoint.clone(),
+            api_key: browser_config.computer_use.api_key.clone(),
+            timeout_ms: browser_config.computer_use.timeout_ms,
+            allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+            window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+            max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+            max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+        },
+        browser_config.allowed_private_hosts.clone(),
+    ) {
+        Ok(tool) => Some(Arc::new(RateLimitedTool::new(tool, security))),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "browser: failed to construct tool, skipping registration"
+            );
+            None
+        }
+    }
 }
 
 /// Rebuilds `claude_code_runner` bound to `security`, gated like
@@ -1328,38 +1380,8 @@ pub fn all_tools_with_runtime(
             }
         }
         // Add full browser automation tool (pluggable backend)
-        match BrowserTool::new_with_backend(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.session_name.clone(),
-            browser_config.backend.clone(),
-            browser_config.headed,
-            browser_config.native_headless,
-            browser_config.native_webdriver_url.clone(),
-            browser_config.native_chrome_path.clone(),
-            ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
-                timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-            },
-            browser_config.allowed_private_hosts.clone(),
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "browser: failed to construct tool, skipping registration"
-                );
-            }
+        if let Some(tool) = browser_tool(security.clone(), browser_config) {
+            tool_arcs.push(tool);
         }
     }
 
@@ -3856,7 +3878,7 @@ const = true
         let mem: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
         let browser = BrowserConfig {
-            enabled: false,
+            enabled: true,
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
