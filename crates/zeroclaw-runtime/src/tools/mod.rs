@@ -450,6 +450,43 @@ pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
     "opencode_cli",
 ];
 
+/// Tool names that bind the CALLER's `agent_alias` (and sometimes `security`)
+/// at construction time - a distinct capture mechanism from
+/// `FILESYSTEM_TOOL_NAMES`/`WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`
+/// (`workspace_dir`/`SecurityPolicy`), but the exact same underlying bug: a
+/// `Bounded` delegate to a cross-profile target that falls through to the
+/// caller's `ToolArcRef`-wrapped instance acts using the CALLER's identity,
+/// not the target's. Severity varies by tool - `spawn_subagent` is the most
+/// severe (a target can synchronously spawn a SubAgent inheriting the
+/// caller's full identity, `SecurityPolicy`, and permissions envelope);
+/// `cron_add`/`cron_update`/`schedule` let a target create or modify
+/// persistent scheduled jobs that later run - asynchronously, after the
+/// delegate call ends - under the CALLER's risk profile (the scheduler
+/// re-derives `SecurityPolicy::for_agent` from the job's stored
+/// `agent_alias`, see `cron/scheduler.rs`); `cron_remove` lets a target
+/// delete the caller's jobs; `send_message_to_peer` lets a target reach the
+/// caller's peer set/channels; `read_skill` leaks the caller's workspace
+/// skill files (same class of leak as the original bug, different
+/// mechanism). Kept in sync with the constructors by
+/// `identity_bound_tool_names_are_actually_constructed` below.
+///
+/// `sop_approve` (audit-attribution spoofing only - the approval gets
+/// recorded under the caller's alias) is a known member of this class NOT
+/// yet in this list: fixing it needs `DelegateTool` to carry the shared
+/// `sop_engine`/`sop_audit` handles it doesn't currently have (they come
+/// from outside `root_config`, unlike everything else reconstructed here),
+/// which is new plumbing rather than a factory-function fix. Deferred as the
+/// least severe of this class (no privilege escalation, no data leak).
+pub const IDENTITY_BOUND_TOOL_NAMES: &[&str] = &[
+    "read_skill",
+    "cron_add",
+    "cron_update",
+    "cron_remove",
+    "schedule",
+    "send_message_to_peer",
+    "spawn_subagent",
+];
+
 /// The vision `image_info` tool, wrapped exactly like every other filesystem-boundary
 /// tool (`RateLimitedTool` + `PathGuardedTool`). Factored out of the big assembly
 /// function below so a `Bounded` delegate target can rebuild it against its own
@@ -718,6 +755,149 @@ pub(crate) fn browser_tool(
             None
         }
     }
+}
+
+// ── Factories for IDENTITY_BOUND_TOOL_NAMES ──────────────────────────────
+//
+// Each function below rebuilds exactly one of the tools from
+// `IDENTITY_BOUND_TOOL_NAMES`, gated the same way `all_tools_with_runtime`
+// gates it. These bind the CALLER's `agent_alias` (not `workspace_dir`/
+// `SecurityPolicy` alone), so a `Bounded` delegate to a cross-profile target
+// must rebuild them against the target's own `agent_alias` too.
+
+/// Rebuilds `read_skill` bound to `agent_alias`, gated like
+/// `all_tools_with_runtime` gates it (`config.effective_skills_prompt_mode(agent_alias)
+/// == Compact`). `None` when not in compact mode. `ReadSkillTool` resolves
+/// workspace skills via `config.agent_workspace_dir(agent_alias)`
+/// (`skills/mod.rs`'s `load_skills_for_agent_from_config`), so a `Bounded`
+/// cross-profile target must get its own alias here, not the caller's.
+pub(crate) fn read_skill_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
+) -> Option<Arc<dyn Tool>> {
+    if !matches!(
+        config.effective_skills_prompt_mode(agent_alias),
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) {
+        return None;
+    }
+    Some(Arc::new(ReadSkillTool::new(
+        config,
+        agent_alias.to_string(),
+    )))
+}
+
+/// Rebuilds `cron_add` bound to `agent_alias` - unconditional in production
+/// (`all_tools_with_runtime` never gates it), so this always returns a tool.
+/// Jobs created through this tool are stored under `agent_alias` and later
+/// run - asynchronously - under that identity's own risk profile
+/// (`cron/scheduler.rs` re-derives `SecurityPolicy::for_agent` from the
+/// job's stored alias), so a `Bounded` cross-profile target must get its own
+/// alias here, not the caller's.
+pub(crate) fn cron_add_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    security: Arc<SecurityPolicy>,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+) -> Arc<dyn Tool> {
+    Arc::new(CronAddTool::new_with_runtime(
+        config,
+        security,
+        agent_alias.to_string(),
+        runtime,
+    ))
+}
+
+/// Rebuilds `cron_update` bound to `agent_alias` - unconditional in
+/// production. See [`cron_add_tool`] for why `agent_alias` must be the
+/// target's own.
+pub(crate) fn cron_update_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    security: Arc<SecurityPolicy>,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+) -> Arc<dyn Tool> {
+    Arc::new(CronUpdateTool::new_with_runtime(
+        config,
+        security,
+        agent_alias.to_string(),
+        runtime,
+    ))
+}
+
+/// Rebuilds `cron_remove` bound to `agent_alias` - unconditional in
+/// production. `CronRemoveTool` scopes job-name resolution to
+/// `agent_alias`'s own jobs, so a `Bounded` cross-profile target reusing the
+/// caller's instance could delete the CALLER's jobs.
+pub(crate) fn cron_remove_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    security: Arc<SecurityPolicy>,
+    agent_alias: &str,
+) -> Arc<dyn Tool> {
+    Arc::new(CronRemoveTool::new(
+        config,
+        security,
+        agent_alias.to_string(),
+    ))
+}
+
+/// Rebuilds `schedule` bound to `agent_alias` - unconditional in production.
+/// Combines `cron_add`/`cron_remove`-equivalent semantics (create, pause,
+/// resume, one-shot) in a single tool; see [`cron_add_tool`] for why
+/// `agent_alias` must be the target's own. `ScheduleTool` takes an owned
+/// `Config`, not `Arc<Config>`, matching `all_tools_with_runtime`'s own call.
+pub(crate) fn schedule_tool(
+    security: Arc<SecurityPolicy>,
+    config: zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+) -> Arc<dyn Tool> {
+    Arc::new(ScheduleTool::new_with_runtime(
+        security,
+        config,
+        agent_alias.to_string(),
+        runtime,
+    ))
+}
+
+/// Rebuilds `send_message_to_peer` bound to `agent_alias` - unconditional in
+/// production. `SendMessageToPeerTool` resolves the sender's peer set and
+/// channel membership from `agent_alias` (`send_message_to_peer.rs`'s own
+/// doc comment: "validates every send against that agent's resolved peer
+/// set"), so a `Bounded` cross-profile target reusing the caller's instance
+/// could reach the CALLER's peers/channels, not its own.
+pub(crate) fn send_message_to_peer_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
+) -> Arc<dyn Tool> {
+    Arc::new(SendMessageToPeerTool::new(config, agent_alias.to_string()))
+}
+
+/// Rebuilds `spawn_subagent` bound to `agent_alias`/`security` -
+/// unconditional in production. The single most severe tool in this class:
+/// `SpawnSubagentTool` spawns a SubAgent that synchronously inherits
+/// `agent_alias`'s full identity, `SecurityPolicy`, and permissions envelope
+/// (its own doc comment: "runs the supplied prompt to completion under the
+/// parent's permissions envelope"), and even its own admission check
+/// (`config.risk_profile_for_agent(&self.parent_alias)`) is scoped to that
+/// alias. A `Bounded` cross-profile target reusing the caller's instance
+/// could spawn a SubAgent running arbitrary prompts under the CALLER's full
+/// permissions, regardless of the target's own (possibly far more
+/// restricted) risk profile. `delegate.rs`'s `Bounded` reconstruction always
+/// passes `is_subagent_caller = false`, matching what `independent`-mode
+/// delegation already passes when building a target's own registry
+/// (`delegate.rs`'s `independent` branch) - `Bounded` delegation is not
+/// itself a "subagent" in the depth-1-cap sense this flag guards.
+pub(crate) fn spawn_subagent_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
+    security: Arc<SecurityPolicy>,
+    is_subagent_caller: bool,
+) -> Arc<dyn Tool> {
+    Arc::new(
+        SpawnSubagentTool::new(config, agent_alias.to_string(), security)
+            .with_subagent_caller(is_subagent_caller),
+    )
 }
 
 /// Rebuilds `claude_code_runner` bound to `security`, gated like
@@ -1209,24 +1389,20 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new_with_runtime(
+        cron_add_tool(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
-        )),
+        ),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(
-            config.clone(),
-            security.clone(),
-            agent_alias,
-        )),
-        Arc::new(CronUpdateTool::new_with_runtime(
+        cron_remove_tool(config.clone(), security.clone(), agent_alias),
+        cron_update_tool(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
-        )),
+        ),
         Arc::new(CronRunTool::new_with_runtime(
             config.clone(),
             security.clone(),
@@ -1238,20 +1414,19 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new_with_runtime(
+        schedule_tool(
             security.clone(),
             root_config.clone(),
             agent_alias,
             runtime.clone(),
-        )),
-        Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
-            Arc::new(root_config.clone()),
+        spawn_subagent_tool(
+            config.clone(),
             agent_alias,
-        )),
+            security.clone(),
+            is_subagent_caller,
+        ),
+        send_message_to_peer_tool(config.clone(), agent_alias),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -1347,16 +1522,10 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
-        root_config.effective_skills_prompt_mode(agent_alias),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-    ) {
-        // ReadSkillTool holds full config to support workspace skills,
-        // open-skills, agent-bound bundles, and plugin skills.
-        tool_arcs.push(Arc::new(ReadSkillTool::new(
-            config.clone(),
-            agent_alias.to_string(),
-        )));
+    // ReadSkillTool holds full config to support workspace skills,
+    // open-skills, agent-bound bundles, and plugin skills.
+    if let Some(tool) = read_skill_tool(config.clone(), agent_alias) {
+        tool_arcs.push(tool);
     }
 
     if browser_config.enabled {
@@ -3928,6 +4097,70 @@ const = true
                 "'{name}' listed in WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT was not \
                  constructed by all_tools_with_runtime with every relevant feature \
                  enabled - the name is stale or its enabling config flag changed"
+            );
+        }
+    }
+
+    /// Proves `IDENTITY_BOUND_TOOL_NAMES` doesn't reference a typo or a tool
+    /// that no longer exists, using the SAME full-registry factory
+    /// production uses, with every optional gate that hides one of these
+    /// tools (currently only `read_skill`'s Compact skills-prompt mode)
+    /// turned on. Same principle as
+    /// `workspace_bound_tool_names_beyond_default_are_actually_constructed`
+    /// above, for the `agent_alias`-capture class instead of the
+    /// `workspace_dir`/`SecurityPolicy`-capture class.
+    #[test]
+    fn identity_bound_tool_names_are_actually_constructed() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let constructed: std::collections::BTreeSet<&str> =
+            tools.iter().map(|t| t.name()).collect();
+        for name in IDENTITY_BOUND_TOOL_NAMES {
+            assert!(
+                constructed.contains(name),
+                "'{name}' listed in IDENTITY_BOUND_TOOL_NAMES was not constructed by \
+                 all_tools_with_runtime with every relevant feature enabled - the name \
+                 is stale or its enabling config flag changed"
             );
         }
     }

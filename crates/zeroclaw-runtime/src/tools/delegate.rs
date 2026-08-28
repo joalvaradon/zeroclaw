@@ -2793,9 +2793,24 @@ impl DelegateTool {
                             && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
                     })
                 };
+                // Tools that bind the CALLER's `agent_alias` (not `workspace_dir`/
+                // `SecurityPolicy`) at construction time - see `IDENTITY_BOUND_TOOL_NAMES`.
+                // Same underlying bug, different capture mechanism: reused unchanged, these
+                // act using the caller's identity instead of the target's.
+                let needs_identity_bound_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && crate::tools::IDENTITY_BOUND_TOOL_NAMES.contains(&tool.name())
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
                 let mut target_workspace_bound_tools: HashMap<String, Box<dyn Tool>> =
                     HashMap::new();
-                if needs_workspace_bound_tools && let Some(root_config) = self.root_config.as_ref()
+                let mut target_identity_bound_tools: HashMap<String, Box<dyn Tool>> =
+                    HashMap::new();
+                if (needs_workspace_bound_tools || needs_identity_bound_tools)
+                    && let Some(root_config) = self.root_config.as_ref()
                 {
                     target_workspace_bound_tools.insert(
                         "git_operations".to_string(),
@@ -2871,6 +2886,42 @@ impl DelegateTool {
                             .insert("browser".to_string(), Box::new(ToolArcRef::new(tool)));
                     }
 
+                    // Tools bound to the CALLER's `agent_alias` (not
+                    // `workspace_dir`/`SecurityPolicy`) at construction time -
+                    // see `IDENTITY_BOUND_TOOL_NAMES`. Rebuilt via the SAME
+                    // per-tool factories `all_tools_with_runtime` calls, against
+                    // the target's own `agent_name`, not the caller's alias.
+                    if let Some(tool) =
+                        crate::tools::read_skill_tool(Arc::clone(root_config), agent_name)
+                    {
+                        target_identity_bound_tools
+                            .insert("read_skill".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
+                    target_identity_bound_tools.insert(
+                        "cron_remove".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::cron_remove_tool(
+                            Arc::clone(root_config),
+                            Arc::clone(&target_policy),
+                            agent_name,
+                        ))),
+                    );
+                    target_identity_bound_tools.insert(
+                        "send_message_to_peer".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::send_message_to_peer_tool(
+                            Arc::clone(root_config),
+                            agent_name,
+                        ))),
+                    );
+                    target_identity_bound_tools.insert(
+                        "spawn_subagent".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::spawn_subagent_tool(
+                            Arc::clone(root_config),
+                            agent_name,
+                            Arc::clone(&target_policy),
+                            false,
+                        ))),
+                    );
+
                     if let Some(runtime) = self.runtime.as_ref() {
                         let persistent_writes = runtime.has_filesystem_access();
                         if let Some(tool) = crate::tools::file_download_tool(
@@ -2892,6 +2943,33 @@ impl DelegateTool {
                             target_workspace_bound_tools
                                 .insert("image_gen".to_string(), Box::new(ToolArcRef::new(tool)));
                         }
+                        target_identity_bound_tools.insert(
+                            "cron_add".to_string(),
+                            Box::new(ToolArcRef::new(crate::tools::cron_add_tool(
+                                Arc::clone(root_config),
+                                Arc::clone(&target_policy),
+                                agent_name,
+                                Arc::clone(runtime),
+                            ))),
+                        );
+                        target_identity_bound_tools.insert(
+                            "cron_update".to_string(),
+                            Box::new(ToolArcRef::new(crate::tools::cron_update_tool(
+                                Arc::clone(root_config),
+                                Arc::clone(&target_policy),
+                                agent_name,
+                                Arc::clone(runtime),
+                            ))),
+                        );
+                        target_identity_bound_tools.insert(
+                            "schedule".to_string(),
+                            Box::new(ToolArcRef::new(crate::tools::schedule_tool(
+                                Arc::clone(&target_policy),
+                                root_config.as_ref().clone(),
+                                agent_name,
+                                Arc::clone(runtime),
+                            ))),
+                        );
 
                         let register_coding_cli_tools =
                             runtime.has_shell_access() && persistent_writes;
@@ -2991,6 +3069,7 @@ impl DelegateTool {
                             .remove(tool.name())
                             .or_else(|| target_fs_tools.remove(tool.name()))
                             .or_else(|| target_workspace_bound_tools.remove(tool.name()))
+                            .or_else(|| target_identity_bound_tools.remove(tool.name()))
                             .unwrap_or_else(|| {
                                 Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
                             })
@@ -8542,6 +8621,7 @@ mod tests {
         target_config: AliasedAgentConfig,
         caller_workspace: PathBuf,
         target_workspace: PathBuf,
+        config: Arc<Config>,
     }
 
     /// Builds a caller ("executive_assistant", risk profile "balanced") that bounded-delegates
@@ -8686,6 +8766,7 @@ mod tests {
             target_config,
             caller_workspace,
             target_workspace,
+            config,
         }
     }
 
@@ -9375,6 +9456,7 @@ mod tests {
             target_config,
             caller_workspace,
             target_workspace,
+            config,
         }
     }
 
@@ -9603,6 +9685,451 @@ mod tests {
              tool instance was reused from parent_tools - this is a destructive \
              variant of #9872, not just a read/write leak",
             fixture.caller_workspace.display()
+        );
+    }
+
+    // ── IDENTITY_BOUND_TOOL_NAMES regressions ────────────────────────────
+    //
+    // Same root cause as every test above (the `Bounded` branch's fallback
+    // reuses the caller's already-built `ToolArcRef`-wrapped instance), but a
+    // different capture mechanism: these tools bind the CALLER's
+    // `agent_alias` at construction, not `workspace_dir`/`SecurityPolicy`.
+    // Found by a full audit of `all_tools_with_runtime` prompted by the
+    // question "why does every review round keep finding one more tool" -
+    // see the investigation notes for the complete reasoning.
+
+    #[tokio::test]
+    async fn bounded_delegate_read_skill_reads_target_workspace_skill_not_callers() {
+        // Regression: `read_skill` captures the CALLER's `agent_alias` at
+        // construction (read_skill.rs:9-19), and `execute()` resolves skills
+        // via `load_skills_for_agent_from_config(&self.config, &self.agent_alias)`
+        // (read_skill.rs:67), which resolves workspace skills through
+        // `config.agent_workspace_dir(agent_alias)` (confirmed by the dedicated
+        // test `load_skills_for_agent_from_config_uses_workspace_dir_not_data_dir`
+        // in skills/mod.rs). A Bounded cross-profile target reusing the
+        // caller's instance would read the CALLER's workspace skills.
+        let fixture = bounded_delegate_full_fixture("read_skill", |cfg| {
+            cfg.skills.prompt_injection_mode =
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+        })
+        .await;
+        std::fs::create_dir_all(&fixture.target_workspace).unwrap();
+
+        for (dir, marker) in [
+            (&fixture.caller_workspace, "CALLER_SKILL_MARKER"),
+            (&fixture.target_workspace, "TARGET_SKILL_MARKER"),
+        ] {
+            let skill_dir = dir.join("skills").join("probe");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.toml"),
+                format!(
+                    "[skill]\nname = \"probe\"\ndescription = \"{marker}\"\nversion = \"0.1.0\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "read_skill",
+            tool_args: serde_json::json!({ "name": "probe" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "read the probe skill",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        assert!(
+            !output.contains("CALLER_SKILL_MARKER"),
+            "regression: a Bounded delegate's read_skill must NOT return the CALLER's \
+             skill content just because its tool instance was reused from \
+             parent_tools - got: {output}"
+        );
+        assert!(
+            output.contains("TARGET_SKILL_MARKER"),
+            "regression: a Bounded delegate's read_skill must return the TARGET's own \
+             workspace skill, not the caller's - got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_add_stores_job_owned_by_target_not_caller() {
+        // Regression: `cron_add` captures the CALLER's `agent_alias` at
+        // construction (cron_add.rs:14-21, doc: "Cron jobs created here are
+        // validated against this agent's risk profile and run as this
+        // agent"). The scheduler later re-derives `SecurityPolicy::for_agent`
+        // from the job's STORED `agent_alias` (cron/scheduler.rs:558,699) and
+        // runs the job under that identity's full risk profile - so a
+        // Bounded cross-profile target reusing the caller's instance could
+        // plant a persistent job that later runs, autonomously, with the
+        // CALLER's permissions. This test only checks which identity the
+        // created job is stored under - it never lets the job actually run
+        // (no scheduler tick fires here), which is enough to prove the fix
+        // without any of the async-execution risk that would come with
+        // actually running it.
+        let fixture = bounded_delegate_full_fixture("cron_add", |_cfg| {}).await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_add",
+            tool_args: serde_json::json!({
+                "job_type": "shell",
+                "command": "echo hi",
+                "schedule": { "kind": "every", "every_ms": 3_600_000 },
+                "approved": true,
+            }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "add a recurring job",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bounded cron_add delegate failed: {result:?}"
+        );
+
+        let caller_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "executive_assistant").unwrap();
+        assert!(
+            caller_jobs.is_empty(),
+            "regression: a Bounded delegate's cron_add must NOT store the created job \
+             under the CALLER's agent_alias just because its tool instance was reused \
+             from parent_tools - got: {caller_jobs:?}"
+        );
+        let target_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "fs_researcher").unwrap();
+        assert_eq!(
+            target_jobs.len(),
+            1,
+            "regression: a Bounded delegate's cron_add must store the created job under \
+             the TARGET's own agent_alias, not the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_update_resolves_target_jobs_by_name_not_callers() {
+        // Regression: `cron_update` captures the CALLER's `agent_alias`
+        // (cron_update.rs:13-19) and resolves a job's `job_id` argument via
+        // `cron::resolve_job_id_or_name(&self.config, raw_id, &self.agent_alias)`
+        // (cron_update.rs:239), which - for name-based lookup - is scoped to
+        // that alias's own jobs (`resolve_job_id_or_name`,
+        // cron/store.rs:258-283: falls back to `list_jobs_by_agent(config,
+        // agent_alias)` when the raw string isn't an existing job ID). A
+        // Bounded cross-profile target reusing the caller's instance could
+        // not resolve (or worse, collide with) its own jobs by name.
+        let fixture = bounded_delegate_full_fixture("cron_update", |_cfg| {}).await;
+
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "fs_researcher",
+            Some("probe".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "echo hi",
+        )
+        .unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_update",
+            tool_args: serde_json::json!({
+                "job_id": "probe",
+                "patch": { "name": "renamed-probe" }
+            }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "rename the probe job",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "regression: a Bounded delegate's cron_update must resolve job names \
+             against the TARGET's own jobs, not the caller's - got: {result:?}"
+        );
+        let target_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "fs_researcher").unwrap();
+        assert!(
+            target_jobs
+                .iter()
+                .any(|j| j.name.as_deref() == Some("renamed-probe")),
+            "cron_update did not actually rename the target's job - got: {target_jobs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_remove_resolves_target_jobs_by_name_not_callers() {
+        // Regression: `cron_remove` captures the CALLER's `agent_alias`
+        // (cron_remove.rs:9-14, doc: "scopes name resolution to this agent's
+        // own jobs") - same `resolve_job_id_or_name` mechanism as
+        // `cron_update` above. A Bounded cross-profile target reusing the
+        // caller's instance could not remove its own job by name.
+        let fixture = bounded_delegate_full_fixture("cron_remove", |_cfg| {}).await;
+
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "fs_researcher",
+            Some("probe".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "echo hi",
+        )
+        .unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_remove",
+            tool_args: serde_json::json!({ "job_id": "probe" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "remove the probe job",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "regression: a Bounded delegate's cron_remove must resolve job names \
+             against the TARGET's own jobs, not the caller's - got: {result:?}"
+        );
+        let target_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "fs_researcher").unwrap();
+        assert!(
+            target_jobs.is_empty(),
+            "cron_remove did not actually delete the target's job - got: {target_jobs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_schedule_stores_job_owned_by_target_not_caller() {
+        // Regression: `schedule` captures the CALLER's `agent_alias`
+        // (schedule.rs:13-19, doc: "risk profile gate for shell command
+        // validation") and creates jobs through the SAME `cron::` store
+        // functions as `cron_add` (schedule.rs:409-413), so it shares that
+        // tool's "runs later under the stored identity's risk profile"
+        // exposure. Same safe assertion strategy as `cron_add`: only checks
+        // which identity the job is stored under, never lets it run.
+        let fixture = bounded_delegate_full_fixture("schedule", |_cfg| {}).await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "schedule",
+            tool_args: serde_json::json!({
+                "action": "create",
+                "expression": "0 9 * * 1-5",
+                "command": "echo hi",
+                "approved": true,
+            }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "create a recurring job",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bounded schedule delegate failed: {result:?}"
+        );
+
+        let caller_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "executive_assistant").unwrap();
+        assert!(
+            caller_jobs.is_empty(),
+            "regression: a Bounded delegate's schedule must NOT store the created job \
+             under the CALLER's agent_alias just because its tool instance was reused \
+             from parent_tools - got: {caller_jobs:?}"
+        );
+        let target_jobs =
+            crate::cron::list_jobs_by_agent(&fixture.config, "fs_researcher").unwrap();
+        assert_eq!(
+            target_jobs.len(),
+            1,
+            "regression: a Bounded delegate's schedule must store the created job under \
+             the TARGET's own agent_alias, not the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_send_message_to_peer_uses_target_alias_not_callers() {
+        // Regression: `send_message_to_peer` captures the CALLER's
+        // `sender_alias` at construction (send_message_to_peer.rs:18-25, doc:
+        // "Bound to a single calling agent's alias; the tool validates every
+        // send against that agent's resolved peer set") and both of its
+        // rejection paths embed that alias in the error text
+        // (send_message_to_peer.rs:142-146,162-166), reached BEFORE any real
+        // channel delivery is attempted - so this is safe to drive through
+        // the real `execute_agentic` path without a peer group configured at
+        // all (the first rejection fires immediately). A Bounded
+        // cross-profile target reusing the caller's instance would have its
+        // sends validated against the CALLER's peer set/channels, not its
+        // own.
+        let fixture = bounded_delegate_full_fixture("send_message_to_peer", |_cfg| {}).await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "send_message_to_peer",
+            tool_args: serde_json::json!({
+                "channel": "telegram.test",
+                "target": "someone",
+                "message": "hi",
+            }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "send a message",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        assert!(
+            !output.contains("executive_assistant"),
+            "regression: a Bounded delegate's send_message_to_peer must NOT resolve \
+             the peer set/channel membership using the CALLER's alias - got: {output}"
+        );
+        assert!(
+            output.contains("fs_researcher"),
+            "regression: a Bounded delegate's send_message_to_peer must resolve using \
+             the TARGET's own alias, not the caller's - got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_tool_factory_binds_given_alias_for_risk_profile_admission() {
+        // Wiring-level test, NOT through execute_agentic, and NOT one of the
+        // `bounded_delegate_*` regressions above. `SpawnSubagentTool::execute()`
+        // ends by calling `crate::agent::run(...)` (spawn_subagent.rs:223-236)
+        // - a full recursive agent turn that resolves its OWN model provider
+        // from config internally, bypassing this test suite's
+        // `execute_agentic`-level model-provider injection entirely. Unlike
+        // `ClaudeCodeTool` (`new_with_executor` supports injecting a fake
+        // executor - the technique used for the `claude_code` regression
+        // elsewhere in this file), `SpawnSubagentTool` has no injection point
+        // to fake that call, and delegate-level admission
+        // (`self.security.is_tool_allowed`/`Self::delegate_admits_with_mcp`)
+        // necessarily requires BOTH the caller's and the target's risk
+        // profile to already admit "spawn_subagent" before a Bounded call
+        // even reaches this tool's `execute()` - so by the time execution
+        // gets here, the tool's OWN internal admission check
+        // (`config.risk_profile_for_agent(&self.parent_alias)`,
+        // spawn_subagent.rs:104-119) is, in the fixed code, checking the same
+        // permission the delegate layer already confirmed, and would pass
+        // too - meaning there is no way to observe a SAFE, discriminating
+        // rejection from inside a real Bounded turn without either
+        // completing the real recursive run (unverified whether that is
+        // network-free - not worth the risk to find out) or losing the
+        // signal. This test instead proves the narrower, real thing that
+        // actually differs between the bug and the fix: `delegate.rs`'s
+        // `Bounded` branch calls `crate::tools::spawn_subagent_tool(...,
+        // agent_name, ...)` - this test calls the SAME factory directly with
+        // a target alias whose OWN risk profile excludes "spawn_subagent",
+        // and confirms the constructed tool's admission check is genuinely
+        // keyed off the alias it was given (not hardcoded, not ignored, not
+        // silently defaulted to some other identity) - the exact fact the
+        // production fix depends on.
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let mut config = Config {
+            config_path: std::path::PathBuf::from("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "excludes_spawn".to_string(),
+            RiskProfileConfig {
+                excluded_tools: vec!["spawn_subagent".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "restricted_target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "excludes_spawn".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let tool = crate::tools::spawn_subagent_tool(
+            Arc::new(config),
+            "restricted_target",
+            Arc::new(SecurityPolicy::default()),
+            false,
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "prompt": "hello" }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "expected the target alias's own excluded_tools to block spawn_subagent - \
+             got: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("restricted_target"),
+            "the rejection must name the alias that was actually checked - proving \
+             crate::tools::spawn_subagent_tool (the same factory delegate.rs's Bounded \
+             branch calls) binds the given alias rather than ignoring it - got: {result:?}"
         );
     }
 
