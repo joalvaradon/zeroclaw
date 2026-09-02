@@ -829,6 +829,457 @@ pub(crate) fn browser_tool(
     }
 }
 
+/// Tools that bind the caller's `SecurityPolicy` for its autonomy/rate gate but
+/// whose remaining constructor arguments are global (credentials and endpoint
+/// config read from `root_config`, or process-wide shared handles).
+///
+/// Reusing a caller instance would gate a `Bounded` target's network and SaaS
+/// calls against the CALLER's autonomy: a read-only target would act with the
+/// caller's `can_act()`. Rebuilding them against `target_policy` restores the
+/// capability under the target's own limits.
+///
+/// Verified per tool by reading the constructor AND its construction site in
+/// `all_tools_with_runtime`: every non-`security` argument comes from
+/// `root_config` (or from a parameter that all seven production callers of
+/// `all_tools_with_runtime` supply from that same global config), so none of
+/// them would differ if the tool were built for the target instead. The
+/// per-agent resolution that does exist in this function - the model provider
+/// api_key - feeds other tools, not these.
+pub const AUTONOMY_REBOUND_TOOL_NAMES: &[&str] = &[
+    "http_request",
+    "web_fetch",
+    "text_browser",
+    "browser_open",
+    "browser_delegate",
+    "notion",
+    "jira",
+    "composio",
+    "google_workspace",
+    "microsoft365",
+    "model_routing_config",
+    "proxy_config",
+    "sessions_history",
+    "sessions_send",
+];
+
+/// Rebuilds `http_request` bound to `security`, gated and wrapped exactly as
+/// `all_tools_with_runtime` does it (`http_config.enabled`, `RateLimitedTool`).
+/// `None` when disabled or when construction fails (logged, mirroring the
+/// production registration path).
+pub(crate) fn http_request_tool(
+    security: Arc<SecurityPolicy>,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !http_config.enabled {
+        return None;
+    }
+    match HttpRequestTool::new_with_config(
+        security.clone(),
+        http_config.allowed_domains.clone(),
+        http_config.max_response_size,
+        http_config.timeout_secs,
+        http_config.allow_private_hosts,
+        http_config.allowed_private_hosts.clone(),
+        root_config.security.nat64_prefixes.clone(),
+        root_config.config_path.clone(),
+        root_config.secrets.encrypt,
+    ) {
+        Ok(tool) => Some(Arc::new(RateLimitedTool::new(tool, security))),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "http_request: failed to construct tool, skipping registration"
+            );
+            None
+        }
+    }
+}
+
+/// Rebuilds `web_fetch` bound to `security`, gated and wrapped exactly as
+/// `all_tools_with_runtime` does it (`web_fetch_config.enabled`,
+/// `RateLimitedTool`).
+pub(crate) fn web_fetch_tool(
+    security: Arc<SecurityPolicy>,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !web_fetch_config.enabled {
+        return None;
+    }
+    match WebFetchTool::new(
+        security.clone(),
+        web_fetch_config.allowed_domains.clone(),
+        web_fetch_config.blocked_domains.clone(),
+        web_fetch_config.max_response_size,
+        web_fetch_config.timeout_secs,
+        web_fetch_config.firecrawl.clone(),
+        web_fetch_config.allowed_private_hosts.clone(),
+        root_config.security.nat64_prefixes.clone(),
+    ) {
+        Ok(tool) => Some(Arc::new(RateLimitedTool::new(tool, security))),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "web_fetch: failed to construct tool, skipping registration"
+            );
+            None
+        }
+    }
+}
+
+/// Rebuilds `text_browser` bound to `security`, gated as
+/// `all_tools_with_runtime` gates it (`root_config.text_browser.enabled`).
+pub(crate) fn text_browser_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.text_browser.enabled {
+        return None;
+    }
+    match TextBrowserTool::new_with_private_hosts(
+        security,
+        root_config.text_browser.preferred_browser.clone(),
+        root_config.text_browser.timeout_secs,
+        root_config.text_browser.allowed_private_hosts.clone(),
+        root_config.security.nat64_prefixes.clone(),
+    ) {
+        Ok(tool) => Some(Arc::new(tool)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "text_browser: failed to construct tool, skipping registration"
+            );
+            None
+        }
+    }
+}
+
+/// Rebuilds `browser_open` bound to `security`, gated as
+/// `all_tools_with_runtime` gates it (`browser_config.enabled`).
+/// `browser_config` itself is not workspace-scoped (same config object for
+/// caller and target), unlike `security` - the same split as [`browser_tool`].
+pub(crate) fn browser_open_tool(
+    security: Arc<SecurityPolicy>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+) -> Option<Arc<dyn Tool>> {
+    if !browser_config.enabled {
+        return None;
+    }
+    match BrowserOpenTool::new_with_private_hosts(
+        security,
+        browser_config.allowed_domains.clone(),
+        browser_config.allowed_private_hosts.clone(),
+    ) {
+        Ok(tool) => Some(Arc::new(tool)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "browser_open: failed to construct tool, skipping registration"
+            );
+            None
+        }
+    }
+}
+
+/// Rebuilds `browser_delegate` bound to `security`, gated as
+/// `all_tools_with_runtime` gates it (config plus runtime shell access).
+pub(crate) fn browser_delegate_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+    has_shell_access: bool,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.browser_delegate.enabled {
+        return None;
+    }
+    if !has_shell_access {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "browser_delegate: skipped registration because the current runtime does not allow shell access"
+        );
+        return None;
+    }
+    Some(Arc::new(BrowserDelegateTool::new(
+        security,
+        root_config.browser_delegate.clone(),
+    )))
+}
+
+/// Rebuilds `notion` bound to `security`. The API key is global
+/// (`root_config.notion.api_key`, or the `NOTION_API_KEY` env var), never
+/// per-agent, so only the policy differs between caller and target.
+pub(crate) fn notion_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.notion.enabled {
+        return None;
+    }
+    let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
+        std::env::var("NOTION_API_KEY").unwrap_or_default()
+    } else {
+        root_config.notion.api_key.trim().to_string()
+    };
+    if notion_api_key.trim().is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+        );
+        return None;
+    }
+    Some(Arc::new(NotionTool::new(notion_api_key, security)))
+}
+
+/// Rebuilds `jira` bound to `security`. Base URL, credentials and allowed
+/// actions are global (`root_config.jira`), never per-agent.
+pub(crate) fn jira_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.jira.enabled {
+        return None;
+    }
+    let api_token = if root_config.jira.api_token.trim().is_empty() {
+        std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+    } else {
+        root_config.jira.api_token.trim().to_string()
+    };
+    if api_token.trim().is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
+        );
+        return None;
+    }
+    if root_config.jira.base_url.trim().is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Jira tool enabled but jira.base_url is empty — skipping registration"
+        );
+        return None;
+    }
+    let email = root_config
+        .jira
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if email.is_some() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Jira tool: Cloud mode (API v3, Basic auth)"
+        );
+    } else {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Jira tool: Server/DC mode (API v2, Bearer auth)"
+        );
+    }
+    Some(Arc::new(JiraTool::new(
+        root_config.jira.base_url.trim().to_string(),
+        email,
+        api_token,
+        root_config.jira.allowed_actions.clone(),
+        security,
+        root_config.jira.timeout_secs,
+    )))
+}
+
+/// Rebuilds `composio` bound to `security`. The key and entity id are the
+/// global `root_config.composio` values every caller of
+/// `all_tools_with_runtime` passes down, not per-agent credentials.
+pub(crate) fn composio_tool(
+    security: Arc<SecurityPolicy>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+) -> Option<Arc<dyn Tool>> {
+    let key = composio_key.filter(|key| !key.is_empty())?;
+    Some(Arc::new(ComposioTool::new(
+        key,
+        composio_entity_id,
+        security,
+    )))
+}
+
+/// Rebuilds `google_workspace` bound to `security`, gated as
+/// `all_tools_with_runtime` gates it (config plus runtime shell access).
+pub(crate) fn google_workspace_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+    has_shell_access: bool,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.google_workspace.enabled {
+        return None;
+    }
+    if !has_shell_access {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "google_workspace: skipped registration because shell access is unavailable"
+        );
+        return None;
+    }
+    Some(Arc::new(GoogleWorkspaceTool::new(
+        security,
+        root_config.google_workspace.allowed_services.clone(),
+        root_config.google_workspace.allowed_operations.clone(),
+        root_config.google_workspace.credentials_path.clone(),
+        root_config.google_workspace.default_account.clone(),
+        root_config.google_workspace.rate_limit_per_minute,
+        root_config.google_workspace.timeout_secs,
+        root_config.google_workspace.audit_log,
+    )))
+}
+
+/// Outcome of building `microsoft365`, which unlike every other tool here can
+/// abort the whole registry: a `client_credentials` flow with no client secret
+/// is a fail-fast misconfiguration, not a tool to skip.
+pub(crate) enum Microsoft365Registration {
+    /// Register this tool.
+    Tool(Arc<dyn Tool>),
+    /// Not configured, or construction failed - skip it (already logged).
+    Skip,
+    /// Misconfigured credentials: `all_tools_with_runtime` returns early here.
+    AbortRegistry,
+}
+
+/// Rebuilds `microsoft365` bound to `security`. Tenant, client and secret are
+/// global (`root_config.microsoft365`); the token cache lives next to
+/// `config.toml`, falling back to `workspace_dir` only when the config path has
+/// no parent - which is why the caller passes the workspace it is building for.
+pub(crate) fn microsoft365_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+    workspace_dir: &std::path::Path,
+) -> Microsoft365Registration {
+    if !root_config.microsoft365.enabled {
+        return Microsoft365Registration::Skip;
+    }
+    let ms_cfg = &root_config.microsoft365;
+    let tenant_id = ms_cfg
+        .tenant_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let client_id = ms_cfg
+        .client_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if tenant_id.is_empty() || client_id.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "microsoft365: skipped registration because tenant_id or client_id is empty"
+        );
+        return Microsoft365Registration::Skip;
+    }
+    // Fail fast: client_credentials flow requires a client_secret at registration time.
+    if ms_cfg.auth_flow.trim() == "client_credentials"
+        && ms_cfg
+            .client_secret
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
+        );
+        return Microsoft365Registration::AbortRegistry;
+    }
+
+    let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
+        tenant_id,
+        client_id,
+        client_secret: ms_cfg.client_secret.clone(),
+        auth_flow: ms_cfg.auth_flow.clone(),
+        scopes: ms_cfg.scopes.clone(),
+        token_cache_encrypted: ms_cfg.token_cache_encrypted,
+        user_id: ms_cfg.user_id.as_deref().unwrap_or("me").to_string(),
+    };
+    // Store token cache in the config directory (next to config.toml),
+    // not the workspace directory, to keep bearer tokens out of the
+    // project tree.
+    let cache_dir = root_config.config_path.parent().unwrap_or(workspace_dir);
+    match Microsoft365Tool::new(resolved, security, cache_dir) {
+        Ok(tool) => Microsoft365Registration::Tool(Arc::new(tool)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "microsoft365: failed to initialize tool"
+            );
+            Microsoft365Registration::Skip
+        }
+    }
+}
+
+/// Rebuilds `model_routing_config` bound to `security`. Always registered.
+pub(crate) fn model_routing_config_tool(
+    security: Arc<SecurityPolicy>,
+    config: Arc<Config>,
+) -> Arc<dyn Tool> {
+    Arc::new(ModelRoutingConfigTool::new(config, security))
+}
+
+/// Rebuilds `proxy_config` bound to `security`. Always registered.
+pub(crate) fn proxy_config_tool(
+    security: Arc<SecurityPolicy>,
+    config: Arc<Config>,
+) -> Arc<dyn Tool> {
+    Arc::new(ProxyConfigTool::new(config, security))
+}
+
+/// Rebuilds `sessions_history` bound to `security`. The backend is built from
+/// the global `config.data_dir` + session-backend setting, so it is the same
+/// object for caller and target; only the gate differs.
+pub(crate) fn sessions_history_tool(
+    security: Arc<SecurityPolicy>,
+    backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+) -> Arc<dyn Tool> {
+    Arc::new(SessionsHistoryTool::new(backend, security))
+}
+
+/// Rebuilds `sessions_send` bound to `security`. Same backend reasoning as
+/// [`sessions_history_tool`].
+pub(crate) fn sessions_send_tool(
+    security: Arc<SecurityPolicy>,
+    backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+) -> Arc<dyn Tool> {
+    Arc::new(SessionsSendTool::new(backend, security))
+}
+
 // ── Factories for IDENTITY_BOUND_TOOL_NAMES ──────────────────────────────
 //
 // Each function below rebuilds exactly one of the tools from
@@ -1543,12 +1994,9 @@ pub fn all_tools_with_runtime(
             is_subagent_caller,
         ),
         send_message_to_peer_tool(config.clone(), agent_alias),
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
-            security.clone(),
-        )),
+        model_routing_config_tool(security.clone(), config.clone()),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
-        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        proxy_config_tool(security.clone(), config.clone()),
         git_operations_tool(security.clone(), workspace_dir),
         pushover_tool(security.clone(), workspace_dir),
         Arc::new(CalculatorTool::new()),
@@ -1644,124 +2092,29 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(tool);
     }
 
-    if browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
-        match BrowserOpenTool::new_with_private_hosts(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.allowed_private_hosts.clone(),
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(tool));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "browser_open: failed to construct tool, skipping registration"
-                );
-            }
-        }
-        // Add full browser automation tool (pluggable backend)
-        if let Some(tool) = browser_tool(security.clone(), browser_config) {
-            tool_arcs.push(tool);
-        }
+    if let Some(tool) = browser_open_tool(security.clone(), browser_config) {
+        tool_arcs.push(tool);
+    }
+    if let Some(tool) = browser_tool(security.clone(), browser_config) {
+        tool_arcs.push(tool);
     }
 
     // Browser delegation tool (conditionally registered; requires shell access)
-    if root_config.browser_delegate.enabled {
-        if has_shell_access {
-            tool_arcs.push(Arc::new(BrowserDelegateTool::new(
-                security.clone(),
-                root_config.browser_delegate.clone(),
-            )));
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "browser_delegate: skipped registration because the current runtime does not allow shell access"
-            );
-        }
+    if let Some(tool) = browser_delegate_tool(security.clone(), root_config, has_shell_access) {
+        tool_arcs.push(tool);
     }
 
-    if http_config.enabled {
-        match HttpRequestTool::new_with_config(
-            security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-            http_config.allow_private_hosts,
-            http_config.allowed_private_hosts.clone(),
-            root_config.security.nat64_prefixes.clone(),
-            root_config.config_path.clone(),
-            root_config.secrets.encrypt,
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "http_request: failed to construct tool, skipping registration"
-                );
-            }
-        }
+    if let Some(tool) = http_request_tool(security.clone(), http_config, root_config) {
+        tool_arcs.push(tool);
     }
 
-    if web_fetch_config.enabled {
-        match WebFetchTool::new(
-            security.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
-            web_fetch_config.allowed_private_hosts.clone(),
-            root_config.security.nat64_prefixes.clone(),
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "web_fetch: failed to construct tool, skipping registration"
-                );
-            }
-        }
+    if let Some(tool) = web_fetch_tool(security.clone(), web_fetch_config, root_config) {
+        tool_arcs.push(tool);
     }
 
     // Text browser tool (headless text-based browser rendering)
-    if root_config.text_browser.enabled {
-        match TextBrowserTool::new_with_private_hosts(
-            security.clone(),
-            root_config.text_browser.preferred_browser.clone(),
-            root_config.text_browser.timeout_secs,
-            root_config.text_browser.allowed_private_hosts.clone(),
-            root_config.security.nat64_prefixes.clone(),
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(tool));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "text_browser: failed to construct tool, skipping registration"
-                );
-            }
-        }
+    if let Some(tool) = text_browser_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // Web search tool (enabled by default for GLM and other models)
@@ -1788,75 +2141,13 @@ pub fn all_tools_with_runtime(
     }
 
     // Notion API tool (conditionally registered)
-    if root_config.notion.enabled {
-        let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
-            std::env::var("NOTION_API_KEY").unwrap_or_default()
-        } else {
-            root_config.notion.api_key.trim().to_string()
-        };
-        if notion_api_key.trim().is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
-            );
-        } else {
-            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
-        }
+    if let Some(tool) = notion_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // Jira integration (config-gated)
-    if root_config.jira.enabled {
-        let api_token = if root_config.jira.api_token.trim().is_empty() {
-            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
-        } else {
-            root_config.jira.api_token.trim().to_string()
-        };
-        if api_token.trim().is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
-            );
-        } else if root_config.jira.base_url.trim().is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Jira tool enabled but jira.base_url is empty — skipping registration"
-            );
-        } else {
-            let email = root_config
-                .jira
-                .email
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            if email.is_some() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "Jira tool: Cloud mode (API v3, Basic auth)"
-                );
-            } else {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "Jira tool: Server/DC mode (API v2, Bearer auth)"
-                );
-            }
-            tool_arcs.push(Arc::new(JiraTool::new(
-                root_config.jira.base_url.trim().to_string(),
-                email,
-                api_token,
-                root_config.jira.allowed_actions.clone(),
-                security.clone(),
-                root_config.jira.timeout_secs,
-            )));
-        }
+    if let Some(tool) = jira_tool(security.clone(), root_config) {
+        tool_arcs.push(tool);
     }
 
     // Project delivery intelligence
@@ -1893,24 +2184,8 @@ pub fn all_tools_with_runtime(
     }
 
     // Google Workspace CLI (gws) integration — requires shell access
-    if root_config.google_workspace.enabled && has_shell_access {
-        tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
-            security.clone(),
-            root_config.google_workspace.allowed_services.clone(),
-            root_config.google_workspace.allowed_operations.clone(),
-            root_config.google_workspace.credentials_path.clone(),
-            root_config.google_workspace.default_account.clone(),
-            root_config.google_workspace.rate_limit_per_minute,
-            root_config.google_workspace.timeout_secs,
-            root_config.google_workspace.audit_log,
-        )));
-    } else if root_config.google_workspace.enabled {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "google_workspace: skipped registration because shell access is unavailable"
-        );
+    if let Some(tool) = google_workspace_tool(security.clone(), root_config, has_shell_access) {
+        tool_arcs.push(tool);
     }
 
     if any_coding_cli_tool_enabled(root_config) && !register_coding_cli_tools {
@@ -1976,11 +2251,8 @@ pub fn all_tools_with_runtime(
     {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-            backend.clone(),
-            security.clone(),
-        )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        tool_arcs.push(sessions_history_tool(security.clone(), backend.clone()));
+        tool_arcs.push(sessions_send_tool(security.clone(), backend));
     }
 
     // LinkedIn integration (config-gated)
@@ -2054,14 +2326,8 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    if let Some(key) = composio_key
-        && !key.is_empty()
-    {
-        tool_arcs.push(Arc::new(ComposioTool::new(
-            key,
-            composio_entity_id,
-            security.clone(),
-        )));
+    if let Some(tool) = composio_tool(security.clone(), composio_key, composio_entity_id) {
+        tool_arcs.push(tool);
     }
 
     // Emoji reaction tool — always registered; owns its own late-bound channel map.
@@ -2115,80 +2381,24 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(escalate_tool));
 
     // Microsoft 365 Graph API integration
-    if root_config.microsoft365.enabled {
-        let ms_cfg = &root_config.microsoft365;
-        let tenant_id = ms_cfg
-            .tenant_id
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let client_id = ms_cfg
-            .client_id
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if !tenant_id.is_empty() && !client_id.is_empty() {
-            // Fail fast: client_credentials flow requires a client_secret at registration time.
-            if ms_cfg.auth_flow.trim() == "client_credentials"
-                && ms_cfg
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
-                );
-                return AllToolsResult {
-                    unfiltered_tool_arcs: tool_arcs.clone(),
-                    tools: boxed_registry_from_arcs(tool_arcs),
-                    delegate_handle: None,
-                    #[cfg(test)]
-                    delegate_tool: None,
-                    ask_user_handle,
-                    channel_room_handle,
-                    reaction_handle,
-                    poll_handle: Some(poll_handle),
-                    escalate_handle,
-                };
-            }
-
-            let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
-                tenant_id,
-                client_id,
-                client_secret: ms_cfg.client_secret.clone(),
-                auth_flow: ms_cfg.auth_flow.clone(),
-                scopes: ms_cfg.scopes.clone(),
-                token_cache_encrypted: ms_cfg.token_cache_encrypted,
-                user_id: ms_cfg.user_id.as_deref().unwrap_or("me").to_string(),
+    match microsoft365_tool(security.clone(), root_config, workspace_dir) {
+        Microsoft365Registration::Tool(tool) => tool_arcs.push(tool),
+        Microsoft365Registration::Skip => {}
+        // Preserved fail-fast: a client_credentials flow with no secret
+        // aborts the whole registry rather than registering anything else.
+        Microsoft365Registration::AbortRegistry => {
+            return AllToolsResult {
+                unfiltered_tool_arcs: tool_arcs.clone(),
+                tools: boxed_registry_from_arcs(tool_arcs),
+                delegate_handle: None,
+                #[cfg(test)]
+                delegate_tool: None,
+                ask_user_handle,
+                channel_room_handle,
+                reaction_handle,
+                poll_handle: Some(poll_handle),
+                escalate_handle,
             };
-            // Store token cache in the config directory (next to config.toml),
-            // not the workspace directory, to keep bearer tokens out of the
-            // project tree.
-            let cache_dir = root_config.config_path.parent().unwrap_or(workspace_dir);
-            match Microsoft365Tool::new(resolved, security.clone(), cache_dir) {
-                Ok(tool) => tool_arcs.push(Arc::new(tool)),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "microsoft365: failed to initialize tool"
-                    );
-                }
-            }
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "microsoft365: skipped registration because tenant_id or client_id is empty"
-            );
         }
     }
 

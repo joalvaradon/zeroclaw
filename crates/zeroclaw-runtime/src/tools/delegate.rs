@@ -3096,6 +3096,123 @@ impl DelegateTool {
                     }
                 }
 
+                // Tools that capture the caller's `SecurityPolicy` only for its
+                // autonomy/rate gate, with global credentials and endpoint
+                // config - see `AUTONOMY_REBOUND_TOOL_NAMES`. Reused unchanged
+                // they let a read-only target act under the CALLER's autonomy,
+                // so they are rebuilt from `target_policy` through the SAME
+                // factories `all_tools_with_runtime` uses, which keeps their
+                // config gates and wrapper stacks from drifting apart.
+                let needs_autonomy_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && crate::tools::AUTONOMY_REBOUND_TOOL_NAMES.contains(&tool.name())
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
+                let mut target_autonomy_tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
+                if needs_autonomy_tools && let Some(root_config) = self.root_config.as_ref() {
+                    let mut insert = |tool: Option<Arc<dyn Tool>>| {
+                        if let Some(tool) = tool {
+                            target_autonomy_tools.insert(
+                                tool.name().to_string(),
+                                Box::new(ToolArcRef::new(tool)) as Box<dyn Tool>,
+                            );
+                        }
+                    };
+                    // Shell-gated registrations must see the same answer the
+                    // production path would: no runtime adapter means no shell.
+                    let has_shell_access = self
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.has_shell_access());
+                    insert(crate::tools::http_request_tool(
+                        Arc::clone(&target_policy),
+                        &root_config.http_request,
+                        root_config,
+                    ));
+                    insert(crate::tools::web_fetch_tool(
+                        Arc::clone(&target_policy),
+                        &root_config.web_fetch,
+                        root_config,
+                    ));
+                    insert(crate::tools::text_browser_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ));
+                    insert(crate::tools::browser_open_tool(
+                        Arc::clone(&target_policy),
+                        &root_config.browser,
+                    ));
+                    insert(crate::tools::browser_delegate_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                        has_shell_access,
+                    ));
+                    insert(crate::tools::notion_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ));
+                    insert(crate::tools::jira_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ));
+                    insert(crate::tools::google_workspace_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                        has_shell_access,
+                    ));
+                    // Composio's key and entity id are the global config values,
+                    // resolved exactly as the independent path resolves them.
+                    let (composio_key, composio_entity_id) = if root_config.composio.enabled {
+                        (
+                            root_config.composio.api_key.as_deref(),
+                            Some(root_config.composio.entity_id.as_str()),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    insert(crate::tools::composio_tool(
+                        Arc::clone(&target_policy),
+                        composio_key,
+                        composio_entity_id,
+                    ));
+                    // A misconfigured `microsoft365` aborts the production
+                    // registry; here the delegate simply omits it, which is the
+                    // fail-closed reading of the same signal.
+                    if let crate::tools::Microsoft365Registration::Tool(tool) =
+                        crate::tools::microsoft365_tool(
+                            Arc::clone(&target_policy),
+                            root_config,
+                            &target_policy.workspace_dir,
+                        )
+                    {
+                        insert(Some(tool));
+                    }
+                    insert(Some(crate::tools::model_routing_config_tool(
+                        Arc::clone(&target_policy),
+                        Arc::clone(root_config),
+                    )));
+                    insert(Some(crate::tools::proxy_config_tool(
+                        Arc::clone(&target_policy),
+                        Arc::clone(root_config),
+                    )));
+                    if let Ok(backend) = zeroclaw_infra::make_session_backend(
+                        &root_config.data_dir,
+                        &root_config.channels.session_backend,
+                    ) {
+                        insert(Some(crate::tools::sessions_history_tool(
+                            Arc::clone(&target_policy),
+                            backend.clone(),
+                        )));
+                        insert(Some(crate::tools::sessions_send_tool(
+                            Arc::clone(&target_policy),
+                            backend,
+                        )));
+                    }
+                }
+
                 // Deny by default. A bounded target always crosses at least the
                 // alias boundary - neither reachability path lets an agent
                 // delegate to itself - so reuse of a caller-built instance has to
@@ -3152,6 +3269,7 @@ impl DelegateTool {
                                 .or_else(|| target_fs_tools.remove(tool.name()))
                                 .or_else(|| target_workspace_bound_tools.remove(tool.name()))
                                 .or_else(|| target_identity_bound_tools.remove(tool.name()))
+                                .or_else(|| target_autonomy_tools.remove(tool.name()))
                             {
                                 return Some(rebuilt);
                             }
@@ -12881,6 +12999,348 @@ command = "echo hi"
             !names.iter().any(|n| n == "caller_srv__do_thing"),
             "an MCP tool whose server only the caller holds must be omitted, \
              got {names:?}"
+        );
+    }
+
+    /// Calls one named tool, then reports the tool result as the final answer,
+    /// so a regression can assert on what the TARGET's own instance returned.
+    struct SingleToolCallCapturingProvider {
+        tool_name: String,
+        arguments: String,
+        tool_message: std::sync::Mutex<Option<String>>,
+        saw_tool: std::sync::Mutex<bool>,
+    }
+
+    impl SingleToolCallCapturingProvider {
+        fn new(tool_name: &str, arguments: serde_json::Value) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+                tool_message: std::sync::Mutex::new(None),
+                saw_tool: std::sync::Mutex::new(false),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+
+        fn tool_was_offered(&self) -> bool {
+            *self.saw_tool.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SingleToolCallCapturingProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let offered = request
+                .tools
+                .is_some_and(|tools| tools.iter().any(|tool| tool.name == self.tool_name));
+            if offered {
+                *self.saw_tool.lock().unwrap() = true;
+            }
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                return Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            if !offered {
+                // Calling a tool the target was never offered would fail the
+                // turn on a semantic error and hide which assertion actually
+                // caught the regression.
+                return Ok(ChatResponse {
+                    text: Some("tool not offered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: self.tool_name.clone(),
+                    arguments: self.arguments.clone(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SingleToolCallCapturingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SingleToolCallCapturingProvider"
+        }
+    }
+
+    /// Caller/target pair whose only difference is the autonomy level, so a
+    /// regression can tell WHICH policy a rebuilt tool ended up gating on.
+    fn autonomy_rebound_config(
+        tool_name: &str,
+        target_level: zeroclaw_config::autonomy::AutonomyLevel,
+        tmp: &TempDir,
+    ) -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{AutonomyLevel, DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let allowed = vec![tool_name.to_string(), DelegateTool::NAME.to_string()];
+
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                // The caller may act.
+                level: AutonomyLevel::Full,
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: allowed.clone(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                level: target_level,
+                allowed_tools: allowed,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// A read-only target must not act with the caller's autonomy.
+    ///
+    /// `http_request` bakes the `SecurityPolicy` it was built with into a
+    /// private field and checks `can_act()` before it does anything else, so a
+    /// caller-built instance handed to a read-only target would act under the
+    /// CALLER's autonomy. The rebuilt instance must refuse instead - and it
+    /// must still be present, since omitting it is a loss of function, not a
+    /// fix.
+    ///
+    /// No network is reachable from this test either way: the gate returns
+    /// before any connection is attempted, and the URL points at a closed
+    /// loopback port so a regression fails locally rather than dialing out.
+    #[tokio::test]
+    async fn bounded_cross_profile_http_request_gates_on_target_autonomy() {
+        let tmp = TempDir::new().unwrap();
+        let config = autonomy_rebound_config(
+            "http_request",
+            zeroclaw_config::autonomy::AutonomyLevel::ReadOnly,
+            &tmp,
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        assert!(
+            caller_policy.can_act(),
+            "the caller fixture must be able to act, or the test proves nothing"
+        );
+        let target_policy =
+            SecurityPolicy::for_agent(&config, "target").expect("target policy resolves");
+        assert!(
+            !target_policy.can_act(),
+            "the target fixture must be read-only"
+        );
+
+        // Built with the CALLER's policy, exactly as the real registry does.
+        let caller_http = crate::tools::HttpRequestTool::new_with_config(
+            Arc::clone(&caller_policy),
+            vec!["127.0.0.1".to_string()],
+            1024,
+            1,
+            true,
+            vec!["127.0.0.1".to_string()],
+            Vec::new(),
+            config.config_path.clone(),
+            false,
+        )
+        .expect("caller http_request builds");
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                crate::tools::RateLimitedTool::new(caller_http, Arc::clone(&caller_policy)),
+            )])));
+
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+
+        let provider = SingleToolCallCapturingProvider::new(
+            "http_request",
+            json!({"url": "http://127.0.0.1:9/", "method": "GET"}),
+        );
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "fetch it",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        assert!(
+            provider.tool_was_offered(),
+            "http_request must stay available to the target: rebuilding it against \
+             the target's policy is the fix, omitting it is a loss of function"
+        );
+        let observed = provider
+            .tool_message()
+            .expect("the target's http_request must have produced a tool result");
+        assert!(
+            observed.contains("Action blocked: autonomy is read-only"),
+            "http_request must gate on the TARGET's autonomy, not the caller's; got {observed:?}"
+        );
+    }
+
+    /// Control case for the regression above: rebuilding against the target's
+    /// policy must restore the capability, not quietly disable it. A target
+    /// that MAY act gets an `http_request` that passes its own autonomy gate.
+    ///
+    /// The URL is a closed loopback port, so the call fails at the connection,
+    /// never off-box - what matters is only that it got past the gate.
+    #[tokio::test]
+    async fn bounded_cross_profile_http_request_stays_usable_for_acting_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = autonomy_rebound_config(
+            "http_request",
+            zeroclaw_config::autonomy::AutonomyLevel::Full,
+            &tmp,
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_http = crate::tools::HttpRequestTool::new_with_config(
+            Arc::clone(&caller_policy),
+            vec!["127.0.0.1".to_string()],
+            1024,
+            1,
+            true,
+            vec!["127.0.0.1".to_string()],
+            Vec::new(),
+            config.config_path.clone(),
+            false,
+        )
+        .expect("caller http_request builds");
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                crate::tools::RateLimitedTool::new(caller_http, Arc::clone(&caller_policy)),
+            )])));
+
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+
+        let provider = SingleToolCallCapturingProvider::new(
+            "http_request",
+            json!({"url": "http://127.0.0.1:9/", "method": "GET"}),
+        );
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "fetch it",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        assert!(
+            provider.tool_was_offered(),
+            "http_request must remain available to a target that may act"
+        );
+        let observed = provider
+            .tool_message()
+            .expect("the target's http_request must have produced a tool result");
+        assert!(
+            !observed.contains("Action blocked: autonomy is read-only"),
+            "a target that may act must not be gated as read-only; got {observed:?}"
         );
     }
 }
