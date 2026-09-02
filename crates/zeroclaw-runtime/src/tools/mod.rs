@@ -487,6 +487,78 @@ pub const IDENTITY_BOUND_TOOL_NAMES: &[&str] = &[
     "spawn_subagent",
 ];
 
+/// Tools a `Bounded` delegate target may reuse from the caller's registry
+/// **as-is**, because they provably capture nothing that would differ if the
+/// instance were built with the target's context.
+///
+/// This is the positive side of the inverted rule: the bounded fallback in
+/// `DelegateTool` reuses a caller instance ONLY for a name listed here (or an
+/// MCP tool the target's own bundles grant). Everything else that is not
+/// rebuilt against the target's policy is OMITTED from the target registry.
+/// A name added to the codebase and forgotten here loses functionality, it
+/// does not silently inherit the caller's context - which is the property
+/// the three hand-maintained inventories above cannot offer on their own.
+///
+/// Admission test, applied per tool by reading its constructor and its real
+/// construction site in `all_tools_with_runtime`: *would any argument change
+/// if this tool were built with the TARGET's context?* Every member below
+/// answers no - none captures a `SecurityPolicy`, an agent alias, or a live
+/// channel handle; their arguments come from `root_config`, from
+/// process-wide shared handles, or from nothing at all.
+///
+/// Note that `sop_execute`, `sop_advance` and `web_search_tool` hold no
+/// `security` field, so they run no internal `can_act` gate. Reusing them is
+/// still correct under the capture test - an instance built with the target's
+/// context would be byte-identical - but the absence of that gate is a
+/// pre-existing property of those tools, identical outside bounded
+/// delegation, and is not what this boundary fix addresses.
+pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
+    // Unit structs: no fields at all.
+    "calculator",
+    "weather",
+    "report_template",
+    "TodoWrite",
+    // `CloudPatternsTool::new()` takes no arguments: static pattern data.
+    "cloud_patterns",
+    // `(default_language, risk_sensitivity)`, both from `root_config.project_intel`.
+    "project_intel",
+    // Holds `Arc<KnowledgeGraph>` opened from `root_config.knowledge.db_path`.
+    "knowledge",
+    // Holds `root_config.cloud_ops` - domain config, not a `SecurityPolicy`.
+    "cloud_ops",
+    // Holds `root_config.security_ops` + its playbooks: "security" here is the
+    // tool's problem domain (IaC scanning), not the caller's policy.
+    "security_ops",
+    // NOT stateless: `CanvasStore` wraps `Arc<RwLock<HashMap<..>>>`. It is
+    // shared session state, and sharing it with a bounded target is the
+    // intended behaviour - a bounded child works inside the caller's turn.
+    "canvas",
+    // The SOP tools below hold the shared `sop_engine`/`sop_audit`/metrics
+    // handles that `all_tools_with_runtime` receives as parameters: the same
+    // objects for caller and target. `sop_approve` is deliberately absent -
+    // it is the one SOP tool built `.with_agent_alias(agent_alias)`.
+    "sop_list",
+    "sop_execute",
+    "sop_advance",
+    "sop_status",
+    // Its `PathBuf` is `root_config.install_root_dir()`, the global install
+    // root that anchors SOP-definition writes - not the caller's workspace.
+    "sop_workshop",
+    // Hold only the session backend, built from `config.data_dir` and the
+    // global session-backend setting. `sessions_history`/`sessions_send` are
+    // deliberately absent: those two do capture `security`.
+    "sessions_current",
+    "sessions_list",
+    // Reads the shared, global `discord` archive DB, not per-agent memory.
+    "discord_search",
+    // Nine constructor arguments, all from `root_config.web_search` plus the
+    // global config path and secrets-encryption flag.
+    "web_search_tool",
+    // Hold the global e-mail account map and auth service.
+    "email_search",
+    "email_read",
+];
+
 /// The vision `image_info` tool, wrapped exactly like every other filesystem-boundary
 /// tool (`RateLimitedTool` + `PathGuardedTool`). Factored out of the big assembly
 /// function below so a `Bounded` delegate target can rebuild it against its own
