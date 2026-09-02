@@ -470,21 +470,31 @@ pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
 /// mechanism). Kept in sync with the constructors by
 /// `identity_bound_tool_names_are_actually_constructed` below.
 ///
-/// `sop_approve` (audit-attribution spoofing only - the approval gets
-/// recorded under the caller's alias) is a known member of this class NOT
-/// yet in this list: fixing it needs `DelegateTool` to carry the shared
-/// `sop_engine`/`sop_audit` handles it doesn't currently have (they come
-/// from outside `root_config`, unlike everything else reconstructed here),
-/// which is new plumbing rather than a factory-function fix. Deferred as the
-/// least severe of this class (no privilege escalation, no data leak).
+/// Capture is not always a field. `send_via` binds the caller's alias inside
+/// a peer-group resolver closure, which is why grepping for an `agent_alias`
+/// field misses it; `llm_task` bakes the caller's provider api_key.
+///
+/// `sop_approve` is in this list but cannot be rebuilt: the target may simply
+/// not be in a checkpoint's `required_group`, so there is no correct instance
+/// to hand it. It gets a refusing stub with the real schema instead
+/// (`BoundedSopApproveDenied`). Note that this is authorization, not just
+/// audit attribution: `authorize_checkpoint` resolves the approving principal
+/// from this alias and returns `NotAuthorized` when it is outside the
+/// required group, before it ever looks at the decision.
 pub const IDENTITY_BOUND_TOOL_NAMES: &[&str] = &[
     "read_skill",
     "cron_add",
     "cron_update",
     "cron_remove",
+    "cron_list",
+    "cron_run",
+    "cron_runs",
     "schedule",
     "send_message_to_peer",
     "spawn_subagent",
+    "send_via",
+    "llm_task",
+    "sop_approve",
 ];
 
 /// Tools a `Bounded` delegate target may reuse from the caller's registry
@@ -827,6 +837,128 @@ pub(crate) fn browser_tool(
             None
         }
     }
+}
+
+/// Tools that capture BOTH the caller's `SecurityPolicy` and a live channel
+/// handle at construction time.
+///
+/// They cannot be reused (the policy gate is inside each tool, not in the
+/// `RateLimitedTool` wrapper, so re-wrapping a caller instance changes
+/// nothing), and they cannot simply be rebuilt either: a fresh handle map
+/// would be empty, giving the target a tool that looks available in the prompt
+/// and then fails at runtime with no channel to answer on. So they are rebuilt
+/// against `target_policy` while KEEPING the caller's live handle - the gate
+/// becomes the target's, the delivery route stays connected.
+///
+/// A missing handle means the tool is omitted rather than reused: an empty map
+/// is worse than an absent tool.
+pub const CHANNEL_REBOUND_TOOL_NAMES: &[&str] = &[
+    "ask_user",
+    "poll",
+    "reaction",
+    "channel_room",
+    "git_forge",
+    "escalate_to_human",
+];
+
+/// The live channel handles a `DelegateTool` needs to rebuild the
+/// [`CHANNEL_REBOUND_TOOL_NAMES`] tools (and `send_via`) for a `Bounded`
+/// target without disconnecting them.
+///
+/// These are the same maps the caller's own tools hold, created once in
+/// `all_tools_with_runtime` and bound to real channels later by the daemon.
+/// Two of them are shared by design: `reaction` backs `git_forge` as well, and
+/// `ask_user` backs `send_via`.
+#[derive(Clone, Default)]
+pub struct DelegateChannelHandles {
+    pub poll: Option<PerToolChannelHandle>,
+    pub reaction: Option<PerToolChannelHandle>,
+    pub channel_room: Option<PerToolChannelHandle>,
+    pub ask_user: Option<PerToolChannelHandle>,
+    pub escalate: Option<PerToolChannelHandle>,
+}
+
+/// Rebuilds `ask_user` bound to `security`, keeping the caller's live channel
+/// handle. `AskUserTool` gates on its captured policy internally, so a
+/// `Bounded` cross-profile target reusing the caller's instance would prompt
+/// under the CALLER's autonomy.
+pub(crate) fn ask_user_tool(
+    security: Arc<SecurityPolicy>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(AskUserTool::new(security, handle))
+}
+
+/// Rebuilds `poll` bound to `security`, keeping the caller's live handle.
+pub(crate) fn poll_tool(
+    security: Arc<SecurityPolicy>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(PollTool::new(security, handle))
+}
+
+/// Rebuilds `reaction` bound to `security`, keeping the caller's live handle.
+pub(crate) fn reaction_tool(
+    security: Arc<SecurityPolicy>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(ReactionTool::new(security, handle))
+}
+
+/// Rebuilds `channel_room` bound to `security`, keeping the caller's live
+/// handle.
+pub(crate) fn channel_room_tool(
+    security: Arc<SecurityPolicy>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(ChannelRoomTool::new(security, handle))
+}
+
+/// Rebuilds `git_forge` bound to `security`. Shares the `reaction` handle in
+/// production, and does so here too.
+pub(crate) fn git_forge_tool(
+    security: Arc<SecurityPolicy>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(GitForgeTool::new(security, handle))
+}
+
+/// Rebuilds `escalate_to_human` bound to `security`, keeping the caller's live
+/// handle. The alert-channel list is global (`root_config.escalation`), so it
+/// is the same for caller and target.
+pub(crate) fn escalate_to_human_tool(
+    security: Arc<SecurityPolicy>,
+    alert_channels: Vec<String>,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    Arc::new(EscalateToHumanTool::new(security, alert_channels, handle))
+}
+
+/// Rebuilds `send_via` bound to `security` and to `agent_alias`'s OWN peer
+/// groups, keeping the caller's live handle.
+///
+/// The alias capture here is a closure, not a field: `SendViaTool` takes an
+/// `AgentPeerGroupResolver` that filters peer groups by alias. Reused from the
+/// caller, a `Bounded` target routes through the CALLER's peer groups - which
+/// is why a grep for an `agent_alias` field misses this tool entirely.
+///
+/// `live_config` mirrors `all_tools_with_runtime`: a live handle so reloads
+/// take effect, falling back to a snapshot when there is none.
+pub(crate) fn send_via_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    agent_alias: &str,
+    handle: PerToolChannelHandle,
+) -> Arc<dyn Tool> {
+    let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config {
+        let alias = agent_alias.to_string();
+        Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
+    } else {
+        let snapshot = filter_agent_peer_groups(root_config, agent_alias);
+        Arc::new(move || snapshot.clone())
+    };
+    Arc::new(SendViaTool::new(security, handle, agent_peer_groups))
 }
 
 /// Tools that bind the caller's `SecurityPolicy` for its autonomy/rate gate but
@@ -1362,6 +1494,77 @@ pub(crate) fn cron_remove_tool(
         security,
         agent_alias.to_string(),
     ))
+}
+
+/// Rebuilds `llm_task` bound to `agent_alias`'s OWN model provider.
+///
+/// `LlmTaskTool` bakes the resolved provider's `api_key` into a field, so
+/// reusing the caller's instance hands a `Bounded` target the CALLER's
+/// credential and bills its provider. `None` when the target resolves no
+/// provider - the tool is then omitted rather than falling back to the
+/// caller's, which fails before any network call rather than after.
+pub(crate) fn llm_task_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+    agent_alias: &str,
+) -> Option<Arc<dyn Tool>> {
+    let (family, alias, entry) = root_config.resolved_model_provider_for_agent(agent_alias)?;
+    let llm_task_provider = family.to_string();
+    let llm_task_model = entry
+        .model
+        .clone()
+        .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+    let llm_task_runtime_options =
+        zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
+    Some(Arc::new(LlmTaskTool::new(
+        security,
+        llm_task_provider,
+        llm_task_model,
+        entry.temperature,
+        entry.api_key.clone(),
+        llm_task_runtime_options,
+    )))
+}
+
+/// Rebuilds `cron_list` bound to `agent_alias` - unconditional in
+/// production. `CronListTool` enumerates through
+/// `cron::list_jobs_by_agent(.., &self.agent_alias)`, so a `Bounded`
+/// cross-profile target reusing the caller's instance would be shown the
+/// CALLER's schedule instead of its own.
+pub(crate) fn cron_list_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
+) -> Arc<dyn Tool> {
+    Arc::new(CronListTool::new(config, agent_alias.to_string()))
+}
+
+/// Rebuilds `cron_run` bound to `agent_alias` - unconditional in production.
+/// The most severe of the three: `CronRunTool` resolves the job through
+/// `cron::get_job_for_agent(.., &self.agent_alias)` and then EXECUTES it, so
+/// a `Bounded` cross-profile target reusing the caller's instance could fire
+/// the caller's jobs, which run under the identity stored on the job.
+pub(crate) fn cron_run_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    security: Arc<SecurityPolicy>,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+) -> Arc<dyn Tool> {
+    Arc::new(CronRunTool::new_with_runtime(
+        config,
+        security,
+        agent_alias.to_string(),
+        runtime,
+    ))
+}
+
+/// Rebuilds `cron_runs` bound to `agent_alias` - unconditional in production.
+/// Reads run history through the same `cron::get_job_for_agent` resolution as
+/// [`cron_run_tool`], so the caller's instance exposes the CALLER's run log.
+pub(crate) fn cron_runs_tool(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
+) -> Arc<dyn Tool> {
+    Arc::new(CronRunsTool::new(config, agent_alias.to_string()))
 }
 
 /// Rebuilds `schedule` bound to `agent_alias` - unconditional in production.
@@ -1961,7 +2164,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         ),
-        Arc::new(CronListTool::new(config.clone(), agent_alias)),
+        cron_list_tool(config.clone(), agent_alias),
         cron_remove_tool(config.clone(), security.clone(), agent_alias),
         cron_update_tool(
             config.clone(),
@@ -1969,13 +2172,13 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         ),
-        Arc::new(CronRunTool::new_with_runtime(
+        cron_run_tool(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
-        )),
-        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
+        ),
+        cron_runs_tool(config.clone(), agent_alias),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
@@ -2067,23 +2270,8 @@ pub fn all_tools_with_runtime(
     }
 
     // LLM task tool — registered using the calling agent's provider
-    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
-    {
-        let llm_task_provider = family.to_string();
-        let llm_task_model = entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
-        tool_arcs.push(Arc::new(LlmTaskTool::new(
-            security.clone(),
-            llm_task_provider,
-            llm_task_model,
-            entry.temperature,
-            entry.api_key.clone(),
-            llm_task_runtime_options,
-        )));
+    if let Some(tool) = llm_task_tool(security.clone(), root_config, agent_alias) {
+        tool_arcs.push(tool);
     }
 
     // ReadSkillTool holds full config to support workspace skills,
@@ -2287,10 +2475,7 @@ pub fn all_tools_with_runtime(
 
     // Poll tool — always registered; owns its own late-bound channel map.
     let poll_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    tool_arcs.push(Arc::new(PollTool::new(
-        security.clone(),
-        Arc::clone(&poll_handle),
-    )));
+    tool_arcs.push(poll_tool(security.clone(), Arc::clone(&poll_handle)));
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
@@ -2332,53 +2517,47 @@ pub fn all_tools_with_runtime(
 
     // Emoji reaction tool — always registered; owns its own late-bound channel map.
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
-    tool_arcs.push(Arc::new(reaction_tool));
+    tool_arcs.push(reaction_tool(
+        security.clone(),
+        Arc::clone(&reaction_handle),
+    ));
 
     // Unified forge operations tool, routes through the git channel via the
     // same late-bound channel map as the reaction tool. Resource/action grid
     // plus a raw catch-all over the channel's single forge_request transport.
-    let git_forge_tool = GitForgeTool::new(security.clone(), Arc::clone(&reaction_handle));
-    tool_arcs.push(Arc::new(git_forge_tool));
+    let forge_tool = git_forge_tool(security.clone(), Arc::clone(&reaction_handle));
+    tool_arcs.push(forge_tool);
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
     let channel_room_handle: Option<PerToolChannelHandle> =
         Some(Arc::new(RwLock::new(HashMap::new())));
-    let channel_room_tool = ChannelRoomTool::new(
+    tool_arcs.push(channel_room_tool(
         security.clone(),
         channel_room_handle.as_ref().cloned().unwrap(),
-    );
-    tool_arcs.push(Arc::new(channel_room_tool));
+    ));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
-    tool_arcs.push(Arc::new(ask_user_tool));
+    tool_arcs.push(ask_user_tool(
+        security.clone(),
+        ask_user_handle.as_ref().cloned().unwrap(),
+    ));
 
-    {
-        let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
-            let alias = agent_alias.to_string();
-            Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
-        } else {
-            let snapshot = filter_agent_peer_groups(root_config, agent_alias);
-            Arc::new(move || snapshot.clone())
-        };
-        tool_arcs.push(Arc::new(SendViaTool::new(
-            security.clone(),
-            ask_user_handle.as_ref().cloned().unwrap(),
-            agent_peer_groups,
-        )));
-    }
+    tool_arcs.push(send_via_tool(
+        security.clone(),
+        root_config,
+        live_config.clone(),
+        agent_alias,
+        ask_user_handle.as_ref().cloned().unwrap(),
+    ));
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
     let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let escalate_tool = EscalateToHumanTool::new(
+    tool_arcs.push(escalate_to_human_tool(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
         escalate_handle.as_ref().cloned().unwrap(),
-    );
-    tool_arcs.push(Arc::new(escalate_tool));
+    ));
 
     // Microsoft 365 Graph API integration
     match microsoft365_tool(security.clone(), root_config, workspace_dir) {
@@ -2482,6 +2661,16 @@ pub fn all_tools_with_runtime(
         // resolve against that snapshot forever. Same contract as the
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
+        // The caller's live channel handles: a bounded target's channel tools
+        // are rebuilt against its own policy but must keep answering on these
+        // very maps, which the daemon binds to real channels after this point.
+        .with_channel_handles(DelegateChannelHandles {
+            poll: Some(Arc::clone(&poll_handle)),
+            reaction: Some(Arc::clone(&reaction_handle)),
+            channel_room: channel_room_handle.as_ref().cloned(),
+            ask_user: ask_user_handle.as_ref().cloned(),
+            escalate: escalate_handle.as_ref().cloned(),
+        })
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
@@ -4453,6 +4642,30 @@ const = true
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+        // Two members of this list are config-gated, so a default config would
+        // let the loop below pass while never constructing them:
+        // `llm_task` needs the agent to resolve a model provider, and
+        // `sop_approve` needs a SOP engine handle. The assertion claims "with
+        // every relevant feature enabled" - this is what makes that true.
+        cfg.providers.models.custom.insert(
+            "sync-test".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.sync-test".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
 
         let tools = all_tools_with_runtime(
             Arc::new(cfg.clone()),
@@ -4473,7 +4686,7 @@ const = true
             None,
             false,
             None,
-            None,
+            Some(sop_engine),
             None,
             None,
         )

@@ -174,6 +174,12 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// The caller's live channel handles, so a `Bounded` target's channel
+    /// tools can be rebuilt against its own policy without losing the route
+    /// they answer on. Empty when unset (legacy unit-test constructors), in
+    /// which case those tools are omitted rather than reused - an empty
+    /// handle map would advertise a tool that fails at runtime.
+    channel_handles: crate::tools::DelegateChannelHandles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +293,7 @@ impl DelegateTool {
             root_config: None,
             live_config: None,
             caller_alias: String::new(),
+            channel_handles: crate::tools::DelegateChannelHandles::default(),
         }
     }
 
@@ -335,6 +342,7 @@ impl DelegateTool {
             root_config: None,
             live_config: None,
             caller_alias: String::new(),
+            channel_handles: crate::tools::DelegateChannelHandles::default(),
         }
     }
 
@@ -449,6 +457,18 @@ impl DelegateTool {
     /// config for the parent's whole lifetime.
     pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
         self.live_config = live_config;
+        self
+    }
+
+    /// Supply the caller's live channel handles.
+    ///
+    /// `Bounded` targets get their channel tools rebuilt against their own
+    /// `SecurityPolicy` while keeping these handles, so the autonomy gate
+    /// becomes the target's without disconnecting delivery. Without them the
+    /// affected tools are omitted: constructing them with a fresh, empty map
+    /// would put a tool in the target's prompt that cannot reach any channel.
+    pub fn with_channel_handles(mut self, handles: crate::tools::DelegateChannelHandles) -> Self {
+        self.channel_handles = handles;
         self
     }
 
@@ -1716,6 +1736,7 @@ impl DelegateTool {
         // will construct its own nested registries.
         let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
+        let channel_handles = self.channel_handles.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
@@ -1742,6 +1763,7 @@ impl DelegateTool {
                     root_config,
                     live_config,
                     caller_alias,
+                    channel_handles,
                 };
 
                 let args_inner = json!({
@@ -1968,6 +1990,7 @@ impl DelegateTool {
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
+            let channel_handles = self.channel_handles.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
@@ -1994,6 +2017,7 @@ impl DelegateTool {
                         root_config,
                         live_config,
                         caller_alias,
+                        channel_handles,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
@@ -2933,6 +2957,37 @@ impl DelegateTool {
                         ))),
                     );
                     target_identity_bound_tools.insert(
+                        "cron_list".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::cron_list_tool(
+                            Arc::clone(root_config),
+                            agent_name,
+                        ))),
+                    );
+                    target_identity_bound_tools.insert(
+                        "cron_runs".to_string(),
+                        Box::new(ToolArcRef::new(crate::tools::cron_runs_tool(
+                            Arc::clone(root_config),
+                            agent_name,
+                        ))),
+                    );
+                    if let Some(tool) = crate::tools::llm_task_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                        agent_name,
+                    ) {
+                        target_identity_bound_tools
+                            .insert("llm_task".to_string(), Box::new(ToolArcRef::new(tool)));
+                    }
+                    // Approval authority is the caller's, and it cannot be
+                    // rebuilt for the target: the target may simply not be in
+                    // the checkpoint's required group. A refusing stub with the
+                    // real schema is clearer to the model than a missing tool.
+                    target_identity_bound_tools.insert(
+                        "sop_approve".to_string(),
+                        Box::new(crate::tools::sop_approve::BoundedSopApproveDenied)
+                            as Box<dyn Tool>,
+                    );
+                    target_identity_bound_tools.insert(
                         "send_message_to_peer".to_string(),
                         Box::new(ToolArcRef::new(crate::tools::send_message_to_peer_tool(
                             Arc::clone(root_config),
@@ -2973,6 +3028,15 @@ impl DelegateTool {
                         target_identity_bound_tools.insert(
                             "cron_add".to_string(),
                             Box::new(ToolArcRef::new(crate::tools::cron_add_tool(
+                                Arc::clone(root_config),
+                                Arc::clone(&target_policy),
+                                agent_name,
+                                Arc::clone(runtime),
+                            ))),
+                        );
+                        target_identity_bound_tools.insert(
+                            "cron_run".to_string(),
+                            Box::new(ToolArcRef::new(crate::tools::cron_run_tool(
                                 Arc::clone(root_config),
                                 Arc::clone(&target_policy),
                                 agent_name,
@@ -3093,6 +3157,101 @@ impl DelegateTool {
                                 );
                             }
                         }
+                    }
+                }
+
+                // Channel tools: the caller's policy AND a live channel handle
+                // are both captured at construction. Rebuilt against
+                // `target_policy` while KEEPING the caller's handle, so the
+                // autonomy gate becomes the target's and the delivery route
+                // stays connected (see `CHANNEL_REBOUND_TOOL_NAMES`).
+                //
+                // A handle this DelegateTool never received means the tool is
+                // OMITTED: building it with a fresh, empty map would advertise
+                // a tool to the target that cannot reach any channel.
+                let needs_channel_tools = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools.iter().any(|tool| {
+                        self.security.is_tool_allowed(tool.name())
+                            && (crate::tools::CHANNEL_REBOUND_TOOL_NAMES.contains(&tool.name())
+                                || tool.name() == "send_via")
+                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                    })
+                };
+                let mut target_channel_tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
+                if needs_channel_tools && let Some(root_config) = self.root_config.as_ref() {
+                    let handles = &self.channel_handles;
+                    let mut insert = |name: &str, tool: Arc<dyn Tool>| {
+                        target_channel_tools.insert(
+                            name.to_string(),
+                            Box::new(ToolArcRef::new(tool)) as Box<dyn Tool>,
+                        );
+                    };
+                    if let Some(handle) = handles.ask_user.as_ref() {
+                        insert(
+                            "ask_user",
+                            crate::tools::ask_user_tool(
+                                Arc::clone(&target_policy),
+                                Arc::clone(handle),
+                            ),
+                        );
+                        // `send_via` shares `ask_user`'s handle in production.
+                        // Its alias capture is a closure over the peer-group
+                        // resolver, not a field, so it must be rebuilt with the
+                        // TARGET's alias or the target routes through the
+                        // caller's peer groups.
+                        insert(
+                            "send_via",
+                            crate::tools::send_via_tool(
+                                Arc::clone(&target_policy),
+                                root_config,
+                                self.live_config.clone(),
+                                agent_name,
+                                Arc::clone(handle),
+                            ),
+                        );
+                    }
+                    if let Some(handle) = handles.poll.as_ref() {
+                        insert(
+                            "poll",
+                            crate::tools::poll_tool(Arc::clone(&target_policy), Arc::clone(handle)),
+                        );
+                    }
+                    if let Some(handle) = handles.reaction.as_ref() {
+                        insert(
+                            "reaction",
+                            crate::tools::reaction_tool(
+                                Arc::clone(&target_policy),
+                                Arc::clone(handle),
+                            ),
+                        );
+                        // `git_forge` shares the `reaction` handle in production.
+                        insert(
+                            "git_forge",
+                            crate::tools::git_forge_tool(
+                                Arc::clone(&target_policy),
+                                Arc::clone(handle),
+                            ),
+                        );
+                    }
+                    if let Some(handle) = handles.channel_room.as_ref() {
+                        insert(
+                            "channel_room",
+                            crate::tools::channel_room_tool(
+                                Arc::clone(&target_policy),
+                                Arc::clone(handle),
+                            ),
+                        );
+                    }
+                    if let Some(handle) = handles.escalate.as_ref() {
+                        insert(
+                            "escalate_to_human",
+                            crate::tools::escalate_to_human_tool(
+                                Arc::clone(&target_policy),
+                                root_config.escalation.alert_channels.clone(),
+                                Arc::clone(handle),
+                            ),
+                        );
                     }
                 }
 
@@ -3270,6 +3429,7 @@ impl DelegateTool {
                                 .or_else(|| target_workspace_bound_tools.remove(tool.name()))
                                 .or_else(|| target_identity_bound_tools.remove(tool.name()))
                                 .or_else(|| target_autonomy_tools.remove(tool.name()))
+                                .or_else(|| target_channel_tools.remove(tool.name()))
                             {
                                 return Some(rebuilt);
                             }
@@ -13341,6 +13501,596 @@ command = "echo hi"
         assert!(
             !observed.contains("Action blocked: autonomy is read-only"),
             "a target that may act must not be gated as read-only; got {observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_run_cannot_trigger_callers_job() {
+        // `cron_run` resolves the job through
+        // `cron::get_job_for_agent(.., &self.agent_alias)` before it runs
+        // anything, so an instance built for the CALLER lets a Bounded target
+        // fire the caller's jobs under the caller's stored identity. The
+        // rebuilt instance must not resolve them at all.
+        //
+        // Safe either way: resolution fails before execution, and the job's
+        // command names an executable that does not exist, so even a total
+        // regression could not run anything meaningful.
+        let fixture = bounded_delegate_full_fixture("cron_run", |_cfg| {}).await;
+
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "executive_assistant",
+            Some("callers_probe".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "zzz_nonexistent_command_for_9872",
+        )
+        .unwrap();
+        let callers_job = crate::cron::list_jobs_by_agent(&fixture.config, "executive_assistant")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the caller owns one job");
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_run",
+            tool_args: serde_json::json!({ "job_id": callers_job.id }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "run that job",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "cron_run must stay available to the target - omitting it is a loss \
+             of function, not a fix: {result:?}"
+        );
+        let runs = crate::cron::list_runs(&fixture.config, &callers_job.id, 10).unwrap();
+        assert!(
+            runs.is_empty(),
+            "regression: a Bounded delegate target triggered the CALLER's cron job - \
+             got runs: {runs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_list_shows_target_jobs_not_callers() {
+        // `cron_list` enumerates through
+        // `cron::list_jobs_by_agent(.., &self.agent_alias)`, so the caller's
+        // instance shows a Bounded target the CALLER's schedule.
+        let fixture = bounded_delegate_full_fixture("cron_list", |_cfg| {}).await;
+
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "executive_assistant",
+            Some("callers_only_job".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "zzz_nonexistent_command_for_9872",
+        )
+        .unwrap();
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "fs_researcher",
+            Some("targets_own_job".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "zzz_nonexistent_command_for_9872",
+        )
+        .unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_list",
+            tool_args: serde_json::json!({}),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "list the jobs",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "cron_list must stay available to the target: {result:?}"
+        );
+        let output = result.output.to_string();
+        assert!(
+            output.contains("targets_own_job"),
+            "the target must see its OWN jobs - got: {output}"
+        );
+        assert!(
+            !output.contains("callers_only_job"),
+            "regression: a Bounded delegate target enumerated the CALLER's cron \
+             jobs - got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_cron_runs_cannot_read_callers_history() {
+        // `cron_runs` reads history through the same
+        // `cron::get_job_for_agent(.., &self.agent_alias)` resolution as
+        // `cron_run`, so the caller's instance exposes the CALLER's run log.
+        let fixture = bounded_delegate_full_fixture("cron_runs", |_cfg| {}).await;
+
+        crate::cron::add_shell_job(
+            &fixture.config,
+            "executive_assistant",
+            Some("callers_probe".to_string()),
+            crate::cron::Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "zzz_nonexistent_command_for_9872",
+        )
+        .unwrap();
+        let callers_job = crate::cron::list_jobs_by_agent(&fixture.config, "executive_assistant")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the caller owns one job");
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_runs",
+            tool_args: serde_json::json!({ "job_id": callers_job.id }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "show the run history",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "cron_runs must stay available to the target: {result:?}"
+        );
+        let output = result.output.to_string();
+        assert!(
+            !output.contains("callers_probe"),
+            "regression: a Bounded delegate target read the CALLER's cron run \
+             history - got: {output}"
+        );
+    }
+
+    /// `ask_user` gates on the policy it was built with, and the gate lives
+    /// inside the tool (not in the `RateLimitedTool` wrapper), so re-wrapping
+    /// the caller's instance would change nothing. The rebuilt instance must
+    /// gate on the TARGET's autonomy - and must still be present, keeping the
+    /// caller's live channel handle so it can actually reach someone.
+    #[tokio::test]
+    async fn bounded_cross_profile_ask_user_gates_on_target_autonomy() {
+        let tmp = TempDir::new().unwrap();
+        let config = autonomy_rebound_config(
+            "ask_user",
+            zeroclaw_config::autonomy::AutonomyLevel::ReadOnly,
+            &tmp,
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let handle: crate::tools::PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let caller_ask_user =
+            crate::tools::ask_user_tool(Arc::clone(&caller_policy), Arc::clone(&handle));
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_channel_handles(crate::tools::DelegateChannelHandles {
+                ask_user: Some(Arc::clone(&handle)),
+                ..Default::default()
+            })
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_ask_user])));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let provider = SingleToolCallCapturingProvider::new(
+            "ask_user",
+            json!({"question": "ready?", "channel": "test"}),
+        );
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "ask them",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        assert!(
+            provider.tool_was_offered(),
+            "ask_user must stay available: it is rebuilt with the caller's live \
+             handle, not dropped"
+        );
+        let observed = provider
+            .tool_message()
+            .expect("the target's ask_user must have produced a tool result");
+        assert!(
+            observed.contains("Action blocked"),
+            "ask_user must gate on the TARGET's autonomy, not the caller's; got {observed:?}"
+        );
+    }
+
+    /// Without the caller's channel handle there is no correct instance to give
+    /// the target, and building one with a fresh empty map would advertise a
+    /// tool that cannot reach any channel. Fail closed: omit it.
+    #[tokio::test]
+    async fn bounded_cross_profile_omits_channel_tool_when_handle_is_absent() {
+        let tmp = TempDir::new().unwrap();
+        let config = autonomy_rebound_config(
+            "ask_user",
+            zeroclaw_config::autonomy::AutonomyLevel::Full,
+            &tmp,
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let handle: crate::tools::PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let caller_ask_user = crate::tools::ask_user_tool(Arc::clone(&caller_policy), handle);
+
+        // No `with_channel_handles` at all.
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_ask_user])));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let provider =
+            SingleToolCallCapturingProvider::new("ask_user", json!({"question": "ready?"}));
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "ask them",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        assert!(
+            !provider.tool_was_offered(),
+            "with no channel handle plumbed through, ask_user must be omitted \
+             rather than handed over as the caller's instance"
+        );
+    }
+
+    /// `llm_task` bakes the resolved provider's api_key into a field, so a
+    /// target that resolves no provider of its own must NOT inherit the
+    /// caller's instance - that would hand over the caller's credential. It is
+    /// omitted instead, which fails before any network call rather than after.
+    #[tokio::test]
+    async fn bounded_cross_profile_omits_llm_task_when_target_resolves_no_provider() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // Only the CALLER's provider exists, and it carries a secret.
+        config.providers.models.custom.insert(
+            "callers-own".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("caller-model".to_string()),
+                    api_key: Some("sk-caller-only-credential".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let allowed = vec!["llm_task".to_string(), DelegateTool::NAME.to_string()];
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: allowed.clone(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: allowed,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "custom.callers-own".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                // Names a provider that is not configured: resolves to None.
+                model_provider: "custom.absent".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_llm_task =
+            crate::tools::llm_task_tool(Arc::clone(&caller_policy), &config, "caller")
+                .expect("the caller resolves its own provider");
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_llm_task])));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let names = {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = RecordingToolNamesProvider {
+                seen: Arc::clone(&seen),
+            };
+            let result = tool
+                .execute_agentic(
+                    "target",
+                    &target_config,
+                    "ollama",
+                    "test-model",
+                    &provider,
+                    "do the thing",
+                    None,
+                )
+                .await
+                .expect("bounded delegation runs");
+            assert!(result.success, "delegation failed: {:?}", result.error);
+            seen.lock().unwrap().clone()
+        };
+
+        assert!(
+            !names.iter().any(|n| n == "llm_task"),
+            "a target that resolves no provider must not inherit the caller's \
+             llm_task, which carries the caller's api_key; got {names:?}"
+        );
+    }
+
+    /// Approval authority cannot be rebuilt for the target - it may simply not
+    /// be in the checkpoint's required group - so `sop_approve` is replaced by
+    /// a stub that refuses without touching the engine.
+    #[tokio::test]
+    async fn bounded_cross_profile_sop_approve_is_replaced_by_refusing_stub() {
+        let tmp = TempDir::new().unwrap();
+        let config = autonomy_rebound_config(
+            "sop_approve",
+            zeroclaw_config::autonomy::AutonomyLevel::Full,
+            &tmp,
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let caller_sop_approve: Arc<dyn Tool> = Arc::new(
+            crate::tools::SopApproveTool::new(Arc::clone(&engine)).with_agent_alias("caller"),
+        );
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_sop_approve])));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let provider =
+            SingleToolCallCapturingProvider::new("sop_approve", json!({"run_id": "some-run-id"}));
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "approve it",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        assert!(
+            provider.tool_was_offered(),
+            "sop_approve stays in the registry as a stub, so the model is told it \
+             may not approve rather than finding no tool at all"
+        );
+        let observed = provider
+            .tool_message()
+            .expect("the stub must have produced a tool result");
+        assert!(
+            observed.contains("not available to a bounded delegate target"),
+            "sop_approve must refuse for a bounded target; got {observed:?}"
+        );
+    }
+
+    /// The positive half of the `llm_task` pair. The test above asserts the
+    /// caller's instance is not inherited, which the deny-by-default fallback
+    /// would satisfy on its own; this one fails unless the tool is actually
+    /// REBUILT, and it is rebuilt from `agent_name`, so the provider and
+    /// api_key it bakes in are the target's own.
+    #[tokio::test]
+    async fn bounded_cross_profile_rebuilds_llm_task_for_target_with_own_provider() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        for (alias, model, key) in [
+            ("callers-own", "caller-model", "sk-caller-only-credential"),
+            ("targets-own", "target-model", "sk-target-only-credential"),
+        ] {
+            config.providers.models.custom.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        api_key: Some(key.to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        let allowed = vec!["llm_task".to_string(), DelegateTool::NAME.to_string()];
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: allowed.clone(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: allowed,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "custom.callers-own".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "custom.targets-own".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_llm_task =
+            crate::tools::llm_task_tool(Arc::clone(&caller_policy), &config, "caller")
+                .expect("the caller resolves its own provider");
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_llm_task])));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingToolNamesProvider {
+            seen: Arc::clone(&seen),
+        };
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "do the thing",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        let names = seen.lock().unwrap().clone();
+        assert!(
+            names.iter().any(|n| n == "llm_task"),
+            "a target with its own provider must get llm_task rebuilt, not dropped; \
+             got {names:?}"
         );
     }
 }
