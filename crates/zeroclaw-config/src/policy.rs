@@ -6424,6 +6424,7 @@ mod tests {
 
     // ── is_resolved_path_readable: read-only allowlist + POSIX devs ──
 
+    #[cfg(unix)]
     #[test]
     fn readable_includes_posix_device_files() {
         // /dev/null and friends are universally-readable system paths
