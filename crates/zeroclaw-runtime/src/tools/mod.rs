@@ -4641,6 +4641,280 @@ const = true
         }
     }
 
+    /// Every bounded-delegation category, paired with its name for diagnostics.
+    fn bounded_classification_lists() -> [(&'static str, &'static [&'static str]); 8] {
+        [
+            ("MEMORY_TOOL_NAMES", zeroclaw_tools::MEMORY_TOOL_NAMES),
+            ("FILESYSTEM_TOOL_NAMES", FILESYSTEM_TOOL_NAMES),
+            (
+                "WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT",
+                WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT,
+            ),
+            ("IDENTITY_BOUND_TOOL_NAMES", IDENTITY_BOUND_TOOL_NAMES),
+            ("AUTONOMY_REBOUND_TOOL_NAMES", AUTONOMY_REBOUND_TOOL_NAMES),
+            ("CHANNEL_REBOUND_TOOL_NAMES", CHANNEL_REBOUND_TOOL_NAMES),
+            ("SAFE_FOR_BOUNDED_REUSE", SAFE_FOR_BOUNDED_REUSE),
+            ("BOUNDED_DENIED_TOOL_NAMES", BOUNDED_DENIED_TOOL_NAMES),
+        ]
+    }
+
+    /// Builds a registry with every config-gated integration switched on, so the
+    /// inventory the completeness test walks is the widest one the production
+    /// factory can produce.
+    ///
+    /// A default config hides most of these behind their `enabled` flag, which is
+    /// exactly how a name can stay unclassified while a sync test reports green.
+    fn maximal_tool_registry(tmp: &TempDir) -> Vec<String> {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(tmp);
+        cfg.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+
+        // Per-agent resolution: `llm_task` needs the agent to resolve a provider.
+        cfg.providers.models.custom.insert(
+            "completeness".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    api_key: Some("sk-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.completeness".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        // Config-gated integrations, with dummy credentials.
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "dummy-notion-key".to_string();
+        cfg.jira.enabled = true;
+        cfg.jira.base_url = "https://example.invalid".to_string();
+        cfg.jira.api_token = "dummy-jira-token".to_string();
+        cfg.google_workspace.enabled = true;
+        cfg.composio.enabled = true;
+        cfg.composio.api_key = Some("dummy-composio-key".to_string());
+        cfg.text_browser.enabled = true;
+        cfg.browser_delegate.enabled = true;
+        cfg.project_intel.enabled = true;
+        cfg.security_ops.enabled = true;
+        cfg.cloud_ops.enabled = true;
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        cfg.sop.procedural_memory_enabled = true;
+        cfg.data_retention.enabled = true;
+        cfg.linkedin.enabled = true;
+        cfg.image_gen.enabled = true;
+        cfg.file_upload.url = Some("https://example.invalid/upload".to_string());
+        cfg.file_download.url = Some("https://example.invalid/download".to_string());
+        cfg.file_upload_bundle.url = Some("https://example.invalid/bundle".to_string());
+        cfg.claude_code_runner.enabled = true;
+        // Coding CLIs are gated on config AND on the runtime granting shell +
+        // filesystem access, which `NativeRuntime` does.
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        // Graph needs a tenant and a client to register at all.
+        cfg.microsoft365.enabled = true;
+        cfg.microsoft365.tenant_id = Some("dummy-tenant".to_string());
+        cfg.microsoft365.client_id = Some("dummy-client".to_string());
+        // The default auth_flow is `client_credentials`, which fails FAST without
+        // a secret - and that fail-fast returns from `all_tools_with_runtime`
+        // entirely, truncating the inventory. Without this line the test silently
+        // walks a registry that stops at microsoft365.
+        cfg.microsoft365.client_secret = Some("dummy-secret".to_string());
+        // `TokenCache::new` refuses to run while token_cache_encrypted is set,
+        // because that encryption is not implemented yet - and that refusal
+        // makes the tool skip registration.
+        cfg.microsoft365.token_cache_encrypted = false;
+        // `discord_search` is registered when some Discord alias archives.
+        cfg.channels.discord.insert(
+            "completeness".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+        // `email_search`/`email_read` need at least one enabled email channel.
+        cfg.channels.email.insert(
+            "completeness".to_string(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let browser = BrowserConfig {
+            enabled: true,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let web_fetch = zeroclaw_config::schema::WebFetchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        let built = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("dummy-composio-key"),
+            Some("default"),
+            &browser,
+            &http,
+            &web_fetch,
+            tmp.path(),
+            &cfg.agents.clone(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(sop_engine),
+            None,
+            None,
+        );
+        built
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    /// Replaces the three hand-maintained sync tests with a real completeness
+    /// check: every tool the production factory builds must fall in EXACTLY one
+    /// bounded-delegation category.
+    ///
+    /// The three tests this supersedes only asked whether the names already in a
+    /// list get constructed. That is circular - it cannot see a name nobody
+    /// added, which is precisely how three identity-bound cron tools arrived
+    /// upstream and sat unclassified while all three reported green.
+    ///
+    /// Note what this test is and is not for. The SECURITY guarantee is the
+    /// deny-by-default fallback: an unclassified name is omitted, never
+    /// inherited. This test protects against the other failure - silent LOSS of
+    /// function - and forces a deliberate decision for each new tool.
+    ///
+    /// It walks a STATIC inventory, so it says nothing about MCP tools, whose
+    /// names exist only at runtime. Those are asserted where they actually get
+    /// decided, at the fallback itself, by
+    /// `bounded_cross_profile_admits_only_target_granted_mcp_servers`: a
+    /// synthetic `<server>__<tool>` from a server the target was not granted is
+    /// omitted, while one from a granted server survives. Checking MCP here
+    /// instead would reproduce the blind spot that let `send_via` through.
+    ///
+    /// Confirmed non-circular by removing `cron_run`/`cron_list`/`cron_runs`
+    /// from `IDENTITY_BOUND_TOOL_NAMES` and re-running: this test names all
+    /// three, while the three sync tests it complements stay green - which is
+    /// the exact scenario that let them arrive unclassified in the first place.
+    #[test]
+    fn every_constructed_tool_is_classified_for_bounded_delegation() {
+        let tmp = TempDir::new().unwrap();
+        let constructed = maximal_tool_registry(&tmp);
+
+        // A floor, so a config that quietly stops enabling integrations cannot
+        // turn this into a green no-op over a handful of tools.
+        assert!(
+            constructed.len() >= 60,
+            "the maximal registry should be far larger than this; only {} tools were \
+             built, so the fixture has stopped enabling integrations and this test is \
+             no longer checking what it claims: {constructed:?}",
+            constructed.len()
+        );
+
+        let lists = bounded_classification_lists();
+        let mut unclassified: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<String> = Vec::new();
+
+        for name in &constructed {
+            // `delegate` is the one name that never reaches a target: the bounded
+            // filter strips it to prevent recursion.
+            if name == crate::tools::delegate::DelegateTool::NAME {
+                continue;
+            }
+            let hits: Vec<&str> = lists
+                .iter()
+                .filter(|(_, list)| list.contains(&name.as_str()))
+                .map(|(list_name, _)| *list_name)
+                .collect();
+            match hits.len() {
+                0 => unclassified.push(name),
+                1 => {}
+                _ => duplicated.push(format!("{name} in {hits:?}")),
+            }
+        }
+
+        assert!(
+            unclassified.is_empty(),
+            "these tools are constructed by all_tools_with_runtime but belong to no \
+             bounded-delegation category. The fallback denies them, so they are SAFE \
+             but silently unavailable to every bounded target. Classify each one \
+             (rebuilt / safe to reuse / denied) rather than leaving it to the \
+             fallback: {unclassified:?}"
+        );
+        assert!(
+            duplicated.is_empty(),
+            "these tools are in more than one category, so which one wins depends on \
+             the order the fallback happens to check: {duplicated:?}"
+        );
+
+        // The other direction: a classified name that nothing builds is a typo or
+        // a tool that was deleted, and the fallback would never consult it. The
+        // exceptions are the names built OUTSIDE `all_tools_with_runtime`, which
+        // is the very reason they went unnoticed long enough to need classifying.
+        let built_elsewhere = [
+            // `build_mcp_capability_tools`, registered by the assembly seam.
+            "mcp_resources",
+            "mcp_prompts",
+        ];
+        let mut stale: Vec<String> = Vec::new();
+        for (list_name, list) in lists {
+            for name in list {
+                if built_elsewhere.contains(name) {
+                    continue;
+                }
+                if !constructed.iter().any(|built| built == name) {
+                    stale.push(format!("{name} ({list_name})"));
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "these names are classified but nothing in the maximal registry builds \
+             them - either a typo, or a tool that no longer exists. A name here is \
+             dead weight the fallback will never match: {stale:?}"
+        );
+    }
+
     /// A name cannot be both denied and reusable. Without this, moving one of
     /// the denied names into `SAFE_FOR_BOUNDED_REUSE` would silently win - the
     /// fallback checks the safe list and never consults the denial list.
