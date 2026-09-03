@@ -2697,14 +2697,15 @@ impl DelegateTool {
         // the parent's already-built registry, not the target's assembled one).
         let mut sub_deferred_section = String::new();
         let mut sub_activated: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>> = None;
-        // For an INDEPENDENT target, build the sub-agent's system prompt (skills, identity)
-        // from the TARGET's workspace, not the caller's - so skill *prompt* content matches
-        // the skill *tools* assembled above. `None` for bounded delegation, which keeps the
-        // caller's `self.workspace_dir`.
+        // Build the sub-agent's system prompt (skills, identity) from the TARGET's
+        // workspace, not the caller's - so skill *prompt* content matches the skill
+        // *tools* assembled above. Populated by BOTH modes now; `None` only survives
+        // when there is no `root_config` to resolve the target's workspace from, which
+        // is the config-less unit-test path.
         let mut sub_workspace: Option<PathBuf> = None;
-        // The target's canonical skills (Some for independent), so the prompt's SkillsSection
-        // describes exactly the assembled skill tools rather than the local bundle resolver's
-        // narrower view. None for bounded delegation (local resolution).
+        // The target's canonical skills, so the prompt's SkillsSection describes exactly
+        // the assembled skill tools rather than the local bundle resolver's narrower
+        // view - and, for bounded, rather than the caller's own skills.
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
         let sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
             DelegateExecutionMode::Independent => {
@@ -3478,6 +3479,26 @@ impl DelegateTool {
                     },
                 )
                 .await;
+                // The prompt must describe the TARGET's skills and workspace, not
+                // the caller's. Every skill-bearing tool above is already the
+                // target's, so building the prompt from `self.workspace_dir`
+                // would describe skills the target has no tools for and omit the
+                // ones it does - the tools-from-B / prompt-from-A split the
+                // independent path already avoids.
+                //
+                // Populating these two covers BOTH skill-resolution branches at
+                // once: `sub_skills` short-circuits the resolver entirely (so
+                // neither the default `skills_dir` branch nor the
+                // `skill_bundles` branch can join a directory onto the caller's
+                // workspace), and `sub_workspace` is what reaches
+                // `PromptContext`. Same source the independent path uses.
+                if let Some(root_config) = self.root_config.as_ref() {
+                    sub_workspace = Some(root_config.agent_workspace_dir(agent_name));
+                    sub_skills = Some(crate::skills::load_skills_for_agent_from_config(
+                        root_config,
+                        agent_name,
+                    ));
+                }
                 assembled_bounded.registry
             }
         };
@@ -3503,9 +3524,10 @@ impl DelegateTool {
         });
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
-        // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
-        // the skill prompt content matches the target's skill tools; bounded delegation
-        // keeps the caller's `self.workspace_dir`.
+        // Both modes build it from the TARGET's workspace (`sub_workspace`), so the skill
+        // prompt content matches the target's skill tools. The fallback to
+        // `self.workspace_dir` is the config-less path, where there is no target workspace
+        // to resolve and `target_policy` is the caller's policy anyway.
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
@@ -14117,6 +14139,331 @@ command = "echo hi"
                  cross-profile bounded target; got {names:?}"
             );
         }
+    }
+
+    /// Captures the system prompt the delegated turn was given.
+    struct SystemPromptCapturingProvider {
+        prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    impl SystemPromptCapturingProvider {
+        fn new() -> Self {
+            Self {
+                prompt: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn captured(&self) -> Option<String> {
+            self.prompt.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SystemPromptCapturingProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if let Some(prompt) = system_prompt {
+                *self.prompt.lock().unwrap() = Some(prompt.to_string());
+            }
+            Ok("done".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(system) = request.messages.iter().find(|m| m.role == "system") {
+                *self.prompt.lock().unwrap() = Some(system.content.clone());
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SystemPromptCapturingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SystemPromptCapturingProvider"
+        }
+    }
+
+    /// Writes one skill into `<workspace>/skills/<name>/SKILL.md`.
+    fn write_skill(workspace: &std::path::Path, name: &str, description: &str) {
+        let dir = crate::skills::skills_dir(workspace).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody for {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    /// A bounded target's prompt must describe the TARGET's skills, not the
+    /// caller's.
+    ///
+    /// The skill *tools* a bounded target gets are already scoped to it, but the
+    /// prompt was still built from `self.workspace_dir` — the caller's — so the
+    /// model was told about skills it had no tools for, and not told about the
+    /// ones it did. Same tools-from-B / prompt-from-A split the independent path
+    /// already guards against.
+    #[tokio::test]
+    async fn bounded_delegate_prompt_describes_target_skills_not_callers() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        // Each workspace gets a skill the other does not have.
+        let target_workspace = config.agent_workspace_dir("target");
+        std::fs::create_dir_all(&target_workspace).unwrap();
+        write_skill(
+            &caller_workspace,
+            "callers-only-skill",
+            "Belongs to the caller",
+        );
+        write_skill(
+            &target_workspace,
+            "targets-own-skill",
+            "Belongs to the target",
+        );
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            // The caller's own session workspace, which is what bounded
+            // delegation used to build the prompt from.
+            .with_workspace_dir(caller_workspace.clone())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let provider = SystemPromptCapturingProvider::new();
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "do the thing",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        let prompt = provider
+            .captured()
+            .expect("the delegated turn must receive a system prompt");
+        assert!(
+            prompt.contains("targets-own-skill"),
+            "a bounded target's prompt must describe its OWN skills; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("callers-only-skill"),
+            "a bounded target's prompt must not describe the CALLER's skills; got: {prompt}"
+        );
+    }
+
+    /// The `skill_bundles` branch, which C-5 flagged separately: it resolved
+    /// each bundle directory by joining it onto the workspace it was given, so
+    /// a target's own bundle names were read out of the CALLER's workspace.
+    ///
+    /// Populating `sub_skills` short-circuits the resolver entirely, so this
+    /// branch cannot join anything onto the wrong workspace - but the branch is
+    /// distinct enough to be worth asserting rather than assuming.
+    #[tokio::test]
+    async fn bounded_delegate_prompt_resolves_skill_bundles_from_target_workspace() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.skill_bundles.insert(
+            "shared".to_string(),
+            SkillBundleConfig {
+                directory: Some("bundled".to_string()),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                skill_bundles: vec!["shared".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                skill_bundles: vec!["shared".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        // The SAME bundle-relative directory exists in both workspaces, holding
+        // a different skill in each. Only the join base tells them apart.
+        let target_workspace = config.agent_workspace_dir("target");
+        for (ws, skill) in [
+            (&caller_workspace, "callers-bundled-skill"),
+            (&target_workspace, "targets-bundled-skill"),
+        ] {
+            let dir = ws.join("bundled").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {skill}\ndescription: Bundle skill {skill}\n---\n\nBody.\n"),
+            )
+            .unwrap();
+        }
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_skill_bundles(config.skill_bundles.clone())
+            .with_workspace_dir(caller_workspace.clone())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let target_config = config.agents.get("target").expect("target exists").clone();
+        let provider = SystemPromptCapturingProvider::new();
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "do the thing",
+                None,
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+
+        let prompt = provider
+            .captured()
+            .expect("the delegated turn must receive a system prompt");
+        assert!(
+            !prompt.contains("callers-bundled-skill"),
+            "a bounded target's bundle must not resolve against the CALLER's \
+             workspace; got: {prompt}"
+        );
     }
 }
 
