@@ -14093,6 +14093,31 @@ command = "echo hi"
              got {names:?}"
         );
     }
+
+    /// Every explicitly denied name is actually absent from a cross-profile
+    /// bounded target's registry. The deny-by-default fallback is what enforces
+    /// this, so the test would pass without the constant - its value is that it
+    /// fails the day someone reclassifies one of these as reusable.
+    #[tokio::test]
+    async fn bounded_cross_profile_omits_every_explicitly_denied_tool() {
+        for denied in crate::tools::BOUNDED_DENIED_TOOL_NAMES {
+            let tmp = TempDir::new().unwrap();
+            let config = bounded_reuse_config(&[denied], false, &tmp);
+
+            let names = bounded_offered_tool_names(
+                &config,
+                "target",
+                vec![Arc::new(NamedFixtureTool(denied))],
+            )
+            .await;
+
+            assert!(
+                !names.iter().any(|n| n == denied),
+                "'{denied}' is in BOUNDED_DENIED_TOOL_NAMES but reached a \
+                 cross-profile bounded target; got {names:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

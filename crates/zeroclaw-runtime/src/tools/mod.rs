@@ -839,6 +839,31 @@ pub(crate) fn browser_tool(
     }
 }
 
+/// Tools a `Bounded` delegate target must never receive, even though the
+/// deny-by-default fallback would already drop them.
+///
+/// The fallback denies anything unclassified, so listing them changes no
+/// behaviour. It records a decision instead: without this list, each of these
+/// is denied by the accident of nobody having classified it, and a later
+/// commit could "restore" one to `SAFE_FOR_BOUNDED_REUSE` without ever
+/// confronting why it was absent.
+///
+/// - `model_switch` switches the active model process-wide. The repo already
+///   sets this precedent for ephemeral children: `all_tools_with_runtime`
+///   strips it for a SubAgent caller, on the grounds that such a child "must
+///   not be able to switch the active model out from under the parent". A
+///   bounded delegate is the same case.
+/// - `mcp_resources` and `mcp_prompts` each hold an `Arc<McpRegistry>` - the
+///   CALLER's registry, listing the resources and prompts of the CALLER's MCP
+///   servers. They are MCP-origin but carry no `<server>__` prefix, so the
+///   per-server rule that admits real MCP tools cannot classify them: it
+///   matches a target's granted servers by prefix, and these names have none.
+///   Reusing them would hand a target the caller's MCP surface - the same
+///   boundary bug, on a surface the tool inventory never enumerated because
+///   they are built by `build_mcp_capability_tools`, outside
+///   `all_tools_with_runtime`.
+pub const BOUNDED_DENIED_TOOL_NAMES: &[&str] = &["model_switch", "mcp_resources", "mcp_prompts"];
+
 /// Tools that capture BOTH the caller's `SecurityPolicy` and a live channel
 /// handle at construction time.
 ///
@@ -4613,6 +4638,36 @@ const = true
                  constructed by all_tools_with_runtime with every relevant feature \
                  enabled - the name is stale or its enabling config flag changed"
             );
+        }
+    }
+
+    /// A name cannot be both denied and reusable. Without this, moving one of
+    /// the denied names into `SAFE_FOR_BOUNDED_REUSE` would silently win - the
+    /// fallback checks the safe list and never consults the denial list.
+    #[test]
+    fn denied_bounded_tool_names_are_disjoint_from_every_reuse_and_rebuild_list() {
+        for denied in BOUNDED_DENIED_TOOL_NAMES {
+            assert!(
+                !SAFE_FOR_BOUNDED_REUSE.contains(denied),
+                "'{denied}' is listed as denied for bounded targets and as safe to \
+                 reuse; the safe list wins at runtime, so this is a real conflict"
+            );
+            for (list_name, list) in [
+                ("FILESYSTEM_TOOL_NAMES", FILESYSTEM_TOOL_NAMES),
+                (
+                    "WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT",
+                    WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT,
+                ),
+                ("IDENTITY_BOUND_TOOL_NAMES", IDENTITY_BOUND_TOOL_NAMES),
+                ("AUTONOMY_REBOUND_TOOL_NAMES", AUTONOMY_REBOUND_TOOL_NAMES),
+                ("CHANNEL_REBOUND_TOOL_NAMES", CHANNEL_REBOUND_TOOL_NAMES),
+            ] {
+                assert!(
+                    !list.contains(denied),
+                    "'{denied}' is listed as denied for bounded targets and also in \
+                     {list_name}, which would rebuild it for the target instead"
+                );
+            }
         }
     }
 
