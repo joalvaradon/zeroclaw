@@ -160,7 +160,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
+use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
@@ -313,8 +313,9 @@ pub(crate) fn build_default_shell_tool(
 /// Assembles a shell tool from an already-resolved `sandbox`, applying the
 /// same `shell_timeout_secs == 0 -> inherit the global default` contract
 /// production uses. Single source of truth for that assembly, reused by both
-/// [`all_tools_with_runtime`] (which resolves `sandbox` from the caller's own
-/// `RiskProfileConfig`, unchanged) and `delegate.rs`'s `Bounded` cross-profile
+/// `runtime_shell_assembly` (the seam [`all_tools_with_runtime`] and
+/// [`shell_tool_for_runtime`] build through, which resolves `sandbox` from the
+/// caller's own `RiskProfileConfig`) and `delegate.rs`'s `Bounded` cross-profile
 /// target reconstruction (which resolves it from the target's
 /// `SecurityPolicy` via [`SecurityPolicy::sandbox_config`], since a Bounded
 /// delegate only has a `SecurityPolicy`, not the `RiskProfileConfig` it came
@@ -2054,6 +2055,61 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+struct RuntimeShellAssembly {
+    shell_tool: ShellTool,
+    sandbox: Arc<dyn Sandbox>,
+}
+
+/// Pair the canonical runtime kind with one shared sandbox instance for every
+/// runtime-backed executor assembled by the production tool registry.
+fn runtime_shell_assembly(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> RuntimeShellAssembly {
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+        &sandbox_extra_roots,
+    );
+    // Built through `build_sandboxed_shell_tool` rather than
+    // `ShellTool::new_with_sandbox` directly, so this production seam and
+    // `delegate.rs`'s `Bounded` cross-profile target rebuild share ONE
+    // assembly step - sandbox, the `shell_timeout_secs == 0 -> global
+    // default` contract, and persistent writes - and cannot silently
+    // diverge on it.
+    let shell_tool = build_sandboxed_shell_tool(
+        security,
+        runtime,
+        sandbox.clone(),
+        root_config.shell_tool.timeout_secs,
+    );
+    RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    }
+}
+
+/// Assemble a shell tool through the same runtime/sandbox ownership seam used
+/// by the production registry.
+#[must_use]
+pub fn shell_tool_for_runtime(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> ShellTool {
+    runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
+}
+
 /// One plugin instance's egress policy, read from canonical config at use time.
 ///
 /// `instance_key` is the instance's
@@ -2207,19 +2263,10 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
-    let runtime_kind = root_config.runtime.kind.as_wire();
-    let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
-        read_write: security.allowed_roots.clone(),
-        read_only: security.allowed_roots_read_only.clone(),
-        write_only: security.allowed_roots_write_only.clone(),
-    };
-    let sandbox = create_sandbox(
-        &sandbox_cfg,
-        runtime_kind,
-        Some(&security.workspace_dir),
-        &sandbox_extra_roots,
-    );
+    let RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -2231,13 +2278,7 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            build_sandboxed_shell_tool(
-                security.clone(),
-                runtime.clone(),
-                sandbox.clone(),
-                root_config.shell_tool.timeout_secs,
-            )
-            .with_tui_env(tui_env),
+            shell_tool.with_tui_env(tui_env),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
