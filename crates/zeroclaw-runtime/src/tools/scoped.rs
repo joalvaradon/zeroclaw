@@ -603,6 +603,16 @@ impl ScopedToolRegistry {
             nat64_prefixes.as_deref(),
         );
 
+        // The per-run ceiling must survive registrations that happen AFTER the
+        // built-in filter. Skills are registered just above, so a ceiling
+        // applied only at the filter step would be complete for built-ins and
+        // empty for exactly the surface an agent can grow into during its own
+        // assembly - which is where a delegated child would otherwise recover
+        // capabilities its caller never had.
+        if let Some(allowed) = caller_allowed {
+            tools_registry.retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        }
+
         // Skills and deferred MCP helpers are registered after the built-in filter,
         // so the explicit denylist must subtract once more at the final boundary.
         if let Some(excluded) = security.excluded_tools.as_deref() {

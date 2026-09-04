@@ -2745,6 +2745,13 @@ impl DelegateTool {
                 }
             }
             DelegateExecutionMode::Bounded => {
+                // Published once the target's registry is sealed, and read by the
+                // rebuilt `spawn_subagent` when it runs. It cannot be a value
+                // here: the set it must carry is the OUTCOME of the filtering
+                // below, and the tools that will consult it have to exist
+                // before that filtering can substitute them in.
+                let bounded_ceiling: Arc<std::sync::OnceLock<Vec<String>>> =
+                    Arc::new(std::sync::OnceLock::new());
                 let needs_memory_tools = {
                     let parent_tools = self.parent_tools.read();
                     parent_tools.iter().any(|tool| {
@@ -3015,6 +3022,7 @@ impl DelegateTool {
                             agent_name,
                             Arc::clone(&target_policy),
                             false,
+                            Some(Arc::clone(&bounded_ceiling)),
                         ))),
                     );
 
@@ -3517,6 +3525,17 @@ impl DelegateTool {
                     },
                 )
                 .await;
+                // The sealed set IS the ceiling for everything below this hop:
+                // bounding each level by what the level above actually received
+                // makes the bound narrow monotonically, instead of restating the
+                // original caller's set at every depth and drifting from it.
+                let _ = bounded_ceiling.set(
+                    assembled_bounded
+                        .registry
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect(),
+                );
                 // The prompt must describe the TARGET's skills and workspace, not
                 // the caller's. Every skill-bearing tool above is already the
                 // target's, so building the prompt from `self.workspace_dir`
@@ -10748,6 +10767,7 @@ mod tests {
             "restricted_target",
             Arc::new(SecurityPolicy::default()),
             false,
+            None,
         );
 
         let result = tool

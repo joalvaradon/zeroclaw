@@ -1684,9 +1684,11 @@ pub(crate) fn spawn_subagent_tool(
     agent_alias: &str,
     security: Arc<SecurityPolicy>,
     is_subagent_caller: bool,
+    caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
 ) -> Arc<dyn Tool> {
     Arc::new(
         SpawnSubagentTool::new(config, agent_alias.to_string(), security)
+            .with_caller_ceiling(caller_ceiling)
             .with_subagent_caller(is_subagent_caller),
     )
 }
@@ -2390,6 +2392,9 @@ pub fn all_tools_with_runtime(
             agent_alias,
             security.clone(),
             is_subagent_caller,
+            // A registry assembled for an agent in its own right has no caller
+            // above it, so there is no ceiling to carry.
+            None,
         ),
         send_message_to_peer_tool(config.clone(), agent_alias),
         model_routing_config_tool(security.clone(), config.clone()),
