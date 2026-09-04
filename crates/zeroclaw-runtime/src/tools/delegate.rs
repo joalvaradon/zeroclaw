@@ -3850,7 +3850,7 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, McpEchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -4153,33 +4153,6 @@ mod tests {
     /// omitted by design, so these fixtures reach the target the way a real one
     /// does: the target's own `mcp_bundles` grant `echo_srv`.
     #[derive(Default)]
-    struct McpEchoTool;
-
-    #[async_trait]
-    impl Tool for McpEchoTool {
-        fn name(&self) -> &str {
-            "echo_srv__echo_tool"
-        }
-
-        fn description(&self) -> &str {
-            "Echoes the `value` argument."
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "value": {"type": "string"}
-                },
-                "required": ["value"]
-            })
-        }
-
-        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            EchoTool.execute(args).await
-        }
-    }
-
     struct OneToolThenFinalModelProvider;
 
     #[async_trait]
@@ -12133,8 +12106,10 @@ command = "rm independent-delegate-marker"
         let (backup, backup_requests) = start_tool_call_chat_server().await;
         let (config, _fixture_dir) =
             fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
-        let tool = fallback_delegate_tool(config, None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(McpEchoTool)])));
+        let tool =
+            fallback_delegate_tool(config, None).with_parent_tools(Arc::new(RwLock::new(vec![
+                mcp_fixture_tool("echo_srv", "echo_tool"),
+            ])));
 
         let result = tool
             .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
@@ -12180,8 +12155,10 @@ command = "rm independent-delegate-marker"
             Some(true),
             Some(false),
         );
-        let tool = fallback_delegate_tool(config, None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(McpEchoTool)])));
+        let tool =
+            fallback_delegate_tool(config, None).with_parent_tools(Arc::new(RwLock::new(vec![
+                mcp_fixture_tool("echo_srv", "echo_tool"),
+            ])));
 
         let result = tool
             .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
@@ -12263,8 +12240,9 @@ command = "rm independent-delegate-marker"
             model: "routed-model".to_string(),
             api_key: None,
         });
-        let tool = fallback_delegate_tool(Arc::new(config), None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(McpEchoTool)])));
+        let tool = fallback_delegate_tool(Arc::new(config), None).with_parent_tools(Arc::new(
+            RwLock::new(vec![mcp_fixture_tool("echo_srv", "echo_tool")]),
+        ));
 
         let result = tool
             .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
@@ -12328,8 +12306,9 @@ command = "rm independent-delegate-marker"
             .get_mut("review")
             .expect("review runtime profile")
             .strict_tool_parsing = true;
-        let tool = fallback_delegate_tool(Arc::new(config), None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(McpEchoTool)])));
+        let tool = fallback_delegate_tool(Arc::new(config), None).with_parent_tools(Arc::new(
+            RwLock::new(vec![mcp_fixture_tool("echo_srv", "echo_tool")]),
+        ));
 
         let result = tool
             .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
@@ -13108,6 +13087,30 @@ command = "rm independent-delegate-marker"
     /// A parent-registry tool fixture with an arbitrary name, standing in for
     /// any tool that is neither rebuilt against the target policy nor proven
     /// safe to reuse.
+    /// A REAL MCP tool: a wrapper over a registry that actually routes it.
+    ///
+    /// Name-only stand-ins no longer stand in for one. Bounded admission
+    /// resolves the owning server through the registry the instance carries,
+    /// because a prefixed name cannot be decoded back into a server whose own
+    /// name may contain the separator - so a fixture that only carries the
+    /// name can no longer express which server owns the tool.
+    fn mcp_fixture_tool(server: &str, tool: &str) -> Arc<dyn Tool> {
+        let registry = Arc::new(
+            zeroclaw_tools::mcp_client::McpRegistry::for_test_with_echoing_tool(server, tool),
+        );
+        let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+            name: tool.to_string(),
+            description: Some("fixture MCP tool".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        Arc::new(crate::tools::McpToolWrapper::new(
+            format!("{server}__{tool}"),
+            def,
+            registry,
+            Arc::new(SecurityPolicy::default()),
+        ))
+    }
+
     struct NamedFixtureTool(&'static str);
 
     impl ::zeroclaw_api::attribution::Attributable for NamedFixtureTool {
@@ -13451,8 +13454,8 @@ command = "rm independent-delegate-marker"
             &config,
             "target",
             vec![
-                Arc::new(NamedFixtureTool("shared_srv__do_thing")),
-                Arc::new(NamedFixtureTool("caller_srv__do_thing")),
+                mcp_fixture_tool("shared_srv", "do_thing"),
+                mcp_fixture_tool("caller_srv", "do_thing"),
             ],
         )
         .await;
@@ -14883,6 +14886,1106 @@ mod tool_arc_ref_spec_tests {
                 .iter()
                 .any(|t| t == "send this to"),
             "wrapped trigger vocabulary must survive bounded delegation"
+        );
+    }
+}
+
+/// A bounded target's rebuilt `send_via` must resolve peer-group authority from
+/// the TARGET's groups, not the caller's.
+///
+/// The alias is captured in a closure over the peer-group resolver rather than
+/// stored in a field, so it is invisible to any check that inspects the tool's
+/// struct: only executing the reused instance can tell the two apart. These
+/// tests execute it, through the real bounded rebuild, with caller and target
+/// in DIFFERENT groups.
+#[cfg(test)]
+mod bounded_send_via_peer_group_authority {
+    use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use ::zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
+    use ::zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::schema::{Config, DelegateExecutionMode, DelegateTargetConfig};
+    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+
+    const CHANNEL: &str = "telegram.default";
+    /// Peer group the CALLER belongs to and the target does not. Addressed by
+    /// group name, which is how `send_via` resolves a target: a bare username
+    /// is read as a channel alias, not as a peer.
+    const CALLER_ONLY_GROUP: &str = "calleronlygroup";
+    /// Peer group the TARGET belongs to and the caller does not.
+    const TARGET_ONLY_GROUP: &str = "targetonlygroup";
+
+    struct StubChannel {
+        sent: Arc<parking_lot::RwLock<Vec<String>>>,
+    }
+
+    impl Attributable for StubChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Webhook)
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StubChannel {
+        fn name(&self) -> &str {
+            CHANNEL
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(format!("{message:?}"));
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Calls `send_via` once against `target`, then reports the tool result it
+    /// observed on the following turn.
+    struct SendViaProbeProvider {
+        target: String,
+        captured: Arc<parking_lot::RwLock<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SendViaProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            for message in request.messages.iter().filter(|m| m.role == "tool") {
+                self.captured.write().push(message.content.clone());
+            }
+            if self.captured.read().is_empty() {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "send_via".to_string(),
+                        arguments: format!("{{\"target\":\"{}\",\"body\":\"probe\"}}", self.target),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    impl Attributable for SendViaProbeProvider {
+        fn role(&self) -> Role {
+            Role::Provider(::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ))
+        }
+        fn alias(&self) -> &str {
+            "probe"
+        }
+    }
+
+    fn peer_group(agent: &str, peer: &str) -> PeerGroupConfig {
+        PeerGroupConfig {
+            channel: "telegram".into(),
+            agents: vec![AgentAlias::new(agent)],
+            external_peers: vec![PeerUsername::new(peer)],
+            ..PeerGroupConfig::default()
+        }
+    }
+
+    /// Caller and target sit in disjoint peer groups over the same channel.
+    fn disjoint_peer_group_config() -> Config {
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "shared".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                allowed_tools: vec!["send_via".to_string()],
+                delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                    mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "shared".into(),
+                runtime_profile: "agentic".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "shared".into(),
+                runtime_profile: "agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            CALLER_ONLY_GROUP.to_string(),
+            peer_group("caller", "@callerpeer"),
+        );
+        config.peer_groups.insert(
+            TARGET_ONLY_GROUP.to_string(),
+            peer_group("target", "@targetpeer"),
+        );
+        config
+    }
+
+    /// Runs a bounded delegation whose target calls `send_via` against `peer`,
+    /// and returns the tool results the delegated turn observed.
+    async fn delegate_and_send_to(group: &str) -> (Vec<String>, usize) {
+        let config = Arc::new(disjoint_peer_group_config());
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+
+        let sent = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let handle: crate::tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        handle.write().insert(
+            CHANNEL.to_string(),
+            Arc::new(StubChannel {
+                sent: Arc::clone(&sent),
+            }) as Arc<dyn Channel>,
+        );
+
+        // The caller's own instance, which is what a bounded target would reuse
+        // if the rebuild were skipped. Its resolver is bound to "caller".
+        let caller_send_via = crate::tools::send_via_tool(
+            Arc::clone(&caller_policy),
+            &config,
+            None,
+            "caller",
+            Arc::clone(&handle),
+        );
+
+        let handles = crate::tools::DelegateChannelHandles {
+            ask_user: Some(Arc::clone(&handle)),
+            ..Default::default()
+        };
+
+        let delegate = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_channel_handles(handles)
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_send_via])));
+
+        let captured = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let provider = SendViaProbeProvider {
+            target: group.to_string(),
+            captured: Arc::clone(&captured),
+        };
+        let target_cfg = config.agents.get("target").expect("target configured");
+
+        let _ = delegate
+            .execute_agentic(
+                "target",
+                target_cfg,
+                "test",
+                "test-model",
+                &provider,
+                "reach the peer",
+                None,
+            )
+            .await;
+
+        let out = captured.read().clone();
+        let delivered = sent.read().len();
+        (out, delivered)
+    }
+
+    #[tokio::test]
+    async fn bounded_target_cannot_reach_a_peer_only_the_caller_is_grouped_with() {
+        // MUST FAIL if the target reuses the caller's `send_via` instance, whose
+        // resolver closes over the CALLER's alias: the caller-only peer would
+        // then resolve and the send would be authorized.
+        let (results, delivered) = delegate_and_send_to(CALLER_ONLY_GROUP).await;
+        let joined = results.join("\n");
+
+        assert!(
+            !joined.is_empty(),
+            "the delegated turn never produced a `send_via` result"
+        );
+        assert!(
+            joined.contains("rejected"),
+            "reaching the caller-only group was not rejected; got {joined}"
+        );
+        assert_eq!(
+            delivered, 0,
+            "the caller-only group was rejected yet a message still reached the channel; got {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_target_can_reach_a_peer_from_its_own_group() {
+        // Positive half. Without it, a rebuild that simply broke `send_via`
+        // would satisfy the rejection above while proving nothing: the point is
+        // that authority MOVED to the target, not that it vanished.
+        let (results, delivered) = delegate_and_send_to(TARGET_ONLY_GROUP).await;
+        let joined = results.join("\n");
+
+        assert!(
+            !joined.is_empty(),
+            "the delegated turn never produced a `send_via` result"
+        );
+        assert!(
+            delivered >= 1,
+            "the target own group delivered nothing: authority did not MOVE to the target, it only disappeared; got {joined}"
+        );
+    }
+}
+
+/// An MCP tool name prefix is not the identity of a grant.
+///
+/// A bounded target may reuse the caller's MCP tools for servers the TARGET was
+/// granted. Admission is decided by matching the tool name against
+/// `format!("{server}__")` for each granted server. That mapping is not
+/// injective: nothing forbids a server name from containing `__` itself, so a
+/// grant for `foo` also admits every tool of a DIFFERENT server named
+/// `foo__admin`, which the caller's registry routes elsewhere entirely.
+///
+/// The two tools are real MCP wrappers over registries that genuinely route
+/// them - one per server - so the ambiguity is not asserted from a name but
+/// present in the fixture: `foo__admin__wipe` is routed by its own registry to
+/// `foo__admin`, a server the target was never granted.
+#[cfg(test)]
+mod bounded_mcp_prefix_is_not_grant_identity {
+    use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_config::schema::{
+        Config, DelegateExecutionMode, DelegateTargetConfig, McpBundleConfig, McpServerConfig,
+    };
+    use zeroclaw_providers::{ChatRequest, ChatResponse};
+
+    /// Server both caller and target hold.
+    const GRANTED_SERVER: &str = "foo";
+    /// Server ONLY the caller holds. Its name contains the separator, which is
+    /// what makes the prefix rule ambiguous.
+    const UNGRANTED_SERVER: &str = "foo__admin";
+
+    /// Tool of the granted server. Must survive.
+    const GRANTED_TOOL: &str = "foo__lookup";
+    /// Tool of the ungranted server. Its name also begins with `foo__`, so a
+    /// prefix test cannot tell it apart from a tool of `foo`.
+    const UNGRANTED_TOOL: &str = "foo__admin__wipe";
+
+    /// Records the tool names the delegated turn was offered.
+    struct OfferedToolNamesProvider {
+        seen: Arc<parking_lot::RwLock<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OfferedToolNamesProvider {
+        /// Without this the loop describes the tools in the prompt instead of
+        /// populating `request.tools`, and the observation below sees nothing.
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tools) = request.tools {
+                let mut seen = self.seen.write();
+                for tool in tools {
+                    seen.push(tool.name.clone());
+                }
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for OfferedToolNamesProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "offered"
+        }
+    }
+
+    /// The caller is granted BOTH servers; the target only `foo`.
+    fn split_grant_config() -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: GRANTED_SERVER.to_string(),
+            ..McpServerConfig::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: UNGRANTED_SERVER.to_string(),
+            ..McpServerConfig::default()
+        });
+        config.mcp_bundles.insert(
+            "caller_bundle".to_string(),
+            McpBundleConfig {
+                servers: vec![GRANTED_SERVER.to_string(), UNGRANTED_SERVER.to_string()],
+                ..McpBundleConfig::default()
+            },
+        );
+        config.mcp_bundles.insert(
+            "target_bundle".to_string(),
+            McpBundleConfig {
+                servers: vec![GRANTED_SERVER.to_string()],
+                ..McpBundleConfig::default()
+            },
+        );
+
+        config.risk_profiles.insert(
+            "shared".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                // Both names are policy-allowed on both sides, so the ONLY gate
+                // left to discriminate them is the MCP server-prefix rule.
+                allowed_tools: vec![GRANTED_TOOL.to_string(), UNGRANTED_TOOL.to_string()],
+                delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                    mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "shared".into(),
+                runtime_profile: "agentic".into(),
+                mcp_bundles: vec!["caller_bundle".to_string()],
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "shared".into(),
+                runtime_profile: "agentic".into(),
+                mcp_bundles: vec!["target_bundle".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Tool names the bounded target was offered, plus the delegation outcome
+    /// so an empty set can be distinguished from a delegation that never ran.
+    async fn offered_to_bounded_target() -> (Vec<String>, String) {
+        let config = Arc::new(split_grant_config());
+        // Fixture guard: if the target holds no granted server the prefix rule
+        // has nothing to match and every assertion below would be about the
+        // fixture, not about admission.
+        assert_eq!(
+            config
+                .mcp_servers_for_agent("target")
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec![GRANTED_SERVER.to_string()],
+            "fixture: the target must hold exactly the granted server"
+        );
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+
+        // One registry per server, each routing its own tool, so the owning
+        // server is a fact of the fixture rather than a reading of the name.
+        let wrapper = |server: &str, tool: &str| -> Arc<dyn Tool> {
+            let registry = Arc::new(
+                zeroclaw_tools::mcp_client::McpRegistry::for_test_with_scripted_tool(
+                    server,
+                    tool,
+                    serde_json::json!({"content": [{"type": "text", "text": "ok"}]}),
+                ),
+            );
+            let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+                name: tool.to_string(),
+                description: Some("scripted".to_string()),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            };
+            Arc::new(crate::tools::McpToolWrapper::new(
+                format!("{server}__{tool}"),
+                def,
+                registry,
+                Arc::clone(&caller_policy),
+            ))
+        };
+        let parent_tools: Vec<Arc<dyn Tool>> = vec![
+            wrapper(GRANTED_SERVER, "lookup"),
+            wrapper(UNGRANTED_SERVER, "wipe"),
+        ];
+
+        let delegate = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(parent_tools)));
+
+        let seen = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let provider = OfferedToolNamesProvider {
+            seen: Arc::clone(&seen),
+        };
+        let target_cfg = config.agents.get("target").expect("target configured");
+
+        let outcome = delegate
+            .execute_agentic(
+                "target",
+                target_cfg,
+                "test",
+                "test-model",
+                &provider,
+                "use what you have",
+                None,
+            )
+            .await;
+
+        let out = seen.read().clone();
+        (out, format!("{outcome:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_tool_of_an_ungranted_server_sharing_the_granted_prefix_is_not_admitted() {
+        // MUST FAIL while admission is `tool.name().starts_with("foo__")`:
+        // `foo__admin__wipe` satisfies that test even though `foo__admin` is a
+        // server the target was never granted.
+        let (offered, outcome) = offered_to_bounded_target().await;
+
+        assert!(
+            !offered.is_empty(),
+            "the delegated turn was offered no tools at all, so this assertion would hold \n             vacuously; outcome {outcome}"
+        );
+        assert!(
+            !offered.iter().any(|name| name == UNGRANTED_TOOL),
+            "a tool of the ungranted `{UNGRANTED_SERVER}` server was admitted because its name \
+             starts with the granted server prefix; offered {offered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_of_the_granted_server_is_still_admitted() {
+        // Positive half. Resolving admission against server identity instead of
+        // the name prefix must not cost the target the tools it IS granted; a
+        // rule that denied both would satisfy the assertion above and break the
+        // feature.
+        let (offered, outcome) = offered_to_bounded_target().await;
+
+        assert!(
+            offered.iter().any(|name| name == GRANTED_TOOL),
+            "the target lost a tool of the `{GRANTED_SERVER}` server it WAS granted; \
+             offered {offered:?}; outcome {outcome}"
+        );
+    }
+}
+
+/// A reused MCP wrapper materializes attachments into the CALLER's workspace.
+///
+/// The wrapper stores a `SecurityPolicy` whose only use is supplying the
+/// directory that embedded `resource` blobs are written under. A bounded target
+/// granted the same server reuses the caller's instance, so the policy - and
+/// therefore the destination directory - is the caller's, even though the work
+/// is the target's. Nothing about the instance's NAME or its inner struct shows
+/// this: the leak is in a wrapper field, reached only on the execution path,
+/// and only when the server actually returns a blob.
+#[cfg(test)]
+mod bounded_mcp_wrapper_materializes_into_target_workspace {
+    use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use tempfile::TempDir;
+    use zeroclaw_config::schema::{
+        Config, DelegateExecutionMode, DelegateTargetConfig, McpBundleConfig, McpServerConfig,
+    };
+    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+
+    const SERVER: &str = "srv";
+    const TOOL: &str = "fetch";
+    const PREFIXED: &str = "srv__fetch";
+
+    /// A `tools/call` result carrying one embedded resource blob. Without a
+    /// blob the formatter returns the payload untouched and never writes
+    /// anything, so this is the branch that has to be exercised.
+    fn blob_result() -> serde_json::Value {
+        serde_json::json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///attachment.txt",
+                    "mimeType": "text/plain",
+                    "blob": "aGVsbG8gZnJvbSB0aGUgc2VydmVy"
+                }
+            }]
+        })
+    }
+
+    /// Emits one call to the reused MCP tool, then finishes.
+    struct CallMcpToolProvider {
+        called: Arc<parking_lot::RwLock<bool>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CallMcpToolProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let offered = request
+                .tools
+                .is_some_and(|tools| tools.iter().any(|t| t.name == PREFIXED));
+            if offered && !*self.called.read() {
+                *self.called.write() = true;
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: PREFIXED.to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CallMcpToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "mcpcaller"
+        }
+    }
+
+    fn cross_profile_config(caller_ws: &std::path::Path, target_ws: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: SERVER.to_string(),
+            ..McpServerConfig::default()
+        });
+        let bundle = McpBundleConfig {
+            servers: vec![SERVER.to_string()],
+            ..McpBundleConfig::default()
+        };
+        config.mcp_bundles.insert("shared_srv".to_string(), bundle);
+
+        let profile = || RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_tools: vec![PREFIXED.to_string()],
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            ..RiskProfileConfig::default()
+        };
+        // Distinct profile names: same-profile delegation deliberately keeps the
+        // caller's session workspace, which would make the destination the
+        // caller's for an entirely different and legitimate reason.
+        config
+            .risk_profiles
+            .insert("caller_p".to_string(), profile());
+        config
+            .risk_profiles
+            .insert("target_p".to_string(), profile());
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let ws = |p: &std::path::Path| zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+            path: Some(p.to_path_buf()),
+            ..Default::default()
+        };
+
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "caller_p".into(),
+                runtime_profile: "agentic".into(),
+                workspace: ws(caller_ws),
+                mcp_bundles: vec!["shared_srv".to_string()],
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "target_p".into(),
+                runtime_profile: "agentic".into(),
+                workspace: ws(target_ws),
+                mcp_bundles: vec!["shared_srv".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Number of files under `<workspace>/uploads`.
+    fn uploads_count(workspace: &std::path::Path) -> usize {
+        std::fs::read_dir(workspace.join("uploads"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    }
+
+    struct Outcome {
+        caller_uploads: usize,
+        target_uploads: usize,
+        tool_called: bool,
+        result: String,
+    }
+
+    async fn delegate_and_call_shared_mcp_tool(root: &std::path::Path) -> Outcome {
+        let caller_ws = root.join("caller-workspace");
+        let target_ws = root.join("target-workspace");
+        std::fs::create_dir_all(&caller_ws).expect("caller workspace");
+        std::fs::create_dir_all(&target_ws).expect("target workspace");
+
+        let config = Arc::new(cross_profile_config(&caller_ws, &target_ws));
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+
+        // The caller's own wrapper, exactly as its registry would hold it: bound
+        // to the caller's policy, which is where the destination comes from.
+        let registry = Arc::new(crate::tools::McpRegistry::for_test_with_scripted_tool(
+            SERVER,
+            TOOL,
+            blob_result(),
+        ));
+        let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+            name: TOOL.to_string(),
+            description: Some("scripted".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let caller_wrapper: Arc<dyn Tool> = Arc::new(crate::tools::McpToolWrapper::new(
+            PREFIXED.to_string(),
+            def,
+            Arc::clone(&registry),
+            Arc::clone(&caller_policy),
+        ));
+
+        let delegate = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_wrapper])));
+
+        let called = Arc::new(parking_lot::RwLock::new(false));
+        let provider = CallMcpToolProvider {
+            called: Arc::clone(&called),
+        };
+        let target_cfg = config.agents.get("target").expect("target configured");
+
+        let result = delegate
+            .execute_agentic(
+                "target",
+                target_cfg,
+                "test",
+                "test-model",
+                &provider,
+                "fetch the attachment",
+                None,
+            )
+            .await;
+
+        Outcome {
+            caller_uploads: uploads_count(&caller_ws),
+            target_uploads: uploads_count(&target_ws),
+            tool_called: *called.read(),
+            result: format!("{result:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reused_mcp_wrapper_writes_attachments_into_the_targets_workspace() {
+        let tmp = TempDir::new().expect("temp root");
+        let outcome = delegate_and_call_shared_mcp_tool(tmp.path()).await;
+
+        // Guard first: if the tool was never offered or never called, both
+        // counts are zero and every assertion below holds for the wrong reason.
+        assert!(
+            outcome.tool_called,
+            "the delegated turn never called the shared MCP tool, so nothing was materialized; \
+             result {}",
+            outcome.result
+        );
+
+        assert_eq!(
+            outcome.target_uploads, 1,
+            "the attachment did not land in the TARGET workspace (target={}, caller={}); \
+             result {}",
+            outcome.target_uploads, outcome.caller_uploads, outcome.result
+        );
+        assert_eq!(
+            outcome.caller_uploads, 0,
+            "the attachment landed in the CALLER workspace: the reused wrapper is still \
+             materializing against the policy it captured (target={}, caller={}); result {}",
+            outcome.target_uploads, outcome.caller_uploads, outcome.result
+        );
+    }
+}
+
+/// A reused rate-limited tool meters the target against the CALLER's budget.
+///
+/// The registered instance is `RateLimitedTool<WebSearchTool>`, and it is the
+/// WRAPPER that holds a `SecurityPolicy`: the inner search tool has no such
+/// field at all. Reading the inner struct therefore says the instance is free
+/// of caller capture, which is exactly the category error that let this one
+/// through - the tool is the registered instance, wrappers included.
+///
+/// Both cases are decided BEFORE the inner tool runs, so neither reaches the
+/// network: `RateLimitedTool::execute` reserves first and returns early on
+/// refusal, and the inner tool is configured with a provider whose API key is
+/// absent, which it rejects before issuing any request. The two failures are
+/// distinguishable by message, which is what makes the pair discriminating in
+/// both directions.
+///
+/// Declared limit: this exercises WHICH policy's ceiling is consulted, not
+/// accumulation across several calls. Accumulation is unreachable without the
+/// network here, because the reservation is only committed when the inner tool
+/// SUCCEEDS - a failing inner call leaves the budget untouched, so repeated
+/// calls never add up. The tracker cannot be pre-charged from the test either:
+/// its bucket is keyed by the tool loop's own thread id, so a reservation made
+/// outside the delegated loop lands in a different bucket.
+#[cfg(test)]
+mod bounded_rate_limit_is_the_targets_own {
+    use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_config::schema::{Config, DelegateExecutionMode, DelegateTargetConfig};
+    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+
+    const TOOL: &str = "web_search_tool";
+    /// Raised by the wrapper when the reservation is refused.
+    const RATE_LIMIT_MARKER: &str = "Rate limit exceeded";
+    /// Substring of every error the INNER tool raises while resolving its
+    /// provider credential - it never gets as far as a request. Seeing it means
+    /// the wrapper ADMITTED the call, which is the fact under test; the precise
+    /// wording depends on whether a config file happens to exist and is
+    /// deliberately not pinned.
+    const INNER_REACHED_MARKER: &str = "Brave API key";
+
+    /// Emits one call to the reused tool, then reports the tool result back.
+    struct CallSearchProvider {
+        captured: Arc<parking_lot::RwLock<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CallSearchProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            for message in request.messages.iter().filter(|m| m.role == "tool") {
+                self.captured.write().push(message.content.clone());
+            }
+            if self.captured.read().is_empty() {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: TOOL.to_string(),
+                        arguments: "{\"query\":\"anything\"}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CallSearchProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "search"
+        }
+    }
+
+    fn budget_config(caller_budget: u32, target_budget: u32) -> Config {
+        let mut config = Config::default();
+        // Pin a credential-requiring provider with NO key. Both the caller's
+        // instance and the rebuilt target instance are built from this config,
+        // so both refuse before issuing any request. Leaving the default
+        // provider here makes the rebuilt instance perform a REAL search the
+        // moment the rebuild starts working.
+        config.web_search.enabled = true;
+        config.web_search.search_provider = "brave".to_string();
+        config.web_search.brave_api_key = None;
+        let profile = || RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_tools: vec!["delegate".to_string(), TOOL.to_string()],
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            ..RiskProfileConfig::default()
+        };
+        // Distinct risk profiles on purpose: a shared one would also drag the
+        // caller's session workspace onto the target, mixing two separate
+        // concerns into one fixture. The action budget itself lives on the
+        // RUNTIME profile, so that is where the two sides have to differ.
+        config
+            .risk_profiles
+            .insert("caller_p".to_string(), profile());
+        config
+            .risk_profiles
+            .insert("target_p".to_string(), profile());
+        let runtime = |budget: u32| RuntimeProfileConfig {
+            agentic: true,
+            max_tool_iterations: 3,
+            max_actions_per_hour: budget,
+            ..RuntimeProfileConfig::default()
+        };
+        config
+            .runtime_profiles
+            .insert("caller_rt".to_string(), runtime(caller_budget));
+        config
+            .runtime_profiles
+            .insert("target_rt".to_string(), runtime(target_budget));
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "caller_p".into(),
+                runtime_profile: "caller_rt".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "target_p".into(),
+                runtime_profile: "target_rt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Delegates with the two budgets and returns what the tool reported.
+    async fn tool_result_with_budgets(caller_budget: u32, target_budget: u32) -> String {
+        let config = Arc::new(budget_config(caller_budget, target_budget));
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+
+        // The caller's registered instance, built through the SAME production
+        // factory the rebuild uses, so the two sides cannot differ in provider
+        // or wrapper shape - only in the policy each was built with.
+        let caller_instance = crate::tools::web_search_tool(Arc::clone(&caller_policy), &config)
+            .expect("web_search is enabled in this fixture");
+
+        let delegate = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![caller_instance])));
+
+        let captured = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let provider = CallSearchProvider {
+            captured: Arc::clone(&captured),
+        };
+        let target_cfg = config.agents.get("target").expect("target configured");
+
+        let outcome = delegate
+            .execute_agentic(
+                "target",
+                target_cfg,
+                "test",
+                "test-model",
+                &provider,
+                "search for something",
+                None,
+            )
+            .await;
+
+        let joined = captured.read().join("\n");
+        format!("{joined} || outcome {outcome:?}")
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_target_budget_stops_the_call_even_when_the_caller_has_room() {
+        // Caller could act 100 more times; the target may not act at all.
+        //
+        // MUST FAIL while the target reuses the caller's wrapped instance: the
+        // reservation is then made against the caller's budget, succeeds, and
+        // the inner tool runs - which the marker below makes visible.
+        let result = tool_result_with_budgets(100, 0).await;
+
+        assert!(
+            result.contains(RATE_LIMIT_MARKER),
+            "the target acted on the caller's budget instead of its own exhausted one; {result}"
+        );
+        assert!(
+            !result.contains(INNER_REACHED_MARKER),
+            "the inner search tool was reached, so the wrapper admitted a call the target had \
+             no budget for; {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_with_budget_is_not_stopped_by_an_exhausted_caller() {
+        // The mirror image, and the half that keeps the assertion above from
+        // being satisfiable by a wrapper that simply denies everything: the
+        // caller is exhausted, the target is not, and the call must proceed.
+        //
+        // MUST FAIL while the target reuses the caller's wrapped instance: the
+        // caller's zero budget would refuse a call the target is entitled to.
+        let result = tool_result_with_budgets(0, 100).await;
+
+        assert!(
+            !result.contains(RATE_LIMIT_MARKER),
+            "the target was refused on the CALLER's exhausted budget; {result}"
+        );
+        assert!(
+            result.contains(INNER_REACHED_MARKER),
+            "the call never reached the inner tool, so it is not clear the wrapper admitted \
+             it at all; {result}"
         );
     }
 }
