@@ -3506,7 +3506,15 @@ impl DelegateTool {
                 // workspace), and `sub_workspace` is what reaches
                 // `PromptContext`. Same source the independent path uses.
                 if let Some(root_config) = self.root_config.as_ref() {
-                    sub_workspace = Some(root_config.agent_workspace_dir(agent_name));
+                    // The EXECUTION policy's workspace, not the target's
+                    // configured one: a same-profile hand-off deliberately keeps
+                    // the caller's session workspace on that policy, and the
+                    // file tools resolve relative paths against it. Naming the
+                    // configured directory here would describe a directory the
+                    // model's own writes never reach. Skill resolution below
+                    // stays keyed to the target's identity, which is a separate
+                    // question from where the work lands.
+                    sub_workspace = Some(target_policy.workspace_dir.clone());
                     sub_skills = Some(crate::skills::load_skills_for_agent_from_config(
                         root_config,
                         agent_name,
