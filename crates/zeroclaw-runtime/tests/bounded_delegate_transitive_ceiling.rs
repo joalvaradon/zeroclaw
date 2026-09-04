@@ -349,7 +349,7 @@ fn drive_chain_blocking(caller_extra: &[&str]) -> Vec<BTreeSet<String>> {
         .build()
         .expect("test runtime builds");
     runtime.block_on(async move {
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
             drive_chain(&refs).await
         })

@@ -302,7 +302,7 @@ fn observe_blocking(same_profile: bool) -> Observation {
         .build()
         .expect("test runtime builds");
     runtime.block_on(async move {
-        tokio::spawn(observe(same_profile))
+        zeroclaw_spawn::spawn!(observe(same_profile))
             .await
             .expect("chain task joins")
     })

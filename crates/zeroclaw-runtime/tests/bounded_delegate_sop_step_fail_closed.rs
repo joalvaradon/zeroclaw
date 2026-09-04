@@ -337,7 +337,7 @@ fn drive_blocking() -> (bool, bool, String) {
         .build()
         .expect("test runtime builds");
     runtime.block_on(async {
-        tokio::spawn(drive_delegated_sop())
+        zeroclaw_spawn::spawn!(drive_delegated_sop())
             .await
             .expect("chain task joins")
     })
