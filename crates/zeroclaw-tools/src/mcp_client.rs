@@ -1143,6 +1143,22 @@ impl McpRegistry {
         }
     }
 
+    /// Name of the server that owns `prefixed_name`, resolved through the
+    /// routing index rather than by parsing the name.
+    ///
+    /// `<server>__<tool>` is not decodable: a server may itself be named with
+    /// the separator, so `foo__admin__wipe` is a legitimate reading as both
+    /// `foo`/`admin__wipe` and `foo__admin`/`wipe`. Only the index knows which
+    /// one this registry actually routes.
+    #[must_use]
+    pub fn server_name_for(&self, prefixed_name: &str) -> Option<&str> {
+        let (server_idx, _) = self.tool_index.get(prefixed_name)?;
+        self.server_index
+            .iter()
+            .find(|(_, idx)| *idx == server_idx)
+            .map(|(name, _)| name.as_str())
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()

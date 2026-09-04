@@ -562,9 +562,6 @@ pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     "sessions_list",
     // Reads the shared, global `discord` archive DB, not per-agent memory.
     "discord_search",
-    // Nine constructor arguments, all from `root_config.web_search` plus the
-    // global config path and secrets-encryption flag.
-    "web_search_tool",
     // Hold the global e-mail account map and auth service.
     "email_search",
     "email_read",
@@ -1018,12 +1015,54 @@ pub const AUTONOMY_REBOUND_TOOL_NAMES: &[&str] = &[
     "proxy_config",
     "sessions_history",
     "sessions_send",
+    // Its inner tool takes only global config, but the INSTANCE registered for
+    // it is `RateLimitedTool<WebSearchTool>`, and the wrapper meters against
+    // the policy it was built with. Reusing the caller's would spend a
+    // Bounded target's calls out of the caller's hourly budget - and refuse
+    // them once the caller's is spent, whatever the target's own budget says.
+    "web_search_tool",
 ];
 
 /// Rebuilds `http_request` bound to `security`, gated and wrapped exactly as
 /// `all_tools_with_runtime` does it (`http_config.enabled`, `RateLimitedTool`).
 /// `None` when disabled or when construction fails (logged, mirroring the
 /// production registration path).
+/// Build the registered `web_search_tool` INSTANCE - the rate-limiting wrapper
+/// included, not just the inner search tool.
+///
+/// The wrapper is where the policy lives: `WebSearchTool` itself has no
+/// `security` field, so reasoning about the inner struct says the instance is
+/// free of caller capture while the instance a registry actually holds meters
+/// every call against whichever policy the wrapper was built with. Both the
+/// production registry and the `Bounded` delegate rebuild go through here, so
+/// the two cannot construct it differently.
+pub(crate) fn web_search_tool(
+    security: Arc<SecurityPolicy>,
+    root_config: &Config,
+) -> Option<Arc<dyn Tool>> {
+    if !root_config.web_search.enabled {
+        return None;
+    }
+    // Rate-limited like every other outbound-network tool (see web_fetch and
+    // http_request): without the wrapper an agent loop could issue unbounded
+    // searches against the configured provider, and against the default
+    // scrape path, which gets the machine blocked.
+    Some(Arc::new(RateLimitedTool::new(
+        WebSearchTool::new_with_config(
+            root_config.web_search.search_provider.clone(),
+            root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.tavily_api_key.clone(),
+            root_config.web_search.jina_api_key.clone(),
+            root_config.web_search.searxng_instance_url.clone(),
+            root_config.web_search.max_results,
+            root_config.web_search.timeout_secs,
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
+        ),
+        security,
+    )))
+}
+
 pub(crate) fn http_request_tool(
     security: Arc<SecurityPolicy>,
     http_config: &zeroclaw_config::schema::HttpRequestConfig,
@@ -2468,20 +2507,9 @@ pub fn all_tools_with_runtime(
         // issue unbounded searches against the configured provider — and
         // against the default DuckDuckGo scrape path, which gets the machine
         // blocked.
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebSearchTool::new_with_config(
-                root_config.web_search.search_provider.clone(),
-                root_config.web_search.brave_api_key.clone(),
-                root_config.web_search.tavily_api_key.clone(),
-                root_config.web_search.jina_api_key.clone(),
-                root_config.web_search.searxng_instance_url.clone(),
-                root_config.web_search.max_results,
-                root_config.web_search.timeout_secs,
-                root_config.config_path.clone(),
-                root_config.secrets.encrypt,
-            ),
-            security.clone(),
-        )));
+        if let Some(tool) = web_search_tool(security.clone(), root_config) {
+            tool_arcs.push(tool);
+        }
     }
 
     // Notion API tool (conditionally registered)

@@ -3327,6 +3327,10 @@ impl DelegateTool {
                         Arc::clone(&target_policy),
                         root_config,
                     ));
+                    insert(crate::tools::web_search_tool(
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ));
                     insert(crate::tools::jira_tool(
                         Arc::clone(&target_policy),
                         root_config,
@@ -3403,14 +3407,14 @@ impl DelegateTool {
                 // against the resolved server list rather than by splitting the
                 // name on `__`, because nothing stops a server name from
                 // containing `__` itself.
-                let target_mcp_prefixes: Vec<String> = self
+                let target_mcp_servers: Vec<String> = self
                     .root_config
                     .as_deref()
                     .map(|config| {
                         config
                             .mcp_servers_for_agent(agent_name)
                             .into_iter()
-                            .map(|server| format!("{}__", server.name))
+                            .map(|server| server.name)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -3447,11 +3451,32 @@ impl DelegateTool {
                             {
                                 return Some(rebuilt);
                             }
+                            // MCP tools are decided by SERVER IDENTITY, asked of
+                            // the registry the instance itself carries, and are
+                            // rebuilt against the target's policy. Matching the
+                            // name against `<granted>__` admitted any server whose
+                            // name merely started with a granted one, and reusing
+                            // the instance kept the caller's workspace as the
+                            // destination for materialized attachments.
+                            //
+                            // An MCP instance whose server cannot be resolved is
+                            // omitted: an unroutable name is not a grant.
+                            if let Some(wrapper) = tool
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<crate::tools::McpToolWrapper>())
+                            {
+                                let granted = wrapper.server_name().is_some_and(|server| {
+                                    target_mcp_servers.iter().any(|name| name == server)
+                                });
+                                return if granted {
+                                    Some(Box::new(wrapper.rebound(Arc::clone(&target_policy)))
+                                        as Box<dyn Tool>)
+                                } else {
+                                    None
+                                };
+                            }
                             let reuse_is_earned = !deny_unclassified_reuse
-                                || crate::tools::SAFE_FOR_BOUNDED_REUSE.contains(&tool.name())
-                                || target_mcp_prefixes
-                                    .iter()
-                                    .any(|prefix| tool.name().starts_with(prefix.as_str()));
+                                || crate::tools::SAFE_FOR_BOUNDED_REUSE.contains(&tool.name());
                             if reuse_is_earned {
                                 Some(Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
                             } else {
