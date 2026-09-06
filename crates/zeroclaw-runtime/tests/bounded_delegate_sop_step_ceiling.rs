@@ -235,10 +235,7 @@ fn sop_ceiling_config(provider_uri: &str, root: &std::path::Path) -> Config {
     // what an unbounded re-assembly would hand it.
     risk_profiles.insert(
         "step_profile".to_string(),
-        permissive(vec![
-            WITHIN_CEILING.to_string(),
-            BEYOND_CEILING.to_string(),
-        ]),
+        permissive(vec![WITHIN_CEILING.to_string(), BEYOND_CEILING.to_string()]),
     );
 
     let mut runtime_profiles = HashMap::new();

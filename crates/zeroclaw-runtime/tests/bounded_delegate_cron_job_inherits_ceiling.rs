@@ -270,7 +270,11 @@ async fn drive_bounded_cron_add(replies: Vec<String>) -> (Option<Vec<String>>, S
     let report = format!(
         "outcome {outcome:?}; jobs {:?}",
         jobs.iter()
-            .map(|j| (j.name.clone(), j.agent_alias.clone(), j.allowed_tools.clone()))
+            .map(|j| (
+                j.name.clone(),
+                j.agent_alias.clone(),
+                j.allowed_tools.clone()
+            ))
             .collect::<Vec<_>>()
     );
     let stored = jobs
