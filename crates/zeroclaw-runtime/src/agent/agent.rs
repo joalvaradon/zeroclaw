@@ -1672,6 +1672,9 @@ impl Agent {
             // whole lifetime. One-shot callers pass `None` and keep the
             // documented snapshot fallback.
             live_config.clone(),
+            // The `Agent` surface assembles with `caller_allowed: None`; it runs
+            // an agent as itself, with no caller ceiling to cap stored jobs by.
+            None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2602,7 +2605,12 @@ impl Agent {
                         .provider_switch_config
                         .as_ref()
                         .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // The `Agent` surface assembles with no caller allowlist,
+                        // so there is no ceiling to forward into a re-assembly.
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            caller_allowed: None,
+                        }),
                 }),
             ),
         );
@@ -3045,7 +3053,12 @@ impl Agent {
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            // The `Agent` surface assembles with no caller allowlist,
+                        // so there is no ceiling to forward into a re-assembly.
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            caller_allowed: None,
+                        }),
                     }),
                 ),
             );

@@ -13,6 +13,12 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Bounded-delegation ceiling for the registering loop, or `None` when the
+    /// registration is unbounded. Unlike the writing tools, this one launches a
+    /// job whose tool set was stored earlier — possibly by the owning agent with
+    /// no ceiling in force — so there is nothing left to intersect and an
+    /// out-of-ceiling job is refused. See [`crate::tools::caller_ceiling`].
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl CronRunTool {
@@ -21,12 +27,14 @@ impl CronRunTool {
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
     ) -> Self {
         Self {
             config,
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            caller_ceiling,
         }
     }
 
@@ -40,7 +48,7 @@ impl CronRunTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, agent_alias, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime, None)
     }
 }
 
@@ -119,6 +127,21 @@ impl Tool for CronRunTool {
                 });
             }
         };
+
+        // Launching an existing job runs its STORED tool set, which may predate
+        // this bounded turn. Nothing is left to intersect at this point, so a
+        // job that is not already within the ceiling is refused outright.
+        if let Err(error) = crate::tools::caller_ceiling::require_within_ceiling(
+            "cron_run",
+            self.caller_ceiling.as_ref(),
+            job.allowed_tools.as_deref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
 
         if matches!(job.job_type, JobType::Shell)
             && let Err(reason) = cron::validate_shell_command_with_security(

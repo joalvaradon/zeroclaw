@@ -16,6 +16,9 @@ pub struct CronUpdateTool {
     runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for command updates.
     agent_alias: String,
+    /// Bounded-delegation ceiling for the registering loop, or `None` when the
+    /// registration is unbounded. See [`crate::tools::caller_ceiling`].
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl CronUpdateTool {
@@ -24,12 +27,14 @@ impl CronUpdateTool {
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
     ) -> Self {
         Self {
             config,
             security,
             runtime,
             agent_alias: agent_alias.into(),
+            caller_ceiling,
         }
     }
 
@@ -43,7 +48,7 @@ impl CronUpdateTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, agent_alias, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime, None)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
@@ -259,7 +264,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match deserialize_patch_arg(&patch_val) {
+        let mut patch = match deserialize_patch_arg(&patch_val) {
             Ok(patch) => patch,
             Err(error) => {
                 return Ok(ToolResult {
@@ -269,6 +274,30 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+        // A patch that sets `allowed_tools` rewrites the stored tool set, so it
+        // is the same write `cron_add` performs and takes the same cap. An empty
+        // patch list clears the field to `None` (unrestricted), which is why the
+        // cap refuses an empty result instead of storing it: without that,
+        // `allowed_tools: []` would remove the inherited limit outright. A patch
+        // that leaves the field unset widens nothing and is left alone; a job
+        // already stored wider than the ceiling is caught at launch by
+        // `cron_run`.
+        if patch.allowed_tools.is_some() {
+            match crate::tools::caller_ceiling::cap_stored_allowed_tools(
+                "cron_update",
+                self.caller_ceiling.as_ref(),
+                patch.allowed_tools.take(),
+            ) {
+                Ok(capped) => patch.allowed_tools = capped,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            }
+        }
         let approved = args
             .get("approved")
             .and_then(serde_json::Value::as_bool)
@@ -451,8 +480,13 @@ mod tests {
         let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
-        let tool =
-            CronUpdateTool::new_with_runtime(cfg.clone(), test_security(&cfg), TEST_AGENT, runtime);
+        let tool = CronUpdateTool::new_with_runtime(
+            cfg.clone(),
+            test_security(&cfg),
+            TEST_AGENT,
+            runtime,
+            None,
+        );
 
         let result = tool
             .execute(json!({

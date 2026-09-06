@@ -1,6 +1,7 @@
 //! Tool subsystem for agent-callable capabilities.
 
 pub mod attribution;
+pub(crate) mod caller_ceiling;
 pub(crate) mod coding_cli_executor;
 pub mod cron_add;
 pub(crate) mod cron_common;
@@ -1519,12 +1520,14 @@ pub(crate) fn cron_add_tool(
     security: Arc<SecurityPolicy>,
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
+    caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
 ) -> Arc<dyn Tool> {
     Arc::new(CronAddTool::new_with_runtime(
         config,
         security,
         agent_alias.to_string(),
         runtime,
+        caller_ceiling,
     ))
 }
 
@@ -1536,12 +1539,14 @@ pub(crate) fn cron_update_tool(
     security: Arc<SecurityPolicy>,
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
     Arc::new(CronUpdateTool::new_with_runtime(
         config,
         security,
         agent_alias.to_string(),
         runtime,
+        caller_ceiling,
     ))
 }
 
@@ -1613,12 +1618,14 @@ pub(crate) fn cron_run_tool(
     security: Arc<SecurityPolicy>,
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
     Arc::new(CronRunTool::new_with_runtime(
         config,
         security,
         agent_alias.to_string(),
         runtime,
+        caller_ceiling,
     ))
 }
 
@@ -2079,6 +2086,11 @@ pub fn all_tools(
         None,
         None,
         None,
+        // This convenience wrapper has no per-run allowlist by construction. A
+        // caller that runs under a ceiling must use `all_tools_with_runtime`
+        // directly and hand it the handle, or its scheduler tools will persist
+        // jobs outside the bound.
+        None,
     )
 }
 
@@ -2300,6 +2312,17 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    // The per-run caller ceiling, when this registry is being built for a loop
+    // that has one. A per-run context fact the tools themselves need, in the
+    // same shape and for the same reason as `is_subagent_caller` above.
+    //
+    // `caller_allowed` alone is not enough for the scheduler tools: it decides
+    // WHICH tools the loop is offered, but a job's stored `allowed_tools`
+    // outlives the turn, so `cron_add`/`cron_update`/`cron_run` need the
+    // ceiling's VALUE to cap or refuse what they persist and launch. A loop that
+    // holds `cron_add` because the ceiling admits it would otherwise schedule
+    // work with the owning agent's full registry.
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -2355,11 +2378,17 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
+        // The three scheduler tools carry the loop's own ceiling when it has
+        // one. The bounded delegate path rebuilds them with the sealed handle;
+        // every OTHER loop that runs under a ceiling — a spawned child, or any
+        // `run` given a per-run allowlist — reaches them through here, and the
+        // stored job is the only carrier that survives to the scheduler.
         cron_add_tool(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
+            caller_ceiling.clone(),
         ),
         cron_list_tool(config.clone(), agent_alias),
         cron_remove_tool(config.clone(), security.clone(), agent_alias),
@@ -2368,12 +2397,14 @@ pub fn all_tools_with_runtime(
             security.clone(),
             agent_alias,
             runtime.clone(),
+            caller_ceiling.clone(),
         ),
         cron_run_tool(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
+            caller_ceiling.clone(),
         ),
         cron_runs_tool(config.clone(), agent_alias),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -3969,6 +4000,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .tools;
 
@@ -4028,6 +4060,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -4177,6 +4210,7 @@ permissions = ["http_client"]
                 None,
                 None,
                 None,
+                None,
             )
             .tools;
             let tool = tools
@@ -4266,6 +4300,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -4329,6 +4364,7 @@ permissions = ["http_client"]
             Some(engine),
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -4386,6 +4422,7 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -4408,6 +4445,7 @@ permissions = ["http_client"]
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
             None,
         );
 
@@ -4535,6 +4573,7 @@ permissions = ["http_client"]
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .tools
         };
@@ -4627,6 +4666,7 @@ permissions = ["http_client"]
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4887,6 +4927,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .tools;
 
@@ -5061,6 +5102,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(sop_engine),
+            None,
             None,
             None,
         );
@@ -5279,6 +5321,7 @@ permissions = ["http_client"]
             Some(sop_engine),
             None,
             None,
+            None,
         )
         .tools;
 
@@ -5444,6 +5487,7 @@ permissions = ["http_client"]
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .tools

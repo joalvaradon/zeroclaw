@@ -874,6 +874,12 @@ impl DelegateTool {
             // lifetime. `None` only when the parent registry itself had no live
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
+            // Independent delegation deliberately does NOT use the caller's
+            // registry as a ceiling (docs/book "Delegation gating": the target
+            // "resolves the target agent's own policy without the caller's
+            // non-escalation ceiling"), so there is none to hand its scheduler
+            // tools. This `None` is the documented mode, not an omission.
+            None,
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -3054,6 +3060,10 @@ impl DelegateTool {
                                 Arc::clone(&target_policy),
                                 agent_name,
                                 Arc::clone(runtime),
+                                // Same sealed ceiling `spawn_subagent` receives:
+                                // a job this target schedules must not outlive the
+                                // bound by being stored without one.
+                                Some(Arc::clone(&bounded_ceiling)),
                             ))),
                         );
                         target_identity_bound_tools.insert(
@@ -3063,6 +3073,10 @@ impl DelegateTool {
                                 Arc::clone(&target_policy),
                                 agent_name,
                                 Arc::clone(runtime),
+                                // Refuses a job stored outside this ceiling; the
+                                // stored list was written before this turn and
+                                // cannot be intersected at launch.
+                                Some(Arc::clone(&bounded_ceiling)),
                             ))),
                         );
                         target_identity_bound_tools.insert(
@@ -3072,6 +3086,10 @@ impl DelegateTool {
                                 Arc::clone(&target_policy),
                                 agent_name,
                                 Arc::clone(runtime),
+                                // A patch that rewrites `allowed_tools` is the
+                                // same write `cron_add` performs, and must not
+                                // widen or clear the inherited limit.
+                                Some(Arc::clone(&bounded_ceiling)),
                             ))),
                         );
                         target_identity_bound_tools.insert(
@@ -10109,6 +10127,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            // This helper builds the CALLER's own registry, which is the
+            // ceiling rather than something bounded by one.
             None,
         )
         .tools;
