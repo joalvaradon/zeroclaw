@@ -9,15 +9,30 @@
 //! rebuilds the owning agent's policy from config and passes the job's STORED
 //! `allowed_tools` to `agent::run`; a job stored without one runs with the
 //! owning agent's full registry. So for anything that schedules, the bound has
-//! to be applied to persisted state, and there are exactly two shapes:
+//! to be applied to persisted state, and there are three shapes:
 //!
-//! - [`cap_stored_allowed_tools`] for tools that WRITE a job's tool set
-//!   (`cron_add`, `cron_update`, `schedule`): intersect before storing, so the
-//!   stored list carries the bound forward to the run.
-//! - [`require_within_ceiling`] for tools that LAUNCH an existing job
-//!   (`cron_run`): there is nothing left to intersect — the list was written
-//!   earlier, possibly by the owning agent with no ceiling in force — so a job
-//!   that is not already within the bound is refused.
+//! - [`cap_stored_allowed_tools`] for the writes that CREATE a job's tool set
+//!   (`cron_add`'s agent branch, and a `cron_update` patch that names
+//!   `allowed_tools`): intersect before storing, so the stored list carries the
+//!   bound forward to the run.
+//! - [`require_within_ceiling`] for the operations that LAUNCH or RE-POINT an
+//!   existing agent job (`cron_run`, and any `cron_update` patch at all): there
+//!   is nothing left to intersect — the list was written earlier, possibly by
+//!   the owning agent with no ceiling in force — so a job that is not already
+//!   within the bound is refused. A patch that does not name `allowed_tools`
+//!   still re-points execution: `prompt`, `schedule` and `enabled` are applied
+//!   unconditionally, so the bound belongs on the RESULTING job, not on the
+//!   patch.
+//! - [`require_shell_within_ceiling`] for the routes that create, re-point or
+//!   re-arm a SHELL job (`cron_add`'s shell branch, `cron_update` against a
+//!   shell job, and `schedule`'s create / one-shot / resume). A shell job
+//!   stores no `allowed_tools` to intersect: it stores a command that the
+//!   scheduler later runs under the owning agent's policy, never through a tool
+//!   call, so the only bound available is whether the caller held `shell`
+//!   itself.
+//!
+//! `schedule` appears in the third shape and not the first: none of its routes
+//! writes an `allowed_tools` list, so there is nothing there to cap.
 //!
 //! Both fail closed on an unsealed ceiling: a tool registered under bounded
 //! delegation whose seal never completed has no bound to apply, and proceeding
@@ -120,6 +135,39 @@ pub(crate) fn require_within_ceiling(
         ));
     }
     Ok(())
+}
+
+/// The registry name of the tool that runs a shell command inside a turn.
+pub(crate) const SHELL_TOOL_NAME: &str = "shell";
+
+/// Refuse a bounded operation that would create, re-point or re-arm a stored
+/// SHELL job when the caller could not have run a shell command itself.
+///
+/// A shell job has no `allowed_tools` column: it stores a command string, and
+/// [`crate::cron::scheduler`] runs it under the OWNING agent's policy without
+/// consulting any tool list. So neither [`cap_stored_allowed_tools`] nor
+/// [`require_within_ceiling`] has anything to work with, and the bound that
+/// does apply is the caller's own shell capability: if `shell` was not in the
+/// caller's sealed set, the caller could not have run the command during the
+/// bounded turn, and deferring it through the scheduler must not become the way
+/// to. This is the fail-closed half of the contract — the alternative, storing
+/// a per-job ceiling the scheduler enforces at replay, would bound the command
+/// itself and is deliberately NOT what this does.
+pub(crate) fn require_shell_within_ceiling(
+    tool: &str,
+    ceiling: Option<&CallerCeiling>,
+) -> Result<(), String> {
+    let Some(ceiling) = sealed(tool, ceiling)? else {
+        return Ok(());
+    };
+    if ceiling.iter().any(|allowed| allowed == SHELL_TOOL_NAME) {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool}: refused — this stores or re-arms a shell job, whose command the \
+         scheduler later runs under the owning agent's policy, and 'shell' is \
+         outside the calling agent's bounded tool ceiling"
+    ))
 }
 
 #[cfg(test)]
@@ -253,5 +301,60 @@ mod tests {
         let error = require_within_ceiling("cron_run", Some(&handle), Some(&["shell".to_string()]))
             .expect_err("an unsealed ceiling must refuse at launch too");
         assert!(error.contains("never sealed"), "got: {error}");
+    }
+
+    // ── require_shell_within_ceiling ────────────────────────────────────────
+
+    #[test]
+    fn storing_a_shell_job_without_a_ceiling_is_unaffected() {
+        // Broken state: refusing unconditionally would break every ordinary
+        // `schedule`/`cron_add` shell job outside bounded delegation.
+        require_shell_within_ceiling("schedule", None).expect("no ceiling in force");
+    }
+
+    #[test]
+    fn storing_a_shell_job_is_allowed_when_the_caller_held_shell() {
+        // The positive half of the refusals below. A bounded caller that could
+        // have run the command in its own turn loses nothing by deferring it,
+        // so this must keep working — otherwise the refusal below would look
+        // correct while simply banning the tool.
+        let handle = sealed_ceiling(&["shell", "cron_add"]);
+        require_shell_within_ceiling("cron_add", Some(&handle))
+            .expect("a caller holding `shell` may still defer a shell command");
+    }
+
+    #[test]
+    fn storing_a_shell_job_is_refused_when_shell_is_outside_the_ceiling() {
+        // The escape: a shell job carries no `allowed_tools`, so nothing
+        // downstream can bound it — the scheduler runs the stored command under
+        // the OWNING agent's policy. Broken state: letting the write through
+        // because there is no list to intersect.
+        let handle = sealed_ceiling(&["cron_add", "spawn_subagent"]);
+        let error = require_shell_within_ceiling("cron_add", Some(&handle))
+            .expect_err("a caller without `shell` must not defer a shell command");
+        assert!(
+            error.contains("shell") && error.contains("owning agent's policy"),
+            "the message must say what the refusal protects, not just that it refused: {error}"
+        );
+    }
+
+    #[test]
+    fn storing_a_shell_job_under_an_unsealed_ceiling_is_refused() {
+        // Same fail-closed reading as the other two shapes: a bound in force but
+        // not yet sealed is an error, never an absent bound.
+        let handle = unsealed_ceiling();
+        let error = require_shell_within_ceiling("schedule", Some(&handle))
+            .expect_err("an unsealed ceiling must refuse the shell route too");
+        assert!(error.contains("never sealed"), "got: {error}");
+    }
+
+    #[test]
+    fn a_ceiling_that_merely_mentions_shell_inside_another_name_does_not_admit_it() {
+        // `shell` is matched as a whole name, not as a substring: a ceiling
+        // holding `shell_history` or `powershell` grants no shell execution.
+        // Broken state: a `contains`-style match, which would silently admit it.
+        let handle = sealed_ceiling(&["shell_history", "powershell"]);
+        require_shell_within_ceiling("schedule", Some(&handle))
+            .expect_err("a name containing `shell` is not the `shell` tool");
     }
 }

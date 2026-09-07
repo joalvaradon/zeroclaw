@@ -478,6 +478,22 @@ impl Tool for CronAddTool {
                     });
                 }
 
+                // The command above was validated against THIS agent's risk
+                // profile, which under bounded delegation is the target's, not
+                // the caller's. A shell job stores no `allowed_tools` to cap,
+                // so the caller's bound has to be applied as a refusal here:
+                // see `caller_ceiling::require_shell_within_ceiling`.
+                if let Err(error) = crate::tools::caller_ceiling::require_shell_within_ceiling(
+                    "cron_add",
+                    self.caller_ceiling.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }

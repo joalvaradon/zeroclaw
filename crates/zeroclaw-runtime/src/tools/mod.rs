@@ -1645,17 +1645,24 @@ pub(crate) fn cron_runs_tool(
 /// resume, one-shot) in a single tool; see [`cron_add_tool`] for why
 /// `agent_alias` must be the target's own. `ScheduleTool` takes an owned
 /// `Config`, not `Arc<Config>`, matching `all_tools_with_runtime`'s own call.
+///
+/// `caller_ceiling` is `Some` wherever the registry being built is bounded by a
+/// caller's set: every job this tool creates is a shell job, so the ceiling is
+/// applied as a refusal at the create/resume routes rather than stored on the
+/// job. `None` is for a registry with no caller above it.
 pub(crate) fn schedule_tool(
     security: Arc<SecurityPolicy>,
     config: zeroclaw_config::schema::Config,
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
     Arc::new(ScheduleTool::new_with_runtime(
         security,
         config,
         agent_alias.to_string(),
         runtime,
+        caller_ceiling,
     ))
 }
 
@@ -2427,6 +2434,10 @@ pub fn all_tools_with_runtime(
             root_config.clone(),
             agent_alias,
             runtime.clone(),
+            // Same sealed ceiling the cron tools and `spawn_subagent` receive:
+            // a replayed bounded job must not gain deferred shell execution
+            // here that its own turn was refused.
+            caller_ceiling.clone(),
         ),
         spawn_subagent_tool(
             config.clone(),

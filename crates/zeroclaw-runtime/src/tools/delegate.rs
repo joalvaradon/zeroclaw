@@ -3736,6 +3736,11 @@ impl DelegateTool {
                                 root_config.as_ref().clone(),
                                 agent_name,
                                 Arc::clone(runtime),
+                                // `schedule` creates shell jobs only, so it has
+                                // no stored tool set to cap: the ceiling is
+                                // applied as a refusal when the caller did not
+                                // hold `shell` itself.
+                                Some(Arc::clone(&bounded_ceiling)),
                             ))),
                         );
 
@@ -11636,10 +11641,40 @@ mod tests {
     /// exactly like a real caller turn with those features enabled.
     /// `configure` lets each test flip config flags (e.g.
     /// `data_retention.enabled`) before the registry is built.
+    /// Three of the ownership regressions below drive their assertion through a
+    /// SHELL job, and a bounded target may now defer shell execution only when
+    /// the caller held `shell` itself — see
+    /// [`crate::tools::caller_ceiling::require_shell_within_ceiling`]. Granting
+    /// it to both profiles keeps those scenarios reachable, so each test still
+    /// measures WHICH identity owns the stored job, which is the property it is
+    /// about. Without this the jobs are never written and the assertions fail on
+    /// a count of zero — a refusal, not the attribution defect they guard.
+    fn grant_shell_to_both_profiles(cfg: &mut Config) {
+        for profile in ["balanced", "research"] {
+            if let Some(profile) = cfg.risk_profiles.get_mut(profile) {
+                profile.allowed_tools.push("shell".to_string());
+            }
+        }
+    }
+
     async fn bounded_delegate_full_fixture(
         tool_name: &str,
         configure: impl FnOnce(&mut Config),
     ) -> BoundedDelegateFsFixture {
+        bounded_delegate_full_fixture_multi(&[tool_name], configure).await
+    }
+
+    /// Same fixture, with more than one tool in the caller's `parent_tools`.
+    ///
+    /// This matters for the ceiling: the bounded set is sealed from the
+    /// registry ASSEMBLED out of `parent_tools`, not from the caller's risk
+    /// profile, so a tool that is merely allowed by policy but absent from
+    /// `parent_tools` never reaches the sealed set.
+    async fn bounded_delegate_full_fixture_multi(
+        tool_names: &[&str],
+        configure: impl FnOnce(&mut Config),
+    ) -> BoundedDelegateFsFixture {
+        let tool_name = tool_names[0];
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
@@ -11767,11 +11802,19 @@ mod tests {
         )
         .tools;
 
-        let real_tool = caller_tool_registry
-            .into_iter()
-            .find(|t| t.name() == tool_name)
-            .unwrap_or_else(|| panic!("all_tools_with_runtime did not register '{tool_name}'"));
-        let parent_tools: Vec<Arc<dyn Tool>> = vec![Arc::from(real_tool)];
+        let mut parent_tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(tool_names.len());
+        for tool in caller_tool_registry {
+            let wanted = tool_names.contains(&tool.name());
+            if wanted {
+                parent_tools.push(Arc::from(tool));
+            }
+        }
+        for name in tool_names {
+            assert!(
+                parent_tools.iter().any(|t| t.name() == *name),
+                "all_tools_with_runtime did not register '{name}'"
+            );
+        }
 
         let mut delegate_agents = HashMap::new();
         for (name, agent) in &config.agents {
@@ -12115,7 +12158,9 @@ mod tests {
         // (no scheduler tick fires here), which is enough to prove the fix
         // without any of the async-execution risk that would come with
         // actually running it.
-        let fixture = bounded_delegate_full_fixture("cron_add", |_cfg| {}).await;
+        let fixture =
+            bounded_delegate_full_fixture_multi(&["cron_add", "shell"], grant_shell_to_both_profiles)
+                .await;
 
         let model_provider = BoundedSingleToolCallThenFinalModelProvider {
             tool_name: "cron_add",
@@ -12175,7 +12220,11 @@ mod tests {
         // agent_alias)` when the raw string isn't an existing job ID). A
         // Bounded cross-profile target reusing the caller's instance could
         // not resolve (or worse, collide with) its own jobs by name.
-        let fixture = bounded_delegate_full_fixture("cron_update", |_cfg| {}).await;
+        let fixture = bounded_delegate_full_fixture_multi(
+            &["cron_update", "shell"],
+            grant_shell_to_both_profiles,
+        )
+        .await;
 
         crate::cron::add_shell_job(
             &fixture.config,
@@ -12286,7 +12335,9 @@ mod tests {
         // tool's "runs later under the stored identity's risk profile"
         // exposure. Same safe assertion strategy as `cron_add`: only checks
         // which identity the job is stored under, never lets it run.
-        let fixture = bounded_delegate_full_fixture("schedule", |_cfg| {}).await;
+        let fixture =
+            bounded_delegate_full_fixture_multi(&["schedule", "shell"], grant_shell_to_both_profiles)
+                .await;
 
         let model_provider = BoundedSingleToolCallThenFinalModelProvider {
             tool_name: "schedule",

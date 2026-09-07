@@ -16,6 +16,11 @@ pub struct ScheduleTool {
     runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for shell command validation.
     agent_alias: String,
+    /// Bounded-delegation ceiling for the registering loop, or `None` when the
+    /// registration is unbounded. Every job this tool creates is a
+    /// `JobType::Shell` job, so the ceiling is applied as a refusal rather than
+    /// as a stored cap. See [`crate::tools::caller_ceiling`].
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl ScheduleTool {
@@ -24,12 +29,14 @@ impl ScheduleTool {
         config: Config,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
     ) -> Self {
         Self {
             security,
             config,
             runtime,
             agent_alias: agent_alias.into(),
+            caller_ceiling,
         }
     }
 
@@ -43,7 +50,7 @@ impl ScheduleTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(security, config, agent_alias, runtime)
+        Self::new_with_runtime(security, config, agent_alias, runtime, None)
     }
 }
 
@@ -397,6 +404,21 @@ impl ScheduleTool {
             }
         }
 
+        // Every route below persists a `JobType::Shell` job that the scheduler
+        // later runs under this agent's policy. Under bounded delegation that
+        // policy is the target's, so the caller's bound has to be applied here:
+        // there is no `allowed_tools` on a shell job to carry it forward.
+        if let Err(error) = crate::tools::caller_ceiling::require_shell_within_ceiling(
+            "schedule",
+            self.caller_ceiling.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         // Enforce rate-limiting AFTER command/args validation so that invalid
         // requests do not consume the action budget.
         if let Some(blocked) = self.enforce_mutation_allowed(action) {
@@ -549,6 +571,37 @@ impl ScheduleTool {
     }
 
     fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
+        // Re-enabling re-arms deferred execution, so it takes the same bound as
+        // creating: a job a bounded caller could not have created is not one it
+        // may switch back on. Pausing only removes capability and is left alone.
+        // The job is read for its type because `resume` can name an agent job
+        // this tool did not create, whose bound is its stored `allowed_tools`.
+        if !pause && self.caller_ceiling.is_some() {
+            let bounded = match cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
+                Ok(job) => match job.job_type {
+                    cron::JobType::Shell => {
+                        crate::tools::caller_ceiling::require_shell_within_ceiling(
+                            "schedule",
+                            self.caller_ceiling.as_ref(),
+                        )
+                    }
+                    cron::JobType::Agent => crate::tools::caller_ceiling::require_within_ceiling(
+                        "schedule",
+                        self.caller_ceiling.as_ref(),
+                        job.allowed_tools.as_deref(),
+                    ),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = bounded {
+                return ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                };
+            }
+        }
+
         // Authorization travels with the write: an agent that receives or guesses
         // another agent's id must not disable or re-enable it, and a success
         // reply must not confirm that the foreign id exists.
@@ -960,7 +1013,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap());
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
-        let tool = ScheduleTool::new_with_runtime(security, config, TEST_AGENT, runtime);
+        let tool = ScheduleTool::new_with_runtime(security, config, TEST_AGENT, runtime, None);
 
         let result = tool
             .execute(json!({
