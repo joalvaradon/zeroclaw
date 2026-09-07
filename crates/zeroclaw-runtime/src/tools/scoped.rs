@@ -994,6 +994,112 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// The ceiling must narrow the delegate parent set, not only the registry
+    /// this function returns.
+    ///
+    /// Tested at the function's own contract rather than through a delegation
+    /// chain, and deliberately so: no reachable chain exercises it today,
+    /// because `delegate` is stripped from a bounded target's registry and so
+    /// cannot reach a per-run allowlist (see
+    /// `bounded_delegate_cron_job_inherits_ceiling`). Testing the behaviour
+    /// where it is defined is what makes the narrowing verifiable now instead of
+    /// only after that stripping changes.
+    ///
+    /// THIS TEST MUST FAIL if the `caller_allowed` retain over `delegate_handle`
+    /// is removed: `out_of_ceiling` reappears in the parent set while the
+    /// returned registry still looks correct.
+    #[tokio::test]
+    async fn caller_ceiling_narrows_the_delegate_parent_set() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+
+        let mut built =
+            built_with_counting_tools(Arc::clone(&calls), &["in_ceiling", "out_of_ceiling"]);
+        // The set a bounded delegation would later read to compute its target's
+        // ceiling. It starts wider than the per-run allowlist, which is the
+        // whole point.
+        let handle: DelegateParentToolsHandle =
+            Arc::new(parking_lot::RwLock::new(built.unfiltered_tool_arcs.clone()));
+        built.delegate_handle = Some(Arc::clone(&handle));
+
+        let allowed = vec!["in_ceiling".to_string()];
+        let _assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: Some(&allowed),
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        let names: Vec<String> = handle
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        // Positive half: without it, a retain that emptied the set entirely
+        // would satisfy the negative half for the wrong reason.
+        assert!(
+            names.iter().any(|n| n == "in_ceiling"),
+            "the admitted tool must survive in the delegate parent set; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "out_of_ceiling"),
+            "a tool outside the caller ceiling stayed in the delegate parent set, so a \
+             bounded delegation would compute its target's ceiling from it; got {names:?}"
+        );
+    }
+
+    /// Control for the test above: with no ceiling in force the parent set is
+    /// left alone, so the narrowing cannot be mistaken for an unconditional
+    /// prune.
+    #[tokio::test]
+    async fn no_caller_ceiling_leaves_the_delegate_parent_set_untouched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+
+        let mut built =
+            built_with_counting_tools(Arc::clone(&calls), &["in_ceiling", "out_of_ceiling"]);
+        let handle: DelegateParentToolsHandle =
+            Arc::new(parking_lot::RwLock::new(built.unfiltered_tool_arcs.clone()));
+        built.delegate_handle = Some(Arc::clone(&handle));
+
+        let _assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        assert_eq!(
+            handle.read().len(),
+            2,
+            "an unbounded assembly must not prune the delegate parent set"
+        );
+    }
+
     async fn assert_pipeline_context_prevalidates_excluded_tool(
         child_name: &'static str,
         exclude_memory: bool,
