@@ -1690,8 +1690,21 @@ impl Agent {
             // whole lifetime. One-shot callers pass `None` and keep the
             // documented snapshot fallback.
             live_config.clone(),
-            // The `Agent` surface assembles with `caller_allowed: None`; it runs
-            // an agent as itself, with no caller ceiling to cap stored jobs by.
+            // No ceiling here, and the reason is narrower than it first looks.
+            // This surface runs an agent as itself and its assembly passes
+            // `caller_allowed: None`.
+            //
+            // `AgentBuilder` does expose an `allowed_tools` setter, so "this
+            // surface has no per-run allowlist" would be the wrong reason. But that
+            // setter has no production caller — its only uses are the builder's own
+            // unit tests — and `build` applies it as a post-hoc `retain` by name
+            // over already-constructed tools, which cannot re-bind a ceiling into
+            // instances built without one.
+            //
+            // So there is nothing to forward today. If that setter ever gains a
+            // production caller, the allowlist has to be threaded THROUGH here as
+            // the ceiling instead of filtered afterwards, or the scheduler tools it
+            // retains will persist work outside it.
             None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill

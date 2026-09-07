@@ -2317,12 +2317,21 @@ pub fn all_tools_with_runtime(
     // that has one. A per-run context fact the tools themselves need, in the
     // same shape and for the same reason as `is_subagent_caller` above.
     //
-    // `caller_allowed` alone is not enough for the scheduler tools: it decides
-    // WHICH tools the loop is offered, but a job's stored `allowed_tools`
-    // outlives the turn, so `cron_add`/`cron_update`/`cron_run` need the
-    // ceiling's VALUE to cap or refuse what they persist and launch. A loop that
-    // holds `cron_add` because the ceiling admits it would otherwise schedule
-    // work with the owning agent's full registry.
+    // `caller_allowed` alone is not enough for the tools that hand work to a
+    // LATER or SEPARATE execution: it decides which tools the loop is offered,
+    // but what those tools carry outlives the turn's filtering.
+    //
+    // Two consumers here, and both must get it — a loop that holds one of them
+    // because the ceiling admits it would otherwise hand the next execution the
+    // owning agent's full registry:
+    //
+    // - `cron_add` / `cron_update` / `cron_run`: a job's stored `allowed_tools`
+    //   is what the scheduler replays from, so they need the ceiling's VALUE to
+    //   cap what they persist and to refuse launching outside it.
+    // - `spawn_subagent`: it re-enters `agent::run` for the child, and passes
+    //   this ceiling as that run's per-run allowlist. Without it the child is
+    //   assembled from the target's own profile — including for a REPLAYED cron
+    //   job, whose own turn is correctly filtered and whose child would not be.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
@@ -2424,9 +2433,16 @@ pub fn all_tools_with_runtime(
             agent_alias,
             security.clone(),
             is_subagent_caller,
-            // A registry assembled for an agent in its own right has no caller
-            // above it, so there is no ceiling to carry.
-            None,
+            // The ceiling has to reach here too, and for a reason that is easy to
+            // miss: a run can BE bounded without being a bounded delegate. A cron
+            // job stored under a ceiling is replayed by the scheduler through
+            // `agent::run` with that stored list, so the job's own first turn is
+            // filtered correctly — but the `spawn_subagent` in THIS registry is
+            // what that turn would use to escape, by assembling its child from the
+            // owning agent's full policy. Passing `None` here would cap what a
+            // bounded chain can persist and then hand the replay an uncapped way
+            // to spawn out of it.
+            caller_ceiling.clone(),
         ),
         send_message_to_peer_tool(config.clone(), agent_alias),
         model_routing_config_tool(security.clone(), config.clone()),

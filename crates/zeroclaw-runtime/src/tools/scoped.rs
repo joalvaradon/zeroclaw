@@ -84,9 +84,18 @@ pub struct ScopedAssembly<'a> {
     /// Skills loaded by the caller's (single) loader; registered under the same gate.
     pub skills: &'a [Skill],
     pub runtime: Arc<dyn RuntimeAdapter>,
-    /// Documented divergence: a per-run caller allowlist. It only NARROWS, and is
-    /// threaded into BOTH the built-in filter and the MCP tool-access policy. `None`
-    /// on every path except `run`.
+    /// A per-run caller allowlist. It only NARROWS, and is threaded into BOTH the
+    /// built-in filter and the MCP tool-access policy — so it also caps eager MCP
+    /// registration and the runtime `tool_search` activation channel, not just the
+    /// static set.
+    ///
+    /// `Some` on `run`, which is the entry point that carries one, and on the SOP
+    /// step re-assembly reached from it, which forwards it so a step agent cannot
+    /// recover what the caller never had. `None` on the remaining paths because
+    /// they have no caller above them — NOT because the ceiling is optional there.
+    ///
+    /// Any new path that assembles a registry for a caller that HAS a ceiling must
+    /// forward it; passing `None` restores the target's own profile in full.
     pub caller_allowed: Option<&'a [String]>,
     /// Documented divergence: ACP `session/new` must return promptly, so it does not
     /// connect MCP servers - they are neither resolved nor connected; nothing is
@@ -624,6 +633,35 @@ impl ScopedToolRegistry {
             if excluded.iter().any(|ex| ex == "tool_search") {
                 deferred_section.clear();
             }
+        }
+
+        // Narrow the delegate parent set by the same ceiling, so that whatever this
+        // assembly refuses to hand the model it also refuses to hand the model's
+        // delegates.
+        //
+        // Consistency, not a repair of a reachable escape — stated plainly because
+        // the distinction matters. A bounded delegation computes its target's
+        // ceiling from `parent_tools` filtered by the CALLER'S POLICY (see the
+        // bounded assembly in `tools/delegate.rs`), never from the caller's sealed
+        // registry. A policy is per-agent and `caller_allowed` is per-run, so the
+        // policy-filtered parent set is the wider of the two, and a run that holds
+        // both a per-run allowlist and `delegate` would delegate from the wide set.
+        //
+        // No such run exists today: `delegate` is stripped from a bounded target's
+        // registry, so it cannot reach the sealed set, cannot reach a job's stored
+        // `allowed_tools`, and cannot reach a spawned child. Verified by
+        // `bounded_delegate_cron_job_inherits_ceiling`, which pins that a job
+        // scheduled from a bounded target stores no `delegate`.
+        //
+        // It stops being hypothetical the moment that stripping changes, which is
+        // exactly what the in-flight work to honour `delegation_policy` for bounded
+        // targets does. One line here is cheaper than re-deriving this later.
+        if let Some(allowed) = caller_allowed
+            && let Some(handle) = delegate_handle.as_ref()
+        {
+            handle
+                .write()
+                .retain(|tool| allowed.iter().any(|name| name == tool.name()));
         }
 
         ScopedAssembled {
