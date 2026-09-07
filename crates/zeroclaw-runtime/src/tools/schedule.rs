@@ -651,6 +651,100 @@ mod tests {
         (tmp, config, security)
     }
 
+    // ── caller ceiling ──────────────────────────────────────────────────────
+
+    fn sealed_ceiling(names: &[&str]) -> crate::tools::caller_ceiling::CallerCeiling {
+        let handle: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = handle.set(names.iter().map(|n| (*n).to_string()).collect());
+        handle
+    }
+
+    /// Every other test in this module builds the tool through
+    /// `ScheduleTool::new`, which hardcodes `caller_ceiling: None` — so without
+    /// this helper the bounded branches are unreachable from any test here.
+    fn bounded_tool(
+        config: &Config,
+        security: &Arc<SecurityPolicy>,
+        ceiling: &[&str],
+    ) -> ScheduleTool {
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        ScheduleTool::new_with_runtime(
+            Arc::clone(security),
+            config.clone(),
+            TEST_AGENT,
+            runtime,
+            Some(sealed_ceiling(ceiling)),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_bounded_caller_without_shell_cannot_resume_a_paused_shell_job() {
+        // Re-enabling is the same deferred execution as creating: the job fires
+        // on its own schedule afterwards, under the owning agent's policy.
+        let (_tmp, config, security) = test_setup().await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        cron::pause_job_for_agent(&config, &job.id, TEST_AGENT).unwrap();
+        let tool = bounded_tool(&config, &security, &["schedule"]);
+
+        let result = tool
+            .execute(json!({ "action": "resume", "id": job.id }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bounded caller without `shell` re-armed a shell job: {result:?}"
+        );
+        assert!(
+            !cron::get_job(&config, &job.id).unwrap().enabled,
+            "the refusal must not have re-armed the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_caller_holding_shell_may_resume_a_paused_shell_job() {
+        // The positive half: same job, same config, one entry more in the
+        // ceiling. Without it the refusal above would be satisfied by a resume
+        // that always fails.
+        let (_tmp, config, security) = test_setup().await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        cron::pause_job_for_agent(&config, &job.id, TEST_AGENT).unwrap();
+        let tool = bounded_tool(&config, &security, &["schedule", "shell"]);
+
+        let result = tool
+            .execute(json!({ "action": "resume", "id": job.id }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(cron::get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn pausing_is_exempt_from_the_ceiling() {
+        // Pausing only removes capability. Refusing it would leave a bounded
+        // target unable to switch off a job it may not switch on — the same
+        // exemption `cron_update` makes for a disable-only patch.
+        let (_tmp, config, security) = test_setup().await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&config, &security, &["schedule"]);
+
+        let result = tool
+            .execute(json!({ "action": "pause", "id": job.id }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a bounded caller must be able to pause a shell job: {result:?}"
+        );
+        assert!(!cron::get_job(&config, &job.id).unwrap().enabled);
+    }
+
     #[tokio::test]
     async fn tool_name_and_schema() {
         let (_tmp, config, security) = test_setup().await;

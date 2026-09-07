@@ -11650,10 +11650,15 @@ mod tests {
     /// about. Without this the jobs are never written and the assertions fail on
     /// a count of zero — a refusal, not the attribution defect they guard.
     fn grant_shell_to_both_profiles(cfg: &mut Config) {
-        for profile in ["balanced", "research"] {
-            if let Some(profile) = cfg.risk_profiles.get_mut(profile) {
-                profile.allowed_tools.push("shell".to_string());
-            }
+        for name in ["balanced", "research"] {
+            // Panics rather than skipping: renaming a fixture profile would
+            // otherwise make this a silent no-op, and the three tests would
+            // fail on a stored-job count of zero — the exact misleading failure
+            // this helper exists to prevent.
+            let profile = cfg.risk_profiles.get_mut(name).unwrap_or_else(|| {
+                panic!("fixture risk profile '{name}' must exist to grant shell")
+            });
+            profile.allowed_tools.push("shell".to_string());
         }
     }
 
@@ -12158,9 +12163,11 @@ mod tests {
         // (no scheduler tick fires here), which is enough to prove the fix
         // without any of the async-execution risk that would come with
         // actually running it.
-        let fixture =
-            bounded_delegate_full_fixture_multi(&["cron_add", "shell"], grant_shell_to_both_profiles)
-                .await;
+        let fixture = bounded_delegate_full_fixture_multi(
+            &["cron_add", "shell"],
+            grant_shell_to_both_profiles,
+        )
+        .await;
 
         let model_provider = BoundedSingleToolCallThenFinalModelProvider {
             tool_name: "cron_add",
@@ -12335,9 +12342,11 @@ mod tests {
         // tool's "runs later under the stored identity's risk profile"
         // exposure. Same safe assertion strategy as `cron_add`: only checks
         // which identity the job is stored under, never lets it run.
-        let fixture =
-            bounded_delegate_full_fixture_multi(&["schedule", "shell"], grant_shell_to_both_profiles)
-                .await;
+        let fixture = bounded_delegate_full_fixture_multi(
+            &["schedule", "shell"],
+            grant_shell_to_both_profiles,
+        )
+        .await;
 
         let model_provider = BoundedSingleToolCallThenFinalModelProvider {
             tool_name: "schedule",

@@ -16,23 +16,34 @@
 //!   `allowed_tools`): intersect before storing, so the stored list carries the
 //!   bound forward to the run.
 //! - [`require_within_ceiling`] for the operations that LAUNCH or RE-POINT an
-//!   existing agent job (`cron_run`, and any `cron_update` patch at all): there
-//!   is nothing left to intersect — the list was written earlier, possibly by
-//!   the owning agent with no ceiling in force — so a job that is not already
-//!   within the bound is refused. A patch that does not name `allowed_tools`
-//!   still re-points execution: `prompt`, `schedule` and `enabled` are applied
-//!   unconditionally, so the bound belongs on the RESULTING job, not on the
-//!   patch.
-//! - [`require_shell_within_ceiling`] for the routes that create, re-point or
-//!   re-arm a SHELL job (`cron_add`'s shell branch, `cron_update` against a
-//!   shell job, and `schedule`'s create / one-shot / resume). A shell job
-//!   stores no `allowed_tools` to intersect: it stores a command that the
-//!   scheduler later runs under the owning agent's policy, never through a tool
-//!   call, so the only bound available is whether the caller held `shell`
-//!   itself.
+//!   existing AGENT job (`cron_run`, `schedule`'s resume, and any `cron_update`
+//!   patch that can arm or re-point one): there is nothing left to intersect —
+//!   the list was written earlier, possibly by the owning agent with no ceiling
+//!   in force — so a job that is not already within the bound is refused. A
+//!   patch that does not name `allowed_tools` still re-points execution:
+//!   `prompt`, `schedule` and `enabled` are applied unconditionally, so the
+//!   bound belongs on the RESULTING job, not on the patch.
+//! - [`require_shell_within_ceiling`] for every route that creates, re-points,
+//!   re-arms **or runs** a SHELL job: `cron_add`'s shell branch, `cron_update`
+//!   against a shell job, `schedule`'s create / one-shot / resume, and
+//!   **`cron_run`**, which is the verb that executes one. A shell job stores no
+//!   `allowed_tools` to intersect: it stores a command that the scheduler runs
+//!   under the owning agent's policy, never through a tool call, so the only
+//!   bound available is whether the caller held `shell` itself.
 //!
-//! `schedule` appears in the third shape and not the first: none of its routes
-//! writes an `allowed_tools` list, so there is nothing there to cap.
+//! Two things this enumeration is deliberately explicit about, because getting
+//! either wrong is how the gaps this module exists to close were opened:
+//!
+//! - **`schedule` is in the third shape and not the first.** None of its routes
+//!   writes an `allowed_tools` list, so there is nothing there to cap — which is
+//!   a reason to bound it differently, never a reason to leave it unbounded.
+//! - **`cron_run` is in BOTH shapes, chosen by `job_type`.** Bounding a shell
+//!   job by its stored `allowed_tools` would bound it by a field it does not
+//!   own. Such a job usually stores `None`, which [`require_within_ceiling`]
+//!   refuses — the right outcome for the wrong reason, and only until an
+//!   unbounded turn of the owning agent writes a harmless-looking list onto it
+//!   (`crate::cron::store` applies an `allowed_tools` patch without consulting
+//!   `job_type`).
 //!
 //! Both fail closed on an unsealed ceiling: a tool registered under bounded
 //! delegation whose seal never completed has no bound to apply, and proceeding

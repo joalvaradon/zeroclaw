@@ -82,6 +82,46 @@ impl CronUpdateTool {
     }
 }
 
+/// True when the only thing a patch can do is REMOVE capability.
+///
+/// `schedule` exempts `pause` from the ceiling for exactly this reason, and
+/// `cron_update` must not be stricter than its sibling: otherwise a bounded
+/// target could be unable to turn OFF a job it was not allowed to turn on,
+/// which protects nothing and takes away the one safe response to a job it
+/// should not have.
+///
+/// Destructured exhaustively on purpose. A new `CronJobPatch` field must not
+/// join the exempt set by default, so adding one breaks this build instead of
+/// silently widening what a bounded turn may write.
+fn patch_only_disables(patch: &cron::CronJobPatch) -> bool {
+    let cron::CronJobPatch {
+        enabled,
+        schedule,
+        command,
+        prompt,
+        name,
+        delivery,
+        model,
+        session_target,
+        delete_after_run,
+        allowed_tools,
+        uses_memory,
+        shell_output_format,
+    } = patch;
+    *enabled == Some(false)
+        && schedule.is_none()
+        && command.is_none()
+        && prompt.is_none()
+        && name.is_none()
+        && delivery.is_none()
+        && model.is_none()
+        && session_target.is_none()
+        && delete_after_run.is_none()
+        && allowed_tools.is_none()
+        && uses_memory.is_none()
+        && shell_output_format.is_none()
+}
+
 #[async_trait]
 impl Tool for CronUpdateTool {
     fn name(&self) -> &str {
@@ -306,7 +346,11 @@ impl Tool for CronUpdateTool {
         // re-point an existing unbounded job's `prompt` and re-arm its
         // `schedule` without ever naming `allowed_tools`. The bound therefore
         // belongs on the RESULTING job, which means reading the stored one.
-        if self.caller_ceiling.is_some() {
+        //
+        // A patch that can only DISABLE is exempt, matching `schedule`, which
+        // guards `resume` and leaves `pause` alone: refusing it would leave a
+        // bounded target unable to switch off a job it may not switch on.
+        if self.caller_ceiling.is_some() && !patch_only_disables(&patch) {
             let existing = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
                 Ok(job) => job,
                 Err(error) => {
@@ -1176,6 +1220,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        // Disabled FIRST, so the patch below genuinely re-arms. Patching
+        // `enabled: true` onto an already-enabled job would assert the refusal
+        // without the scenario the name promises.
+        cron::pause_job_for_agent(&cfg, &job.id, TEST_AGENT).unwrap();
         let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
 
         let result = tool
@@ -1195,16 +1243,47 @@ mod tests {
             error.contains("shell"),
             "the refusal must name the capability it protects: {error}"
         );
+        assert!(
+            !cron::get_job(&cfg, &job.id).unwrap().enabled,
+            "the refusal must not have re-armed the job"
+        );
     }
 
     #[tokio::test]
     async fn a_shell_job_is_patchable_when_the_caller_held_shell() {
-        // The positive half of the refusal above: deferring what the caller
-        // could already have run in-turn takes nothing away.
+        // The positive half of the refusal above. It patches `name` rather than
+        // `enabled: false`, which is exempt from the ceiling entirely: an exempt
+        // field would make this pass without ever reaching the guard's allow
+        // path, which is the branch it exists to prove.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
         let tool = bounded_tool(&cfg, &["cron_update", "shell"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "name": "renamed-by-bounded-caller" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().name.as_deref(),
+            Some("renamed-by-bounded-caller")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_caller_may_disable_a_shell_job_it_could_not_have_armed() {
+        // Refusing this would protect nothing and remove the one safe response
+        // to a job the target should not have: `schedule` already exempts
+        // `pause` on the same reasoning, and the two must not disagree.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
 
         let result = tool
             .execute(json!({
@@ -1214,8 +1293,40 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.success,
+            "a bounded caller must be able to switch OFF a shell job: {result:?}"
+        );
         assert!(!cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn the_disable_exemption_does_not_carry_a_second_field() {
+        // The exemption is for a patch whose ONLY effect is removing
+        // capability. Pairing it with any other field must fall back to the
+        // guard, or `{"enabled": false, "command": "..."}` would be a way in.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": false, "command": "echo smuggled" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a disable paired with another field must not ride the exemption: {result:?}"
+        );
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().command,
+            "echo ok",
+            "the refusal must not have written the command"
+        );
     }
 
     #[tokio::test]
