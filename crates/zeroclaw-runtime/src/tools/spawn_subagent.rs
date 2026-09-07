@@ -253,7 +253,8 @@ impl Tool for SpawnSubagentTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(
-                            "spawn_subagent: refused - a delegated caller ceiling was declared                              but never published, so the child cannot be bounded"
+                            "spawn_subagent: refused — a delegated caller ceiling was \
+                             declared but never published, so the child cannot be bounded"
                                 .into(),
                         ),
                     });
