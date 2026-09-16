@@ -4189,10 +4189,31 @@ impl DelegateTool {
                 // bounding each level by what the level above actually received
                 // makes the bound narrow monotonically, instead of restating the
                 // original caller's set at every depth and drifting from it.
+                //
+                // The ceiling is a set of NAMES, but a name identifies a surface
+                // offered, not the authority behind it: `BoundedSopApproveDenied`
+                // reports the same `name()` as the real `SopApproveTool` it stands
+                // in for, deliberately, so the model sees the schema instead of a
+                // missing tool. Sealing that name into the ceiling would hand a
+                // denied capability to whatever rebuilds a normal, unbounded
+                // registry and retains by name from this set later — a stored cron
+                // job's replay, or `spawn_subagent`'s own `agent::run` call — both
+                // of which construct the REAL approval tool and would honor the
+                // name as a grant. Every other denied tool is instead simply
+                // absent from this registry, so this is the one name that needs
+                // an explicit exclusion rather than falling out of the set on its
+                // own (see `BoundedSopApproveDenied`'s doc comment).
                 let _ = bounded_ceiling.set(
                     assembled_bounded
                         .registry
                         .iter()
+                        .filter(|tool| {
+                            tool.as_any()
+                                .and_then(|any| {
+                                    any.downcast_ref::<crate::tools::sop_approve::BoundedSopApproveDenied>()
+                                })
+                                .is_none()
+                        })
                         .map(|tool| tool.name().to_string())
                         .collect(),
                 );

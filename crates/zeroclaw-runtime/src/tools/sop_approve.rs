@@ -233,6 +233,14 @@ pub struct BoundedSopApproveDenied;
 
 #[async_trait]
 impl Tool for BoundedSopApproveDenied {
+    // Lets the bounded ceiling derivation (`delegate.rs`) tell this refusing
+    // stub apart from the real `SopApproveTool` despite sharing a `name()`:
+    // the ceiling is sealed from names, and a name alone cannot distinguish
+    // a denied placeholder from the capability it is standing in for.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn name(&self) -> &str {
         "sop_approve"
     }
