@@ -2903,18 +2903,24 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(forge_tool);
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
-    let channel_room_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    tool_arcs.push(channel_room_tool(
-        security.clone(),
-        channel_room_handle.as_ref().cloned().unwrap(),
-    ));
+    // Factory functions (`channel_room_tool`/`ask_user_tool`/`send_via_tool`/
+    // `escalate_to_human_tool`) are this branch's own construction path,
+    // reused verbatim by `delegate.rs`'s `Bounded` rebuild (`channel_room_tool`
+    // at delegate.rs:4162, `ask_user_tool` at :4115, `send_via_tool` at :4127,
+    // `escalate_to_human_tool` at :4171) — kept, not master's inlined
+    // construction, which would orphan that reuse. `master`'s only real change
+    // here was avoiding an `Option`-wrap-then-`.unwrap()` round trip on the
+    // handle variables; folded in below without losing the factory calls.
+    let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
+    tool_arcs.push(channel_room_tool(security.clone(), channel_room_tool_handle));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
     tool_arcs.push(ask_user_tool(
         security.clone(),
-        ask_user_handle.as_ref().cloned().unwrap(),
+        Arc::clone(&ask_user_tool_handle),
     ));
 
     tool_arcs.push(send_via_tool(
@@ -2922,15 +2928,16 @@ pub fn all_tools_with_runtime(
         root_config,
         live_config.clone(),
         agent_alias,
-        ask_user_handle.as_ref().cloned().unwrap(),
+        ask_user_tool_handle,
     ));
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
     tool_arcs.push(escalate_to_human_tool(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_tool_handle,
     ));
 
     // Microsoft 365 Graph API integration
