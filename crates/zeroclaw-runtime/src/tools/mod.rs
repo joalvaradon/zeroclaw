@@ -2913,7 +2913,10 @@ pub fn all_tools_with_runtime(
     // handle variables; folded in below without losing the factory calls.
     let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
-    tool_arcs.push(channel_room_tool(security.clone(), channel_room_tool_handle));
+    tool_arcs.push(channel_room_tool(
+        security.clone(),
+        channel_room_tool_handle,
+    ));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
