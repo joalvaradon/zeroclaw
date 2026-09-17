@@ -2862,6 +2862,7 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
@@ -3000,10 +3001,15 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
-            // `process_message` has no per-run allowlist (its assembly passes
-            // `caller_allowed: None` too), so there is no ceiling to hand the
-            // scheduler tools.
-            None,
+            // `process_message` now carries a per-run allowlist when its
+            // caller has one (`send_message_to_peer`'s bounded relay), the
+            // same pre-sealed-handle shape `run()` already builds above.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3013,7 +3019,9 @@ pub async fn process_message(
             built: all_tools_result_pm,
             skills: &skills,
             runtime: runtime.clone(),
-            caller_allowed: None,
+            // Most callers have no per-run allowlist (`None`, unchanged); a
+            // bounded `send_message_to_peer` relay is the one caller that does.
+            caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
@@ -16922,6 +16930,7 @@ Let me check the result."#;
             "entrypoint-profile-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;
@@ -16998,6 +17007,7 @@ Let me check the result."#;
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;

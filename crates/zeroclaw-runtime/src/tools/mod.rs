@@ -1693,11 +1693,21 @@ pub(crate) fn schedule_tool(
 /// doc comment: "validates every send against that agent's resolved peer
 /// set"), so a `Bounded` cross-profile target reusing the caller's instance
 /// could reach the CALLER's peers/channels, not its own.
+///
+/// The ceiling has to reach here too, same reasoning as `spawn_subagent_tool`
+/// below: `execute` starts the RECIPIENT's own turn through
+/// `agent::loop_::process_message`, a fresh registry assembled from the
+/// recipient's own full risk profile unless bound — a bounded sender must not
+/// be able to hand a peer's turn more than its own sealed ceiling.
 pub(crate) fn send_message_to_peer_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     agent_alias: &str,
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
-    Arc::new(SendMessageToPeerTool::new(config, agent_alias.to_string()))
+    Arc::new(
+        SendMessageToPeerTool::new(config, agent_alias.to_string())
+            .with_caller_ceiling(caller_ceiling),
+    )
 }
 
 /// Rebuilds `spawn_subagent` bound to `agent_alias`/`security` -
@@ -2493,7 +2503,7 @@ pub fn all_tools_with_runtime(
             // to spawn out of it.
             caller_ceiling.clone(),
         ),
-        send_message_to_peer_tool(config.clone(), agent_alias),
+        send_message_to_peer_tool(config.clone(), agent_alias, caller_ceiling.clone()),
         model_routing_config_tool(security.clone(), config.clone()),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         proxy_config_tool(security.clone(), config.clone()),

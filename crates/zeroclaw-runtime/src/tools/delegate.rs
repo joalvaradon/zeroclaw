@@ -3891,6 +3891,11 @@ impl DelegateTool {
                         Box::new(ToolArcRef::new(crate::tools::send_message_to_peer_tool(
                             Arc::clone(root_config),
                             agent_name,
+                            // Same sealed ceiling `spawn_subagent` receives two
+                            // lines below: a relayed peer turn must not outlive
+                            // the bound by escaping to the peer's own full
+                            // profile.
+                            Some(Arc::clone(&bounded_ceiling)),
                         ))),
                     );
                     target_identity_bound_tools.insert(

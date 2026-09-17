@@ -22,6 +22,16 @@ pub struct SendMessageToPeerTool {
     config: Arc<Config>,
     sender_alias: String,
     description: String,
+    /// Tool names the RECIPIENT's turn may be offered, published by whoever
+    /// built this instance for a bounded delegate target.
+    ///
+    /// `None` is a top-level caller: there is no ceiling to carry, and the
+    /// recipient is assembled from its own configuration as before. `Some` is
+    /// a bounded target, and the cell is filled once the caller's registry
+    /// has actually been sealed. A `Some` that is still empty when the tool
+    /// runs is a wiring failure, and refusing is the only safe reading — same
+    /// contract as `SpawnSubagentTool::caller_ceiling`.
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl SendMessageToPeerTool {
@@ -32,7 +42,19 @@ impl SendMessageToPeerTool {
             config,
             sender_alias,
             description,
+            caller_ceiling: None,
         }
+    }
+
+    /// Bind the ceiling a bounded sender's relayed peer turn must stay
+    /// within.
+    #[must_use]
+    pub fn with_caller_ceiling(
+        mut self,
+        ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
+    ) -> Self {
+        self.caller_ceiling = ceiling;
+        self
     }
 }
 
@@ -187,6 +209,31 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
+            // Carry the sender's own ceiling into the recipient's assembly.
+            // `process_message` threads this into `ScopedAssembly::caller_allowed`
+            // the same way `agent::run` already does for `spawn_subagent`'s
+            // child — without it, the recipient is rebuilt from its own full
+            // risk profile and recovers whatever the sender's bounded turn was
+            // supposed to have taken away.
+            let allowed_tools = match self.caller_ceiling.as_ref() {
+                None => None,
+                Some(cell) => match cell.get() {
+                    Some(names) => Some(names.clone()),
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(
+                                "send_message_to_peer: refused — a delegated caller \
+                                 ceiling was declared but never published, so the \
+                                 recipient's turn cannot be bounded"
+                                    .into(),
+                            ),
+                        });
+                    }
+                },
+            };
+
             let cfg = (*self.config).clone();
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
@@ -206,6 +253,7 @@ impl Tool for SendMessageToPeerTool {
                     &recipient_alias,
                     &body,
                     None,
+                    allowed_tools,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
