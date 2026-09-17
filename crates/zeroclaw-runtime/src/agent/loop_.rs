@@ -2013,9 +2013,12 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
-                                    // `run` is the one entry point with a caller
-                                    // ceiling; forwarding it keeps a re-assembled
-                                    // step agent inside the set this loop received.
+                                    // Forwarding this turn's own per-run
+                                    // allowlist keeps a re-assembled step
+                                    // agent inside the set this loop
+                                    // received. `process_message`'s own
+                                    // `SopStepReassembly` construction below
+                                    // does the same with its `allowed_tools`.
                                     caller_allowed: allowed_tools.as_deref(),
                                 }),
                             }),
@@ -3430,12 +3433,17 @@ pub async fn process_message(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    // `process_message` has no caller allowlist (see the
-                    // assembly call in this same function), so there is no
-                    // ceiling to forward.
+                    // `process_message` carries a per-run allowlist when its
+                    // caller has one (the same `allowed_tools` value the
+                    // assembly call above in this function already uses) —
+                    // forwarding it here keeps a cross-agent re-assembled
+                    // step agent inside the set this turn received, instead
+                    // of rebuilding it from the step agent's own full policy
+                    // one hop further out. Same reasoning as `run()`'s own
+                    // `SopStepReassembly` construction.
                     Some(SopStepReassembly {
                         config: &config,
-                        caller_allowed: None,
+                        caller_allowed: allowed_tools.as_deref(),
                     }),
                 ),
             )
