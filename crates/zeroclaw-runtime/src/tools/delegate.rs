@@ -4467,6 +4467,34 @@ impl DelegateTool {
                                     None
                                 };
                             }
+                            // `sop_execute`/`sop_advance`: `SAFE_FOR_BOUNDED_REUSE`
+                            // because they share the caller's live `engine`/`audit`
+                            // handles rather than being rebuilt from config - there
+                            // is only one SOP engine to share. That reuse is only
+                            // safe for a run that stays inside this turn
+                            // (`bounded_delegate_sop_step_ceiling` covers it via
+                            // `SopStepReassembly`); a run that instead PARKS
+                            // (WaitApproval/CheckpointWait) escapes to an external
+                            // resume with `allowed_tools: None` - full authority,
+                            // outside this ceiling entirely. Rebinding the sealed
+                            // ceiling here lets each tool cancel a parked run under
+                            // its own bound rather than let it sit resolvable.
+                            if let Some(sop_execute) = tool
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<crate::tools::SopExecuteTool>())
+                            {
+                                return Some(Box::new(
+                                    sop_execute.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
+                                ) as Box<dyn Tool>);
+                            }
+                            if let Some(sop_advance) = tool
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<crate::tools::SopAdvanceTool>())
+                            {
+                                return Some(Box::new(
+                                    sop_advance.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
+                                ) as Box<dyn Tool>);
+                            }
                             let reuse_is_earned = !deny_unclassified_reuse
                                 || crate::tools::SAFE_FOR_BOUNDED_REUSE.contains(&tool.name());
                             if reuse_is_earned {

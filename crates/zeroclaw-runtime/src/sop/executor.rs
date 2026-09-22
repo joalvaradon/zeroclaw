@@ -149,6 +149,42 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
     }
 }
 
+/// The run id a just-produced `SopRunAction` left OUT of the live-turn
+/// machinery, if any. The mechanism is `enqueue_live_action`'s own guard
+/// clause above: it enqueues `ExecuteStep`/`DeterministicStep` and nothing
+/// else, so every other non-terminal variant — `WaitApproval` (operator
+/// approval gate), `CheckpointWait` (deterministic-workflow checkpoint), and
+/// `Pending` (unsatisfied dependency, or a park redirected here because the
+/// approval-pending pool was momentarily full) — leaves the run persisted and
+/// active without anything in the current turn driving it again.
+///
+/// `Pending` looks the least like a park — its own reason is about a
+/// dependency or a capacity limit, not approval — but it is not safe to
+/// exclude: `SopEngine::run_maintenance_tick` -> `retry_capacity_blocked_
+/// gated_pends` (engine.rs) runs on a background tick with NO caller or
+/// ceiling of any kind, and for a `Pending` run whose blocked step is gated,
+/// promotes it directly to `WaitingApproval`/`PausedCheckpoint` — the same
+/// park this function already has to catch, just reached one hop later and
+/// entirely outside this call. Excluding `Pending` here because ITS OWN
+/// reason isn't approval-shaped would be excluding by the wrong property:
+/// the invariant is about whether the turn keeps driving the run, not about
+/// why the run stopped.
+///
+/// Every one of these leaves the run resolvable by an external approver, who
+/// then runs the step through `agent::run` with `allowed_tools: None`: full
+/// authority, detached from whichever turn started or advanced the run. A
+/// bounded caller — one whose `sop_execute`/`sop_advance` instance carries a
+/// sealed ceiling — must never be allowed to leave a run in any of these
+/// three states; see the callers in `tools::sop_execute`/`tools::sop_advance`.
+pub(crate) fn parked_run_id(action: &SopRunAction) -> Option<&str> {
+    match action {
+        SopRunAction::WaitApproval { run_id, .. }
+        | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. } => Some(run_id.as_str()),
+        _ => None,
+    }
+}
+
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
 pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
