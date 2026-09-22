@@ -335,57 +335,38 @@ impl Tool for CronUpdateTool {
                 }
             }
         }
-        // Capping the patch is not enough, and the note that used to stand
-        // above — "a patch that leaves the field unset widens nothing; a job
-        // already stored wider than the ceiling is caught at launch by
-        // `cron_run`" — was false as a security claim. `cron_run` is the MANUAL
-        // launch verb; the automatic scheduler reaches `run_agent_job` directly
-        // and hands it the job's STORED list, so a job stored without one runs
-        // the owning agent's full registry. And every other patched field is
+        // Capping the patch is not enough: a patch that leaves `allowed_tools`
+        // unset widens nothing by itself, yet every other patched field is
         // applied unconditionally by `update_job_inner`, so a bounded turn could
         // re-point an existing unbounded job's `prompt` and re-arm its
-        // `schedule` without ever naming `allowed_tools`. The bound therefore
-        // belongs on the RESULTING job, which means reading the stored one.
+        // `schedule` without ever naming `allowed_tools`; and the automatic
+        // scheduler replays the job's STORED list, which `cron_run` (the manual
+        // launch verb) never sees. The bound therefore belongs on the RESULTING
+        // job.
+        //
+        // It is handed to the store as a guard rather than checked here on a
+        // read of our own. A check made here describes a row another turn of
+        // the same owning agent may have rewritten by the time the write
+        // re-reads it, and the write commits whatever it finds; the guard runs
+        // on that same read, inside the write's transaction.
         //
         // A patch that can only DISABLE is exempt, matching `schedule`, which
         // guards `resume` and leaves `pause` alone: refusing it would leave a
         // bounded target unable to switch off a job it may not switch on.
-        if self.caller_ceiling.is_some() && !patch_only_disables(&patch) {
-            let existing = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
-                Ok(job) => job,
-                Err(error) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(error.to_string()),
-                    });
-                }
+        let ceiling = self.caller_ceiling.clone();
+        let bound = |job: &cron::CronJob| {
+            crate::tools::caller_ceiling::require_job_within_ceiling(
+                "cron_update",
+                ceiling.as_ref(),
+                job,
+            )
+        };
+        let guard: cron::JobGuard<'_> =
+            if self.caller_ceiling.is_some() && !patch_only_disables(&patch) {
+                &bound
+            } else {
+                &cron::unguarded
             };
-            let resulting = patch
-                .allowed_tools
-                .clone()
-                .or_else(|| existing.allowed_tools.clone());
-            let bounded = match existing.job_type {
-                // A shell job has no tool list to bound: the stored command is
-                // what the scheduler runs, under the owning agent's policy.
-                cron::JobType::Shell => crate::tools::caller_ceiling::require_shell_within_ceiling(
-                    "cron_update",
-                    self.caller_ceiling.as_ref(),
-                ),
-                cron::JobType::Agent => crate::tools::caller_ceiling::require_within_ceiling(
-                    "cron_update",
-                    self.caller_ceiling.as_ref(),
-                    resulting.as_deref(),
-                ),
-            };
-            if let Err(error) = bounded {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error),
-                });
-            }
-        }
 
         let approved = args
             .get("approved")
@@ -404,6 +385,7 @@ impl Tool for CronUpdateTool {
             job_id,
             patch,
             approved,
+            guard,
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
@@ -1298,6 +1280,68 @@ mod tests {
             "a bounded caller must be able to switch OFF a shell job: {result:?}"
         );
         assert!(!cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    /// The literal scenario the review described: a narrow delegated turn
+    /// patches a job while another turn of the same owning agent widens its
+    /// stored `allowed_tools` in between. Goes through the real
+    /// `CronUpdateTool::execute` end to end — its own guard construction and
+    /// `patch_only_disables` decision, not a hand-built closure — closing the
+    /// gap the store-level race test (`cron::store::tests::
+    /// no_other_writer_can_commit_between_a_guarded_updates_read_and_its_write`)
+    /// leaves open: that one drives `update_job_for_agent` directly and never
+    /// exercises this file's code at all. The pre-existing tests above run on
+    /// one thread with no rival writer, so they would pass unchanged against
+    /// the pre-fix code too; this is the one that would not.
+    #[tokio::test]
+    async fn a_concurrent_unbounded_widen_cannot_land_between_a_bounded_cron_updates_read_and_its_write()
+     {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = agent_job_with(&cfg, "narrow prompt", Some(vec!["calculator".into()]));
+        let tool = bounded_tool(&cfg, &["cron_update", "calculator"]);
+
+        let attempt: Arc<std::sync::Mutex<Option<rusqlite::Result<usize>>>> = Arc::default();
+        // `cron/store.rs:1942-1944` (`fn cron_db_path`): private to that module,
+        // so the path is reconstructed here rather than exposed further.
+        let db_path = cfg.data_dir.join("cron").join("jobs.db");
+        let job_id = job.id.clone();
+        let slot = Arc::clone(&attempt);
+        crate::cron::install_after_read_hook_for_tests(move || {
+            let rival = rusqlite::Connection::open(&db_path).unwrap();
+            // No waiting: a rival that could only get in by blocking until the
+            // transaction ends has not got in between read and write.
+            rival.busy_timeout(std::time::Duration::ZERO).unwrap();
+            *slot.lock().unwrap() = Some(rival.execute(
+                "UPDATE cron_jobs SET allowed_tools = ?1 WHERE id = ?2",
+                rusqlite::params![r#"["calculator","file_write"]"#, job_id],
+            ));
+        });
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "prompt": "re-pointed by the narrow turn" }
+            }))
+            .await
+            .unwrap();
+
+        let rival = attempt
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the after-read hook must have run");
+        assert!(
+            rival.is_err(),
+            "a rival writer widened allowed_tools between this tool's read and its write: \
+             {rival:?}"
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
+            Some(vec!["calculator".to_string()]),
+            "the committed row must be the row the guard judged, not the rival's"
+        );
     }
 
     #[tokio::test]

@@ -192,8 +192,9 @@ impl Tool for CronRunTool {
         // `require_within_ceiling` about that list would bound a shell job by a
         // field it does not own: today such a job usually stores `None` and is
         // refused for the right outcome by accident, but the column is writable
-        // by any unbounded turn of the owning agent (`cron/store.rs:592-599`
-        // applies an `allowed_tools` patch without consulting `job_type`), so a
+        // by any unbounded turn of the owning agent (`apply_job_patch` in
+        // `cron/store.rs` applies an `allowed_tools` patch without consulting
+        // `job_type`), so a
         // harmless-looking list turns the accident into a pass.
         let bounded = match job.job_type {
             JobType::Shell => crate::tools::caller_ceiling::require_shell_within_ceiling(

@@ -575,44 +575,30 @@ impl ScheduleTool {
     }
 
     fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
-        // Re-enabling re-arms deferred execution, so it takes the same bound as
-        // creating: a job a bounded caller could not have created is not one it
-        // may switch back on. Pausing only removes capability and is left alone.
-        // The job is read for its type because `resume` can name an agent job
-        // this tool did not create, whose bound is its stored `allowed_tools`.
-        if !pause && self.caller_ceiling.is_some() {
-            let bounded = match cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
-                Ok(job) => match job.job_type {
-                    cron::JobType::Shell => {
-                        crate::tools::caller_ceiling::require_shell_within_ceiling(
-                            "schedule",
-                            self.caller_ceiling.as_ref(),
-                        )
-                    }
-                    cron::JobType::Agent => crate::tools::caller_ceiling::require_within_ceiling(
-                        "schedule",
-                        self.caller_ceiling.as_ref(),
-                        job.allowed_tools.as_deref(),
-                    ),
-                },
-                Err(error) => Err(error.to_string()),
-            };
-            if let Err(error) = bounded {
-                return ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error),
-                };
-            }
-        }
-
         // Authorization travels with the write: an agent that receives or guesses
         // another agent's id must not disable or re-enable it, and a success
         // reply must not confirm that the foreign id exists.
+        //
+        // Re-enabling re-arms deferred execution, so it takes the same bound as
+        // creating: a job a bounded caller could not have created is not one it
+        // may switch back on. Pausing only removes capability and is left alone.
+        // The job is judged by its type because `resume` can name an agent job
+        // this tool did not create, whose bound is its stored `allowed_tools`.
+        // The bound is a guard on the write, evaluated on the row it commits
+        // rather than on an earlier read that another turn may since have
+        // invalidated.
         let operation = if pause {
             cron::pause_job_for_agent(&self.config, id, &self.agent_alias)
         } else {
-            cron::resume_job_for_agent(&self.config, id, &self.agent_alias)
+            let ceiling = self.caller_ceiling.clone();
+            let bound = |job: &cron::CronJob| {
+                crate::tools::caller_ceiling::require_job_within_ceiling(
+                    "schedule",
+                    ceiling.as_ref(),
+                    job,
+                )
+            };
+            cron::resume_job_for_agent(&self.config, id, &self.agent_alias, &bound)
         };
 
         match operation {
@@ -683,6 +669,88 @@ mod tests {
             runtime,
             Some(sealed_ceiling(ceiling)),
         )
+    }
+
+    fn agent_job_with(
+        config: &Config,
+        prompt: &str,
+        allowed: Option<Vec<String>>,
+    ) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            prompt,
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            allowed,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// The literal scenario the review described, for the `resume` path this
+    /// time: a narrow delegated turn resumes an agent job while another turn
+    /// of the same owning agent widens its stored `allowed_tools` in between.
+    /// Goes through the real `ScheduleTool::execute` end to end, mirroring
+    /// `cron_update.rs`'s equivalent test — the store-level race test
+    /// (`cron::store::tests::no_other_writer_can_commit_between_...`) alone
+    /// never exercises this file's own guard construction, and the
+    /// single-threaded shell-job tests above use a different gate
+    /// (`require_shell_within_ceiling`, not stored `allowed_tools`) and would
+    /// pass unchanged against the pre-fix code too.
+    #[tokio::test]
+    async fn a_concurrent_unbounded_widen_cannot_land_between_a_bounded_resumes_read_and_its_write()
+    {
+        let (_tmp, config, security) = test_setup().await;
+        let job = agent_job_with(&config, "narrow prompt", Some(vec!["calculator".into()]));
+        cron::pause_job_for_agent(&config, &job.id, TEST_AGENT).unwrap();
+        let tool = bounded_tool(&config, &security, &["schedule", "calculator"]);
+
+        let attempt: Arc<std::sync::Mutex<Option<rusqlite::Result<usize>>>> = Arc::default();
+        // `cron/store.rs:1942-1944` (`fn cron_db_path`): private to that module,
+        // so the path is reconstructed here rather than exposed further.
+        let db_path = config.data_dir.join("cron").join("jobs.db");
+        let job_id = job.id.clone();
+        let slot = Arc::clone(&attempt);
+        crate::cron::install_after_read_hook_for_tests(move || {
+            let rival = rusqlite::Connection::open(&db_path).unwrap();
+            // No waiting: a rival that could only get in by blocking until the
+            // transaction ends has not got in between read and write.
+            rival.busy_timeout(std::time::Duration::ZERO).unwrap();
+            *slot.lock().unwrap() = Some(rival.execute(
+                "UPDATE cron_jobs SET allowed_tools = ?1 WHERE id = ?2",
+                rusqlite::params![r#"["calculator","file_write"]"#, job_id],
+            ));
+        });
+
+        let result = tool
+            .execute(json!({ "action": "resume", "id": job.id }))
+            .await
+            .unwrap();
+
+        let rival = attempt
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the after-read hook must have run");
+        assert!(
+            rival.is_err(),
+            "a rival writer widened allowed_tools between resume's read and its write: \
+             {rival:?}"
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec!["calculator".to_string()]),
+            "the committed row must be the row the guard judged, not the rival's"
+        );
     }
 
     #[tokio::test]

@@ -181,6 +181,24 @@ pub(crate) fn require_shell_within_ceiling(
     ))
 }
 
+/// The bound a stored job must satisfy for a bounded caller to write or run it:
+/// the shell capability for a shell job, the stored `allowed_tools` for an agent
+/// job. One predicate for every tool that judges a job, so the arms cannot drift
+/// apart, and usable as the guard `cron::update_job_for_agent` evaluates inside
+/// its write transaction.
+pub(crate) fn require_job_within_ceiling(
+    tool: &str,
+    ceiling: Option<&CallerCeiling>,
+    job: &crate::cron::CronJob,
+) -> Result<(), String> {
+    match job.job_type {
+        crate::cron::JobType::Shell => require_shell_within_ceiling(tool, ceiling),
+        crate::cron::JobType::Agent => {
+            require_within_ceiling(tool, ceiling, job.allowed_tools.as_deref())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
