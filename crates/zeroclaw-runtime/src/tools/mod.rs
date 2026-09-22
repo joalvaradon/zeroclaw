@@ -2736,9 +2736,9 @@ fn all_tools_with_runtime_on_thread(
         // factory (`delegate.rs:3774`, "rebuilt via the SAME per-tool
         // factories... so this can't drift from the real construction path
         // either") — that comment's own invariant is what master's inline
-        // change here now breaks for this one tool. Declared, not fixed: out
-        // of scope for #9872, no context on the sandbox/command-boundary
-        // design to change it safely mid-merge.
+        // change here now breaks for this one tool. Declared, not fixed:
+        // out of scope for this caller-ceiling fix, no context on the
+        // sandbox/command-boundary design to change it safely mid-merge.
         Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
             Arc::new(RuntimeGitCommandBoundary {
