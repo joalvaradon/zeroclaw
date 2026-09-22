@@ -23,6 +23,7 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub(crate) mod shell_env;
+pub(crate) mod shell_output;
 pub mod skill_http;
 pub mod skill_manage;
 pub mod skill_tool;
@@ -70,7 +71,7 @@ pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
-pub use zeroclaw_tools::git_operations::GitOperationsTool;
+pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -608,20 +609,14 @@ pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
 // construction code `all_tools_with_runtime` does, instead of a hand-rebuilt
 // copy that could silently drift from it.
 
-/// Rebuilds `git_operations` bound to the given `workspace_dir` - unconditional
+/// Rebuilds `git_operations` bound to `security.workspace_dir` - unconditional
 /// in production (`all_tools_with_runtime` never gates it), so this always
-/// returns a tool. `workspace_dir` is passed explicitly (not read from
-/// `security.workspace_dir`) because in the normal (non-delegate) registry the
-/// two can differ - callers pass the shared data dir here, while
-/// `security.workspace_dir` is the per-agent workspace.
-pub(crate) fn git_operations_tool(
-    security: Arc<SecurityPolicy>,
-    workspace_dir: &std::path::Path,
-) -> Arc<dyn Tool> {
-    Arc::new(GitOperationsTool::new(
-        security,
-        workspace_dir.to_path_buf(),
-    ))
+/// returns a tool. `GitOperationsTool::new` reads `workspace_dir` off
+/// `security` itself (no separate constructor parameter), so this helper's
+/// one caller (`delegate.rs`'s Bounded target rebuild, which passes the
+/// target's own `security.workspace_dir`) gets identical behavior.
+pub(crate) fn git_operations_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
+    Arc::new(GitOperationsTool::new(security))
 }
 
 /// Rebuilds `backup` bound to the given `workspace_dir`, gated like
@@ -819,7 +814,17 @@ pub(crate) fn browser_tool(
     security: Arc<SecurityPolicy>,
     browser_config: &zeroclaw_config::schema::BrowserConfig,
 ) -> Option<Arc<dyn Tool>> {
-    if !browser_config.enabled {
+    // Full browser automation is gated on `automation_enabled` alone, a
+    // SEPARATE and INDEPENDENT flag from `enabled` (`schema.rs`'s own
+    // doc-comment on `BrowserConfig`, confirmed by its `integration_active()`
+    // helper being `enabled || automation_enabled`, never an AND) — master's
+    // addition: it drives a real Chrome/Chromium session that may already be
+    // logged in, so `[browser] enabled` alone must not grant it. Checked
+    // HERE, in the shared factory, not just at the top-level call site —
+    // `delegate.rs:3872` calls this same factory for the `Bounded` rebuild,
+    // and a gate added only at the unbounded call site would leave a bounded
+    // target able to get full automation whenever `enabled` alone was set.
+    if !browser_config.automation_enabled {
         return None;
     }
     match BrowserTool::new_with_backend(
@@ -2120,7 +2125,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime(
         config,
         security,
@@ -2168,6 +2173,26 @@ fn filter_agent_peer_groups(
 struct RuntimeShellAssembly {
     shell_tool: ShellTool,
     sandbox: Arc<dyn Sandbox>,
+}
+
+/// Adapts the runtime's canonical per-agent sandbox to the Git tool without
+/// making the lower-level tools crate depend on the runtime crate.
+struct RuntimeGitCommandBoundary {
+    sandbox: Arc<dyn Sandbox>,
+    runtime_kind: zeroclaw_config::schema::RuntimeKind,
+}
+
+impl GitCommandBoundary for RuntimeGitCommandBoundary {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        if self.runtime_kind == zeroclaw_config::schema::RuntimeKind::Docker {
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "tool-git-operations-error-docker-runtime-write-unsupported"
+            ));
+        }
+        self.sandbox
+            .wrap_command(command)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 /// Pair the canonical runtime kind with one shared sandbox instance for every
@@ -2338,7 +2363,46 @@ pub(crate) fn plugin_host_services(
     zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
-/// Create the full tool registry without an ACP session read view.
+/// Stack reserved for the dedicated registry-builder thread. The registry
+/// build is a deep synchronous subtree — ~100 tool constructors plus 18
+/// full-`Config` clones — measured at ~1.5–1.7 MiB of stack on x86_64 Linux
+/// debug builds, with Windows frames some 10–25% larger. Reserving roughly
+/// twice the measured worst case keeps the builder off every caller's stack
+/// budget without itself becoming a new cliff.
+const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Force-compile the process-global lazy regexes used on the turn path.
+///
+/// A cold `regex` compile descends through ~40 `regex_automata` NFA compiler
+/// frames. `scrub_credentials` reaches `SENSITIVE_KV_REGEX` from deep inside
+/// the turn loop (`make_query_summary` → memory rendering), so a first-turn
+/// compile lands that recursion on the turn's stack. Every turn path builds
+/// a tool registry first, so warming them here — on the registry-builder
+/// thread, before any turn stack exists — keeps the recursion off every
+/// caller. Runs at most once per process.
+fn warm_lazy_regexes() {
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
+    std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
+    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
+    zeroclaw_providers::multimodal::warm_lazy_regexes();
+}
+
+/// Create the full tool registry on a dedicated builder thread.
+///
+/// The registry build is the deepest synchronous subtree reachable from
+/// `session/new` and from every turn path. Built inline it consumed the RPC
+/// caller's stack down to a few KiB of the 2 MiB `session/new` regression
+/// budget, so any change deepening it overflowed Windows debug builds. The
+/// build now runs on a thread with its own explicit stack; the caller's
+/// stack pays only the cheap per-call prep below.
+///
+/// Ordering and panic semantics are unchanged: the caller blocks until the
+/// registry is built (as the inline build did), and a builder panic is
+/// resumed on the caller's thread. A scoped thread keeps the borrowed
+/// parameters (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
+/// `root_config`) semantically independent at the API boundary while avoiding
+/// deep clones on the caller's limited stack.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -2369,7 +2433,7 @@ pub fn all_tools_with_runtime(
     // Forwarded verbatim to `all_tools_with_runtime_and_acp_sessions` — see its
     // own doc-comment on this parameter for why it matters.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_and_acp_sessions(
         config,
         security,
@@ -2448,6 +2512,99 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     //   this ceiling as that run's per-run allowlist. Without it the child is
     //   assembled from the target's own profile — including for a REPLAYED cron
     //   job, whose own turn is correctly filtered and whose child would not be.
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
+) -> anyhow::Result<AllToolsResult> {
+    let builder = move || {
+        // Warm the lazy regexes BEFORE the registry build and BEFORE any
+        // turn can start: LazyLock runs the initializer on whichever thread
+        // reaches it first, so a turn racing an un-joined warmup would
+        // compile the regex (a ~40-frame regex_automata recursion) on the
+        // turn's own stack. Doing this first on the builder thread also
+        // means the compile never lands on a turn stack; it costs one
+        // cold-process delay of a few hundred milliseconds, once.
+        warm_lazy_regexes();
+        all_tools_with_runtime_on_thread(
+            config,
+            security,
+            risk_profile,
+            agent_alias,
+            runtime,
+            memory,
+            composio_key,
+            composio_entity_id,
+            browser_config,
+            http_config,
+            web_fetch_config,
+            workspace_dir,
+            agents,
+            fallback_api_key,
+            root_config,
+            canvas_store,
+            is_subagent_caller,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            live_config,
+            acp_sessions,
+            caller_ceiling,
+        )
+    };
+    std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-tool-registry".into())
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn_scoped(scope, builder)
+            .map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "failed to spawn tool-registry builder thread: {error}"
+                ))
+            })?;
+        Ok(match handle.join() {
+            Ok(result) => result,
+            // Preserve the inline build's panic semantics: a builder panic is
+            // resumed on the caller's thread exactly as if it had unwound
+            // through the caller's frames.
+            Err(panic) => std::panic::resume_unwind(panic),
+        })
+    })
+}
+
+/// Registry build body; runs on the dedicated builder thread spawned by
+/// [`all_tools_with_runtime`].
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+fn all_tools_with_runtime_on_thread(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
+    // See the doc-comment on this same parameter on
+    // `all_tools_with_runtime_and_acp_sessions`, which forwards it here
+    // verbatim through the builder closure above.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
@@ -2572,7 +2729,23 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         model_routing_config_tool(security.clone(), config.clone()),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         proxy_config_tool(security.clone(), config.clone()),
-        git_operations_tool(security.clone(), workspace_dir),
+        // master added a sandboxed command boundary here
+        // (`new_with_command_boundary`); adopted rather than reverted to the
+        // plain `git_operations_tool` factory. NOT threaded into
+        // `delegate.rs`'s `Bounded` rebuild, which still calls the plain
+        // factory (`delegate.rs:3774`, "rebuilt via the SAME per-tool
+        // factories... so this can't drift from the real construction path
+        // either") — that comment's own invariant is what master's inline
+        // change here now breaks for this one tool. Declared, not fixed: out
+        // of scope for #9872, no context on the sandbox/command-boundary
+        // design to change it safely mid-merge.
+        Arc::new(GitOperationsTool::new_with_command_boundary(
+            security.clone(),
+            Arc::new(RuntimeGitCommandBoundary {
+                sandbox: sandbox.clone(),
+                runtime_kind: root_config.runtime.kind,
+            }),
+        )),
         pushover_tool(security.clone(), workspace_dir),
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
@@ -2656,6 +2829,10 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         tool_arcs.push(tool);
     }
 
+    // Both factories now carry their own gate internally (`browser_open_tool`
+    // on `enabled`, `browser_tool` on `automation_enabled` — see its own
+    // doc-comment for why that check moved into the shared factory rather
+    // than staying top-level-only).
     if let Some(tool) = browser_open_tool(security.clone(), browser_config) {
         tool_arcs.push(tool);
     }
@@ -3319,10 +3496,10 @@ fn register_plugin_tools(
 
     for scope in admitted {
         let package = scope.id().package().to_string();
-        let Some((manifest, wasm_path)) = details
+        let Some((manifest, component)) = details
             .iter()
-            .copied()
             .find(|(manifest, _)| manifest.name == package)
+            .map(|(manifest, component)| (*manifest, *component))
         else {
             continue;
         };
@@ -3345,7 +3522,7 @@ fn register_plugin_tools(
         }
 
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-            wasm_path.to_path_buf(),
+            component.clone(),
             scope,
             services.clone(),
             plugin_limits,
@@ -3406,6 +3583,203 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
+
+    #[test]
+    fn git_write_boundary_rejects_docker_runtime_writes() {
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+        const ENGLISH: &str = "Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.";
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Docker,
+        };
+        let mut command = std::process::Command::new("git");
+
+        let error = boundary.wrap_command(&mut command).unwrap_err();
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+
+        assert_eq!(
+            error.to_string(),
+            expected_error,
+            "Docker runtime must return its localized Git-write rejection"
+        );
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        assert_eq!(
+            crate::i18n::get_english_cli_string_with_args(KEY, &[]),
+            ENGLISH,
+            "the English diagnostic contract must remain stable"
+        );
+        assert_eq!(command.get_program(), "git");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_rejects_docker_git_writes_before_hook_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+
+        let tmp = TempDir::new().unwrap();
+        let repository = tmp.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-C", repository.to_str().unwrap()])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "test setup git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "ZeroClaw Test"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        run_git(&["config", "tag.gpgsign", "false"]);
+        std::fs::write(repository.join("tracked.txt"), "initial\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+        run_git(&["branch", "target"]);
+
+        let marker = tmp.path().join("host-hook-ran");
+        let hook = repository.join(".git/hooks/post-checkout");
+        run_git(&[
+            "config",
+            "core.hooksPath",
+            hook.parent().unwrap().to_str().unwrap(),
+        ]);
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let filter_marker = tmp.path().join("host-filter-ran");
+        let filter = tmp.path().join("clean-filter");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch {}\ncat\n", filter_marker.display()),
+        )
+        .unwrap();
+        let mut filter_permissions = std::fs::metadata(&filter).unwrap().permissions();
+        filter_permissions.set_mode(0o755);
+        std::fs::set_permissions(&filter, filter_permissions).unwrap();
+        run_git(&["config", "filter.marker.clean", filter.to_str().unwrap()]);
+        std::fs::write(
+            repository.join(".gitattributes"),
+            "filtered.txt filter=marker\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("filtered.txt"), "filtered\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: repository.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("docker".to_string()),
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                cfg.runtime.docker.clone(),
+            )),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            repository.as_path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("production registry must build")
+        .tools;
+        let git_operations = tools
+            .iter()
+            .find(|tool| tool.name() == "git_operations")
+            .expect("production registry must install git_operations");
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        let expected_checkout_error = format!("Checkout failed: {expected_error}");
+        let expected_add_error = format!("Add failed: {expected_error}");
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "checkout",
+                "branch": "target",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(expected_checkout_error.as_str())
+        );
+        assert!(
+            !marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a repository hook"
+        );
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "add",
+                "paths": "filtered.txt",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(result.error.as_deref(), Some(expected_add_error.as_str()));
+        assert!(
+            !filter_marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a clean filter"
+        );
+    }
+
+    #[test]
+    fn git_write_boundary_preserves_native_none_mode() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Native,
+        };
+        let mut command = std::process::Command::new("git");
+
+        boundary.wrap_command(&mut command).unwrap();
+
+        assert_eq!(command.get_program(), "git");
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -4082,6 +4456,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         assert!(
@@ -4151,6 +4526,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let web_search = tools
@@ -4216,6 +4592,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -4282,6 +4659,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let send_via = tools
@@ -4344,6 +4722,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -4492,6 +4871,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools;
             let tool = tools
                 .iter()
@@ -4582,6 +4962,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
@@ -4646,6 +5027,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -4703,7 +5085,8 @@ permissions = ["http_client"]
             Some(shared_audit.clone()),
             None,
             None,
-        );
+        )
+        .expect("first tool registry builds");
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
             &security,
@@ -4727,7 +5110,8 @@ permissions = ["http_client"]
             Some(shared_audit.clone()),
             None,
             None,
-        );
+        )
+        .expect("second tool registry builds");
 
         for tools in [&session_a.tools, &session_b.tools] {
             assert!(tools.iter().any(|t| t.name() == "sop_status"));
@@ -4855,6 +5239,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
         let unauthorized_tools = build("ZeroClawAgent", mem.clone());
@@ -4952,6 +5337,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -5169,6 +5555,12 @@ permissions = ["http_client"]
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
         let browser = BrowserConfig {
             enabled: true,
+            // See `maximal_tool_registry`'s identical field: `browser_tool`
+            // gates full automation on this flag alone, and this test's job
+            // is specifically to prove every name in
+            // `WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT` gets constructed
+            // with every relevant feature enabled.
+            automation_enabled: true,
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -5209,6 +5601,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let constructed: std::collections::BTreeSet<&str> =
@@ -5347,6 +5740,11 @@ permissions = ["http_client"]
 
         let browser = BrowserConfig {
             enabled: true,
+            // `browser_tool`'s factory gates full automation on this flag
+            // alone (separate from `enabled`) — this fixture's job is to
+            // enable every feature so every constructible tool actually
+            // gets constructed, so it needs both.
+            automation_enabled: true,
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig {
@@ -5385,7 +5783,8 @@ permissions = ["http_client"]
             None,
             None,
             None,
-        );
+        )
+        .expect("tool registry builds");
         built
             .tools
             .iter()
@@ -5603,6 +6002,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let constructed: std::collections::BTreeSet<&str> =
@@ -5656,9 +6056,11 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
@@ -5710,6 +6112,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"knowledge"));
@@ -5757,13 +6160,118 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(
+            !names.contains(&"browser"),
+            "[browser] enabled must gate browser_open only; full automation \
+             requires the separate automation_enabled opt-in"
+        );
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Opting into `[browser] automation_enabled` registers the full
+    /// `browser` automation tool alongside `browser_open`.
+    #[test]
+    fn all_tools_includes_browser_automation_when_opted_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("browser automation tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
+    }
+
+    /// The two flags gate independently: automation can be registered
+    /// without `browser_open`, proving `automation_enabled` is the only
+    /// thing standing between an operator and the automation tool.
+    #[test]
+    fn all_tools_registers_automation_without_browser_open() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("automation-only tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
     }
 
     #[tokio::test]
@@ -5823,6 +6331,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
 
@@ -5981,6 +6490,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -6020,6 +6530,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -6061,6 +6572,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
@@ -6101,6 +6613,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
@@ -6135,6 +6648,7 @@ permissions = ["http_client"]
             is_subagent_caller,
             None,
         )
+        .expect("tool registry builds")
         .tools
         .iter()
         .map(|t| t.name().to_string())
@@ -6191,6 +6705,7 @@ permissions = ["http_client"]
                 false,
                 None,
             )
+            .expect("tool registry builds")
             .tools
             .iter()
             .map(|t| t.name().to_string())
@@ -6267,6 +6782,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -6330,6 +6846,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -6375,6 +6892,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -6476,6 +6994,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let llm_task = tools
