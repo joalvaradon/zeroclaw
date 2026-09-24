@@ -938,6 +938,43 @@ impl DelegateTool {
         ))
     }
 
+    /// Rebuilds `git_operations` bound to the TARGET's own sandbox and
+    /// runtime kind, the same way [`Self::rebuild_target_shell_tool`] does
+    /// for `shell`. `None` only when this `DelegateTool` has no `root_config`
+    /// snapshot to resolve `runtime_kind` from - see that method's own doc
+    /// comment for why that case carries no real cross-profile boundary to
+    /// enforce. Without this, `crate::tools::git_operations_tool`'s plain
+    /// constructor installs `UnconfiguredGitCommandBoundary`, which fails
+    /// every write-classified Git operation closed unconditionally,
+    /// regardless of what the target's own policy would otherwise permit.
+    fn rebuild_target_git_operations_tool(
+        &self,
+        target_policy: Arc<SecurityPolicy>,
+    ) -> Option<Arc<dyn Tool>> {
+        let root_config = self.root_config.as_ref()?;
+        let runtime_kind = root_config.runtime.kind;
+        let sandbox_cfg = target_policy.sandbox_config();
+        // Mirrors `rebuild_target_shell_tool`: the sandbox's allowed-root
+        // tiers are part of the same workspace boundary this rebuild exists
+        // to enforce, sourced from the TARGET's policy, not the caller's.
+        let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+            read_write: target_policy.allowed_roots.clone(),
+            read_only: target_policy.allowed_roots_read_only.clone(),
+            write_only: target_policy.allowed_roots_write_only.clone(),
+        };
+        let sandbox = crate::security::create_sandbox(
+            &sandbox_cfg,
+            runtime_kind,
+            Some(&target_policy.workspace_dir),
+            &sandbox_extra_roots,
+        );
+        Some(crate::tools::git_operations_tool(
+            target_policy,
+            runtime_kind,
+            sandbox,
+        ))
+    }
+
     pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
@@ -3797,12 +3834,14 @@ impl DelegateTool {
                 if (needs_workspace_bound_tools || needs_identity_bound_tools)
                     && let Some(root_config) = self.root_config.as_ref()
                 {
-                    target_workspace_bound_tools.insert(
-                        "git_operations".to_string(),
-                        Box::new(ToolArcRef::new(crate::tools::git_operations_tool(
-                            Arc::clone(&target_policy),
-                        ))) as Box<dyn Tool>,
-                    );
+                    if let Some(tool) =
+                        self.rebuild_target_git_operations_tool(Arc::clone(&target_policy))
+                    {
+                        target_workspace_bound_tools.insert(
+                            "git_operations".to_string(),
+                            Box::new(ToolArcRef::new(tool)),
+                        );
+                    }
                     if let Some(tool) =
                         crate::tools::backup_tool(&target_policy.workspace_dir, root_config)
                     {
@@ -12565,6 +12604,151 @@ mod tests {
             "regression: a Bounded delegate's git_operations must run 'git status' \
              against the TARGET's own workspace (branch 'target-branch'), not the \
              caller's - got: {output}"
+        );
+    }
+
+    /// Regression: `git_operations_tool` (`tools/mod.rs`), the standalone
+    /// factory the `Bounded` rebuild calls, constructs `GitOperationsTool`
+    /// via the plain `GitOperationsTool::new`, which installs
+    /// `UnconfiguredGitCommandBoundary` - every write-classified operation
+    /// (`add`, `commit`, `checkout`, `reset`, `revert`, non-list `stash`/
+    /// `worktree`) then fails closed with "Git write commands require a
+    /// configured execution boundary", unlike the production registry's
+    /// `new_with_command_boundary` path. Only `add` is exercised here: the
+    /// gate all of them share is `run_git_command`'s single call to
+    /// `git_command_boundary.wrap_command`, not per-operation logic, so one
+    /// representative write proves the constructor wiring rather than
+    /// needing one test per Git subcommand.
+    #[tokio::test]
+    async fn bounded_delegate_git_operations_can_write_in_the_target_workspace() {
+        let fixture = bounded_delegate_full_fixture("git_operations", |_cfg| {}).await;
+        std::fs::create_dir_all(&fixture.target_workspace).unwrap();
+        std::fs::create_dir_all(&fixture.caller_workspace).unwrap();
+
+        for dir in [&fixture.caller_workspace, &fixture.target_workspace] {
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir)
+                .status()
+                .expect("git must be available to run this test");
+            assert!(status.success(), "git init failed in {}", dir.display());
+        }
+        std::fs::write(
+            fixture.target_workspace.join("proof.txt"),
+            "staged-by-bounded-target",
+        )
+        .unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "git_operations",
+            tool_args: serde_json::json!({ "operation": "add", "paths": "proof.txt" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "stage the proof file",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        assert!(
+            output.contains("Staged: proof.txt"),
+            "regression: a Bounded delegate's git_operations must be able to stage a file \
+             in the target's own writable workspace, the same way the production registry's \
+             git_operations already can - got: {output}"
+        );
+
+        let target_status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&fixture.target_workspace)
+            .output()
+            .expect("git status must run");
+        assert!(
+            String::from_utf8_lossy(&target_status.stdout).contains("proof.txt"),
+            "the staged file must actually be staged in the TARGET's repository"
+        );
+
+        let caller_status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&fixture.caller_workspace)
+            .output()
+            .expect("git status must run");
+        assert!(
+            caller_status.stdout.is_empty(),
+            "the write must not touch the CALLER's own repository: {}",
+            String::from_utf8_lossy(&caller_status.stdout)
+        );
+    }
+
+    /// Companion negative control to the write-succeeds test above: the fix
+    /// must attach a REAL boundary (the target's own sandbox/runtime kind),
+    /// not simply remove the gate. `RuntimeGitCommandBoundary` (`tools/
+    /// mod.rs`) already refuses every write under the Docker runtime
+    /// regardless of sandbox - the cheapest real boundary behavior to prove
+    /// end to end through this path without requiring Docker to be
+    /// installed in the test environment.
+    #[tokio::test]
+    async fn bounded_delegate_git_operations_write_still_blocked_under_docker_runtime() {
+        let fixture = bounded_delegate_full_fixture("git_operations", |cfg| {
+            cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+        })
+        .await;
+        std::fs::create_dir_all(&fixture.target_workspace).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&fixture.target_workspace)
+            .status()
+            .expect("git must be available to run this test");
+        assert!(status.success(), "git init failed in target workspace");
+        std::fs::write(
+            fixture.target_workspace.join("proof.txt"),
+            "should-not-stage",
+        )
+        .unwrap();
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "git_operations",
+            tool_args: serde_json::json!({ "operation": "add", "paths": "proof.txt" }),
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "stage the proof file",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        let output = result.output.to_string();
+        // Deliberately NOT just "Add failed" - the current bug's own
+        // `UnconfiguredGitCommandBoundary` also fails every write with a
+        // DIFFERENT message ("...requires a configured execution boundary"),
+        // so asserting on the generic wrapper alone would pass whether or not
+        // a real boundary was ever attached. Only the Docker-specific text
+        // proves `RuntimeGitCommandBoundary` (a real, runtime-aware boundary)
+        // is what rejected the write.
+        let expected_docker_text = crate::i18n::get_required_cli_string(
+            "tool-git-operations-error-docker-runtime-write-unsupported",
+        );
+        assert!(
+            output.contains(&expected_docker_text),
+            "a bounded delegate's git write must fail under the Docker runtime with the REAL \
+             boundary's own rejection, not the current bug's generic \"configured execution \
+             boundary\" one, and not silently succeed either - got: {output}"
         );
     }
 

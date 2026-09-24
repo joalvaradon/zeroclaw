@@ -202,6 +202,11 @@ impl Tool for SopAdvanceTool {
                         && let Some(parked_id) = crate::sop::executor::parked_run_id(&action)
                     {
                         let parked_id = parked_id.to_string();
+                        // Same reporting rule as `SopExecuteTool::execute`:
+                        // `cancel_run` persists the terminal record BEFORE
+                        // removing the run from `active_runs`, so a
+                        // persistence failure leaves it genuinely still
+                        // active - report that failure, not a false success.
                         if let Err(e) = engine.cancel_run(&parked_id) {
                             ::zeroclaw_log::record!(
                                 ERROR,
@@ -216,6 +221,17 @@ impl Tool for SopAdvanceTool {
                                 })),
                                 "bounded sop_advance: parked run could not be cancelled"
                             );
+                            return Ok(ToolResult {
+                                success: false,
+                                output: ToolOutput::default(),
+                                error: Some(format!(
+                                    "sop_advance: refused — run {parked_id} left outside this \
+                                     turn (parked or pending on a dependency), which a bounded \
+                                     caller's tool ceiling cannot follow past this turn; the run \
+                                     could NOT be cancelled ({e}) and may still be active - \
+                                     treat it as unresolved, not closed"
+                                )),
+                            });
                         }
                         return Ok(ToolResult {
                             success: false,
@@ -502,6 +518,69 @@ mod tests {
             !matches!(outcome, crate::sop::approval::ResolveOutcome::Resumed(_)),
             "an external approver must not be able to resume the cancelled run into a \
              fresh step, got: {outcome:?}"
+        );
+    }
+
+    /// Same regression as `sop_execute.rs`'s equivalent test: `cancel_run`'s
+    /// `Err` branch only logged the failure - the return below it still
+    /// claimed the run was cancelled regardless. `start_run` only exercises
+    /// `save_run`/`save_run_with_event` (not overridden here), so the run
+    /// starts and reaches step two normally; only the CANCELLATION triggered
+    /// by advancing into the park fails, via `finish_run_with_event`. The
+    /// test above this one is this test's own positive control: same
+    /// scenario, a store that persists, and it already asserts the message
+    /// DOES say "cancelled".
+    #[tokio::test]
+    async fn advance_into_a_park_under_ceiling_reports_persistence_failure_instead_of_false_success()
+     {
+        let sop = test_sop_gated_at_step_two();
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(Arc::new(
+            crate::sop::test_support::AlwaysFailFinishStore::new(),
+        ));
+        let name = sop.name.clone();
+        engine.set_sops_for_test(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-02-19T12:00:00Z".into(),
+        };
+        engine.start_run(&name, event).unwrap();
+        let run_id = engine
+            .active_runs()
+            .keys()
+            .next()
+            .expect("expected active run")
+            .clone();
+        let engine = Arc::new(Mutex::new(engine));
+        let tool = SopAdvanceTool::new(Arc::clone(&engine))
+            .with_caller_ceiling(Some(sealed_ceiling(&["sop_advance"])));
+
+        let result = tool
+            .execute(json!({
+                "run_id": run_id,
+                "status": "completed",
+                "output": "Step 1 done"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bounded caller must still be refused even when cancellation itself fails: \
+             {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            !error.contains("has been cancelled"),
+            "regression: the refusal must not claim the run was cancelled when the engine's \
+             own cancel_run call failed (persistence error) - got: {error}"
+        );
+
+        let engine = engine.lock().unwrap();
+        assert!(
+            engine.active_runs().contains_key(&run_id),
+            "the run must still be active: cancellation never persisted"
         );
     }
 

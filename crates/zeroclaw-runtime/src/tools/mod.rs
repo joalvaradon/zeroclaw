@@ -611,12 +611,26 @@ pub fn image_info_tool(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
 
 /// Rebuilds `git_operations` bound to `security.workspace_dir` - unconditional
 /// in production (`all_tools_with_runtime` never gates it), so this always
-/// returns a tool. `GitOperationsTool::new` reads `workspace_dir` off
-/// `security` itself (no separate constructor parameter), so this helper's
-/// one caller (`delegate.rs`'s Bounded target rebuild, which passes the
-/// target's own `security.workspace_dir`) gets identical behavior.
-pub(crate) fn git_operations_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
-    Arc::new(GitOperationsTool::new(security))
+/// returns a tool. Takes the SAME `RuntimeGitCommandBoundary` the main
+/// registry's own inline construction uses (sandbox + runtime kind), not
+/// `GitOperationsTool::new`'s plain constructor - that one installs
+/// `UnconfiguredGitCommandBoundary`, which fails every write-classified
+/// operation closed unconditionally. This helper's one caller
+/// (`delegate.rs`'s `rebuild_target_git_operations_tool`) supplies the
+/// TARGET's own sandbox/runtime kind, the same way
+/// `rebuild_target_shell_tool` already does for `shell`.
+pub(crate) fn git_operations_tool(
+    security: Arc<SecurityPolicy>,
+    runtime_kind: zeroclaw_config::schema::RuntimeKind,
+    sandbox: Arc<dyn Sandbox>,
+) -> Arc<dyn Tool> {
+    Arc::new(GitOperationsTool::new_with_command_boundary(
+        security,
+        Arc::new(RuntimeGitCommandBoundary {
+            sandbox,
+            runtime_kind,
+        }),
+    ))
 }
 
 /// Rebuilds `backup` bound to the given `workspace_dir`, gated like
