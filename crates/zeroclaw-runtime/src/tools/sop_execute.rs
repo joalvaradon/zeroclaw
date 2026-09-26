@@ -67,7 +67,12 @@ impl SopExecuteTool {
             engine: Arc::clone(&self.engine),
             audit: self.audit.clone(),
             caller_ceiling: Some(ceiling),
-            initiator: self.initiator.clone(),
+            // Deliberately not the caller's initiator. The initiator lets the
+            // headless driver resume a parked run as that agent, with its full
+            // policy and no ceiling. Bounded runs are cancelled before they can
+            // park; if a cancellation ever fails, an unowned step must fail
+            // closed at resume rather than run as the caller.
+            initiator: None,
         }
     }
 }
@@ -226,6 +231,7 @@ impl Tool for SopExecuteTool {
                 Arc::clone(&self.engine),
                 self.audit.clone(),
                 action,
+                self.caller_ceiling.is_some(),
             );
         }
 
@@ -546,6 +552,46 @@ mod tests {
             "a SOP that never parks must not be refused under a ceiling: {result:?}"
         );
         assert!(result.output.contains("Step one"));
+    }
+
+    /// The initiator is what lets the headless driver resume a parked run as
+    /// its starting agent, with that agent's full policy and no ceiling. A
+    /// bounded caller's run must never be resumable that way, so the rebound
+    /// instance records no initiator: if a park ever survives (cancellation
+    /// failed), an unowned step fails closed at resume instead of running as
+    /// the caller. Control: the unbounded instance still records it.
+    #[tokio::test]
+    async fn rebound_with_ceiling_does_not_carry_the_initiator() {
+        let engine = engine_with_sops(vec![
+            test_sop("unbounded-sop", SopExecutionMode::Auto),
+            test_sop("bounded-sop", SopExecutionMode::Auto),
+        ]);
+        let unbounded = SopExecuteTool::new(Arc::clone(&engine)).with_initiator("caller");
+        let bounded = unbounded.rebound_with_ceiling(sealed_ceiling(&["sop_execute"]));
+
+        let control = unbounded
+            .execute(json!({"name": "unbounded-sop"}))
+            .await
+            .unwrap();
+        assert!(control.success, "{control:?}");
+        let result = bounded
+            .execute(json!({"name": "bounded-sop"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+
+        let engine = engine.lock().unwrap();
+        let mut initiators: Vec<Option<String>> = engine
+            .active_runs()
+            .values()
+            .map(|run| run.initiating_agent.clone())
+            .collect();
+        initiators.sort();
+        assert_eq!(
+            initiators,
+            vec![None, Some("caller".to_string())],
+            "the unbounded run records its initiator; the bounded one must not"
+        );
     }
 
     /// The other park variant `parked_run_id` matches. Found by re-reading the

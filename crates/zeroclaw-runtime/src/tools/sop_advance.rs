@@ -296,6 +296,7 @@ impl Tool for SopAdvanceTool {
                 Arc::clone(&self.engine),
                 self.audit.clone(),
                 action,
+                self.caller_ceiling.is_some(),
             );
         }
 

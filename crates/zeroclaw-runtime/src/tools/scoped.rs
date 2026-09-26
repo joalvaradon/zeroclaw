@@ -670,15 +670,13 @@ impl ScopedToolRegistry {
         // policy-filtered parent set is the wider of the two, and a run that holds
         // both a per-run allowlist and `delegate` would delegate from the wide set.
         //
-        // No such run exists today: `delegate` is stripped from a bounded target's
-        // registry, so it cannot reach the sealed set, cannot reach a job's stored
-        // `allowed_tools`, and cannot reach a spawned child. Verified by
-        // `bounded_delegate_cron_job_inherits_ceiling`, which pins that a job
-        // scheduled from a bounded target stores no `delegate`.
-        //
-        // It stops being hypothetical the moment that stripping changes, which is
-        // exactly what the in-flight work to honour `delegation_policy` for bounded
-        // targets does. One line here is cheaper than re-deriving this later.
+        // A bounded target whose policy permits delegation does now carry a
+        // `delegate` (its own depth-capped `sub_delegate_tool`), but that name is
+        // excluded when the bounded ceiling is sealed (`tools/delegate.rs`), so it
+        // still cannot reach a job's stored `allowed_tools` or a spawned child.
+        // Pinned by `a_job_scheduled_from_a_bounded_delegate_cannot_store_delegate`
+        // (`tests/bounded_delegate_cron_job_inherits_ceiling.rs`). This narrowing
+        // keeps the parent set consistent regardless of that exclusion.
         if let Some(allowed) = caller_allowed
             && let Some(handle) = delegate_handle.as_ref()
         {

@@ -109,10 +109,13 @@ impl Tool for SopApproveTool {
 
         match result {
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
+                // Never a bounded caller: a bounded registry carries
+                // `BoundedSopApproveDenied` in this tool's place, never this one.
                 crate::sop::executor::enqueue_live_action(
                     Arc::clone(&self.engine),
                     self.audit.clone(),
                     &action,
+                    false,
                 );
                 let output = match *action {
                     SopRunAction::ExecuteStep {

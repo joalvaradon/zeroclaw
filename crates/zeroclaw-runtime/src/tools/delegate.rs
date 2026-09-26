@@ -4570,11 +4570,12 @@ impl DelegateTool {
                             // safe for a run that stays inside this turn
                             // (`bounded_delegate_sop_step_ceiling` covers it via
                             // `SopStepReassembly`); a run that instead PARKS
-                            // (WaitApproval/CheckpointWait) escapes to an external
-                            // resume with `allowed_tools: None` - full authority,
-                            // outside this ceiling entirely. Rebinding the sealed
-                            // ceiling here lets each tool cancel a parked run under
-                            // its own bound rather than let it sit resolvable.
+                            // (WaitApproval/CheckpointWait/Pending) escapes to an
+                            // external resume with `allowed_tools: None` - full
+                            // authority, outside this ceiling entirely. Rebinding
+                            // the sealed ceiling here lets each tool cancel a run it
+                            // parks, and marks the actions it queues so the live
+                            // driver cancels any park it reaches later in the turn.
                             if let Some(sop_execute) = tool
                                 .as_any()
                                 .and_then(|any| any.downcast_ref::<crate::tools::SopExecuteTool>())
@@ -4672,6 +4673,23 @@ impl DelegateTool {
                 // name from this set - a stored cron job's replay, or
                 // `spawn_subagent`'s own `agent::run` call - so both denied names
                 // would be honored as grants there.
+                //
+                // A headless SOP step this delegation runs inside narrows the
+                // target's registry below, after this match. The ceiling must
+                // describe what the target actually receives, so the same
+                // exclusions are applied here, before sealing, rather than
+                // letting the deferred tools inherit names the step denied.
+                let step_excluded: Vec<String> =
+                    crate::sop::active_scope::active_headless_step_scope()
+                        .map(|scope| {
+                            let names: Vec<String> = assembled_bounded
+                                .registry
+                                .iter()
+                                .map(|tool| tool.name().to_string())
+                                .collect();
+                            scope.excluded(&names)
+                        })
+                        .unwrap_or_default();
                 let _ = bounded_ceiling.set(
                     assembled_bounded
                         .registry
@@ -4684,6 +4702,9 @@ impl DelegateTool {
                                         any.downcast_ref::<crate::tools::sop_approve::BoundedSopApproveDenied>()
                                     })
                                     .is_none()
+                                && !step_excluded
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
                         })
                         .map(|tool| tool.name().to_string())
                         .collect(),
@@ -13264,6 +13285,84 @@ mod tests {
             "regression: a Bounded delegate's cron_add must store the created job under \
              the TARGET's own agent_alias, not the caller's"
         );
+    }
+
+    /// Runs a bounded delegation to `fs_researcher` whose target calls
+    /// `cron_add` for a shell job, inside a headless SOP step that allows
+    /// `step_allows`, and returns the jobs the target ended up owning.
+    async fn shell_jobs_stored_by_bounded_target_under_step(
+        step_allows: &[&str],
+    ) -> Vec<crate::cron::CronJob> {
+        let fixture = bounded_delegate_full_fixture_multi(
+            &["cron_add", "shell"],
+            grant_shell_to_both_profiles,
+        )
+        .await;
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(step_allows.iter().map(|t| (*t).to_string()).collect()),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        };
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "cron_add",
+            tool_args: serde_json::json!({
+                "job_type": "shell",
+                "command": "echo hi",
+                "schedule": { "kind": "every", "every_ms": 3_600_000 },
+                "approved": true,
+            }),
+        };
+        let result = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            fixture.tool.execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "add a recurring job",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "bounded delegation failed: {result:?}");
+        crate::cron::list_jobs_by_agent(&fixture.config, "fs_researcher").unwrap()
+    }
+
+    /// The sealed ceiling is what the target's deferred tools check later
+    /// (`require_shell_within_ceiling` here), and it has to describe what the
+    /// target actually received. A headless SOP step narrows the target's
+    /// registry after the bounded assembly; if the ceiling is sealed before
+    /// that narrowing, it still grants `shell`, and the target can store a
+    /// shell job the step it runs inside denied.
+    #[tokio::test]
+    async fn bounded_delegate_under_a_sop_step_scope_cannot_store_a_shell_job_the_step_denied() {
+        let jobs = shell_jobs_stored_by_bounded_target_under_step(&["cron_add"]).await;
+        assert!(
+            jobs.is_empty(),
+            "a step that allows only cron_add must not let the delegated target defer a \
+             shell job - got: {jobs:?}"
+        );
+    }
+
+    /// Control for the test above: same chain, the step also allows `shell`,
+    /// and the job is stored. Proves `cron_add` is reachable under a step scope
+    /// and that the step's allow list is what decides the outcome.
+    #[tokio::test]
+    async fn bounded_delegate_under_a_sop_step_scope_can_store_a_shell_job_the_step_allows() {
+        let jobs = shell_jobs_stored_by_bounded_target_under_step(&["cron_add", "shell"]).await;
+        assert_eq!(jobs.len(), 1, "got: {jobs:?}");
     }
 
     #[tokio::test]
