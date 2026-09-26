@@ -17,6 +17,10 @@ pub struct SopExecuteTool {
     /// `audit` handles are shared with the target rather than rebuilt — so
     /// this is the one piece that IS per-instance: see `rebound_with_ceiling`.
     caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
+    /// The agent this tool instance belongs to. Recorded on runs it starts, so a
+    /// procedure that parks at an approval can still resume as the agent that
+    /// started it once the turn is gone.
+    initiator: Option<String>,
 }
 
 impl SopExecuteTool {
@@ -25,7 +29,16 @@ impl SopExecuteTool {
             engine,
             audit: None,
             caller_ceiling: None,
+            initiator: None,
         }
+    }
+
+    /// Record `alias` as the initiating agent on runs this tool starts.
+    #[must_use]
+    pub fn with_initiator(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        self.initiator = (!alias.trim().is_empty()).then_some(alias);
+        self
     }
 
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
@@ -54,6 +67,7 @@ impl SopExecuteTool {
             engine: Arc::clone(&self.engine),
             audit: self.audit.clone(),
             caller_ceiling: Some(ceiling),
+            initiator: self.initiator.clone(),
         }
     }
 }
@@ -128,7 +142,7 @@ impl Tool for SopExecuteTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.start_run(sop_name, event) {
+            match engine.start_run_owned(sop_name, event, self.initiator.as_deref()) {
                 Ok(action) => {
                     // A bounded caller must never leave a run parked: nothing
                     // in ITS turn will ever drive it past this point (see
@@ -333,6 +347,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
