@@ -450,8 +450,9 @@ pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
 /// `FILESYSTEM_TOOL_NAMES`, so a target allowed one of these still falls
 /// through to the caller's `ToolArcRef`-wrapped instance. See each
 /// constructor function above for the exact captured field: `git_operations`,
-/// `backup`, `data_management` (the most severe: its `purge` command deletes
-/// files), `linkedin`, `image_gen`, `pushover` (reads credentials from
+/// `backup`, `data_management` (these two work on the shared data directory,
+/// but capture the agent's `SecurityPolicy` that confines them;
+/// `data_management`'s `purge` command deletes files), `linkedin`, `image_gen`, `pushover` (reads credentials from
 /// `workspace_dir/.env`), `screenshot`, `file_upload`, `file_upload_bundle`,
 /// `file_download` (all capture `workspace_dir`/`SecurityPolicy` directly),
 /// `browser` (resolves screenshot destinations through the captured
@@ -641,39 +642,46 @@ pub(crate) fn git_operations_tool(
     ))
 }
 
-/// Rebuilds `backup` bound to the given `workspace_dir`, gated like
+/// Builds `backup` over the shared `data_root` under `security`, gated like
 /// `all_tools_with_runtime` gates it (`root_config.backup.enabled`, true by
-/// default). `None` when disabled. See [`git_operations_tool`] for why
-/// `workspace_dir` is a separate parameter rather than read from a policy.
+/// default). `None` when disabled. The archive root is the daemon's data
+/// directory, not any agent's workspace; `security` is what differs per
+/// agent, so a bounded rebuild passes the TARGET's policy here.
 pub(crate) fn backup_tool(
-    workspace_dir: &std::path::Path,
+    data_root: &std::path::Path,
+    security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.backup.enabled {
         return None;
     }
-    Some(Arc::new(BackupTool::new(
-        workspace_dir.to_path_buf(),
+    Some(Arc::new(BackupTool::new_with_data_root_and_security(
+        data_root.to_path_buf(),
         root_config.backup.include_dirs.clone(),
         root_config.backup.max_keep,
+        security,
     )))
 }
 
-/// Rebuilds `data_management` bound to the given `workspace_dir`, gated like
-/// `all_tools_with_runtime` gates it (`root_config.data_retention.enabled`,
-/// false by default). `None` when disabled. See [`git_operations_tool`] for
-/// why `workspace_dir` is a separate parameter rather than read from a policy.
+/// Builds `data_management` over the shared `data_root` under `security`,
+/// gated like `all_tools_with_runtime` gates it
+/// (`root_config.data_retention.enabled`, false by default). `None` when
+/// disabled. Same split as [`backup_tool`]: shared root, per-agent policy.
 pub(crate) fn data_management_tool(
-    workspace_dir: &std::path::Path,
+    data_root: &std::path::Path,
+    security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
 ) -> Option<Arc<dyn Tool>> {
     if !root_config.data_retention.enabled {
         return None;
     }
-    Some(Arc::new(DataManagementTool::new(
-        workspace_dir.to_path_buf(),
-        root_config.data_retention.retention_days,
-    )))
+    Some(Arc::new(
+        DataManagementTool::new_with_data_root_and_security(
+            data_root.to_path_buf(),
+            root_config.data_retention.retention_days,
+            security,
+        ),
+    ))
 }
 
 /// Rebuilds `linkedin` bound to the given `workspace_dir`, gated like
@@ -3089,12 +3097,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Backup tool (enabled by default)
-    if let Some(tool) = backup_tool(workspace_dir, root_config) {
+    if let Some(tool) = backup_tool(&config.data_dir, security.clone(), root_config) {
         tool_arcs.push(tool);
     }
 
     // Data management tool (disabled by default)
-    if let Some(tool) = data_management_tool(workspace_dir, root_config) {
+    if let Some(tool) = data_management_tool(&config.data_dir, security.clone(), root_config) {
         tool_arcs.push(tool);
     }
 
@@ -5533,6 +5541,193 @@ permissions = ["http_client"]
             !workspace_dir.join("sessions").exists(),
             "session tools must not open/create a store under the per-agent workspace_dir"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_and_data_management_use_shared_data_dir_not_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("shared-data");
+        let workspace_dir = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(data_dir.join("config")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join("config")).unwrap();
+        std::fs::write(data_dir.join("config/shared.txt"), "shared").unwrap();
+        std::fs::write(workspace_dir.join("config/agent.txt"), "agent").unwrap();
+        let shared_old = data_dir.join("shared-old.txt");
+        let agent_old = workspace_dir.join("agent-old.txt");
+        std::fs::write(&shared_old, "old").unwrap();
+        std::fs::write(&agent_old, "old-agent").unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&shared_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&agent_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace_dir.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mut root_config = test_config(&tmp);
+        root_config.data_dir = data_dir.clone();
+        root_config.backup.enabled = true;
+        root_config.backup.include_dirs = vec!["config".into()];
+        root_config.data_retention.enabled = true;
+        root_config.data_retention.retention_days = 1;
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            workspace_dir.as_path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        assert!(!security.allowed_roots.contains(&data_dir));
+
+        let backup = tools
+            .iter()
+            .find(|tool| tool.name() == "backup")
+            .expect("enabled backup tool must register");
+        let created = backup
+            .execute(serde_json::json!({"command": "create"}))
+            .await
+            .unwrap();
+        assert!(created.success, "backup failed: {:?}", created.error);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap();
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/shared.txt")
+                .exists()
+        );
+        assert!(
+            !data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/agent.txt")
+                .exists()
+        );
+        assert!(!workspace_dir.join("backups").exists());
+
+        let listed = backup
+            .execute(serde_json::json!({"command": "list"}))
+            .await
+            .unwrap();
+        assert!(listed.success, "list failed: {:?}", listed.error);
+        let listed: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == backup_name)
+        );
+
+        let verified = backup
+            .execute(serde_json::json!({
+                "command": "verify",
+                "backup_name": backup_name
+            }))
+            .await
+            .unwrap();
+        assert!(verified.success, "verify failed: {:?}", verified.error);
+
+        std::fs::write(data_dir.join("config/shared.txt"), "changed").unwrap();
+        let restored = backup
+            .execute(serde_json::json!({
+                "command": "restore",
+                "backup_name": backup_name,
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config/shared.txt")).unwrap(),
+            "shared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_dir.join("config/agent.txt")).unwrap(),
+            "agent"
+        );
+
+        let data_management = tools
+            .iter()
+            .find(|tool| tool.name() == "data_management")
+            .expect("enabled data-management tool must register");
+        let status = data_management
+            .execute(serde_json::json!({"command": "retention_status"}))
+            .await
+            .unwrap();
+        assert!(status.success, "status failed: {:?}", status.error);
+        let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
+        assert_eq!(status["affected_files"], 1);
+
+        let preview = data_management
+            .execute(serde_json::json!({"command": "purge", "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(preview.success, "preview failed: {:?}", preview.error);
+        let preview: serde_json::Value = serde_json::from_str(&preview.output).unwrap();
+        assert_eq!(preview["files"], 1);
+        assert_eq!(preview["bytes_freed"], 3);
+
+        let stats = data_management
+            .execute(serde_json::json!({"command": "stats"}))
+            .await
+            .unwrap();
+        assert!(stats.success, "stats failed: {:?}", stats.error);
+        let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
+        assert!(stats["subdirectories"].get("backups").is_some());
+        assert!(!workspace_dir.join("backups").exists());
     }
 
     #[tokio::test]

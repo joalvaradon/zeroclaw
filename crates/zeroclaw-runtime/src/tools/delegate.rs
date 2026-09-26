@@ -3865,14 +3865,20 @@ impl DelegateTool {
                             Box::new(ToolArcRef::new(tool)),
                         );
                     }
-                    if let Some(tool) =
-                        crate::tools::backup_tool(&target_policy.workspace_dir, root_config)
-                    {
+                    // `backup`/`data_management` work on the shared data
+                    // directory, the same one the caller's instance uses; what
+                    // must be the target's is the policy that confines them.
+                    if let Some(tool) = crate::tools::backup_tool(
+                        &root_config.data_dir,
+                        Arc::clone(&target_policy),
+                        root_config,
+                    ) {
                         target_workspace_bound_tools
                             .insert("backup".to_string(), Box::new(ToolArcRef::new(tool)));
                     }
                     if let Some(tool) = crate::tools::data_management_tool(
-                        &target_policy.workspace_dir,
+                        &root_config.data_dir,
+                        Arc::clone(&target_policy),
                         root_config,
                     ) {
                         target_workspace_bound_tools.insert(
@@ -13044,12 +13050,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_delegate_backup_creates_archive_in_target_workspace_not_callers() {
+    async fn bounded_delegate_backup_creates_archive_in_shared_data_dir_not_callers_workspace() {
         // Regression: `backup` is not in `FILESYSTEM_TOOL_NAMES` either, so a
-        // Bounded cross-profile target gets the CALLER's `BackupTool`
-        // instance (tools/mod.rs:1182-1186 bakes in `workspace_dir` at
-        // construction), and `cmd_create` (backup_tool.rs:30-62) always
-        // archives into `self.workspace_dir.join("backups")`.
+        // Bounded cross-profile target used to get the CALLER's `BackupTool`
+        // instance, which archived into the caller's workspace. `backup` now
+        // archives under the daemon's shared data directory for every agent
+        // (`backup_tool` in tools/mod.rs); the bounded rebuild gives the target
+        // its own policy over that same root. The caller's workspace must
+        // still receive nothing.
         let fixture = bounded_delegate_full_fixture("backup", |_cfg| {}).await;
 
         let model_provider = BoundedSingleToolCallThenFinalModelProvider {
@@ -13081,22 +13089,66 @@ mod tests {
             fixture.caller_workspace.display()
         );
         assert!(
-            fixture.target_workspace.join("backups").exists(),
-            "regression: a Bounded delegate's backup must create its archive \
-             under the TARGET's own configured workspace ({}), not the caller's",
-            fixture.target_workspace.display()
+            fixture.config.data_dir.join("backups").exists(),
+            "a Bounded delegate's backup must create its archive under the shared \
+             data directory ({}), the same root every agent's backup uses",
+            fixture.config.data_dir.display()
+        );
+    }
+
+    /// With the archive root shared, the policy is the only thing the bounded
+    /// rebuild of `backup` changes, so it is what this pins: the target's own
+    /// risk profile forbids the archive directory and the caller's does not.
+    /// Reusing the caller's instance would archive anyway. The test above is
+    /// its positive control: same fixture, no forbidden entry, archive created.
+    #[tokio::test]
+    async fn bounded_delegate_backup_runs_under_the_targets_policy_not_the_callers() {
+        let fixture = bounded_delegate_full_fixture("backup", |cfg| {
+            let archive_dir = cfg.data_dir.join("backups").to_string_lossy().into_owned();
+            cfg.risk_profiles
+                .get_mut("research")
+                .expect("fixture target risk profile must exist")
+                .forbidden_paths
+                .push(archive_dir);
+        })
+        .await;
+
+        let model_provider = BoundedSingleToolCallThenFinalModelProvider {
+            tool_name: "backup",
+            tool_args: serde_json::json!({ "command": "create" }),
+        };
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &model_provider,
+                "create a backup",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "bounded backup delegate failed: {result:?}");
+
+        assert!(
+            !fixture.config.data_dir.join("backups").exists(),
+            "a Bounded delegate's backup must run under the TARGET's policy, which \
+             forbids {}; the caller's policy does not",
+            fixture.config.data_dir.join("backups").display()
         );
     }
 
     #[tokio::test]
     async fn bounded_delegate_data_management_purge_does_not_delete_callers_files() {
-        // Regression (most severe variant of the bounded cross-profile workspace
-        // boundary bug): `data_management` is not
-        // in `FILESYSTEM_TOOL_NAMES` either, and unlike file_write/backup this
-        // tool is DESTRUCTIVE - `cmd_purge` (data_management.rs:41-59) calls
-        // `fs::remove_file` (data_management.rs:205) against
-        // `self.workspace_dir`. A Bounded cross-profile target reusing the
-        // caller's instance can delete files from the CALLER's workspace.
+        // Regression: `data_management` is not in `FILESYSTEM_TOOL_NAMES`
+        // either, and a Bounded cross-profile target reusing the caller's
+        // instance once purged files from the CALLER's workspace. The tool now
+        // works on the shared data directory and a confirmed purge is disabled
+        // altogether (preview only), so this is kept as a guard: if a
+        // destructive purge ever returns, the caller's workspace still must not
+        // be its target.
         let fixture = bounded_delegate_full_fixture("data_management", |cfg| {
             cfg.data_retention.enabled = true;
             cfg.data_retention.retention_days = 0;
@@ -13141,6 +13193,76 @@ mod tests {
              tool instance was reused from parent_tools - this is a destructive \
              variant of #9872, not just a read/write leak",
             fixture.caller_workspace.display()
+        );
+    }
+
+    /// Runs `data_management stats` as the bounded target, optionally with the
+    /// target's own risk profile forbidding one populated subdirectory of the
+    /// shared data directory, and returns the tool result the target saw.
+    async fn bounded_data_management_stats_result(target_forbids_subdir: bool) -> String {
+        let fixture = bounded_delegate_full_fixture("data_management", |cfg| {
+            cfg.data_retention.enabled = true;
+            let subdir = cfg.data_dir.join("target-forbidden");
+            std::fs::create_dir_all(&subdir).unwrap();
+            std::fs::write(subdir.join("entry.txt"), b"data").unwrap();
+            if target_forbids_subdir {
+                cfg.risk_profiles
+                    .get_mut("research")
+                    .expect("fixture target risk profile must exist")
+                    .forbidden_paths
+                    .push(subdir.to_string_lossy().into_owned());
+            }
+        })
+        .await;
+        let provider = SingleToolCallCapturingProvider::new(
+            "data_management",
+            serde_json::json!({ "command": "stats" }),
+        );
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "fs_researcher",
+                &fixture.target_config,
+                "custom",
+                "delegate-fs-test-model",
+                &provider,
+                "report data stats",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "bounded delegation failed: {result:?}");
+        assert!(
+            provider.tool_was_offered(),
+            "data_management must be offered to the target"
+        );
+        provider
+            .tool_message()
+            .expect("the target's data_management must have produced a tool result")
+    }
+
+    /// Positive control for the test below: no forbidden entry, so `stats`
+    /// reads the whole shared data directory and reports totals.
+    #[tokio::test]
+    async fn bounded_delegate_data_management_stats_reads_the_shared_data_dir() {
+        let observed = bounded_data_management_stats_result(false).await;
+        assert!(
+            observed.contains("total_files"),
+            "stats over the shared data directory must succeed, got: {observed}"
+        );
+    }
+
+    /// `data_management` reads the shared data directory under whichever
+    /// policy its instance carries. The target's profile forbids one
+    /// subdirectory and the caller's does not, so `stats` must fail under the
+    /// target's policy; reusing the caller's instance would report totals.
+    #[tokio::test]
+    async fn bounded_delegate_data_management_reads_under_the_targets_policy_not_the_callers() {
+        let observed = bounded_data_management_stats_result(true).await;
+        assert!(
+            !observed.contains("total_files"),
+            "a Bounded delegate's data_management must read under the TARGET's policy, \
+             which forbids part of the data directory; got: {observed}"
         );
     }
 
