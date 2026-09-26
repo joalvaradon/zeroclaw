@@ -203,7 +203,12 @@ fn sop_ceiling_config(provider_uri: &str, root: &std::path::Path) -> Config {
         base.native_tools = Some(true);
     }
 
+    // A bounded child has no operator to answer an approval prompt, so a
+    // tool its profile would prompt for is denied before it runs. These
+    // regressions are about the ceiling, so each profile auto-approves the
+    // tools it allows; that grants no tool the profile does not already list.
     let permissive = |tools: Vec<String>| RiskProfileConfig {
+        auto_approve: tools.clone(),
         allowed_tools: tools,
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,

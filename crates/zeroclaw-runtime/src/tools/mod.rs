@@ -642,11 +642,8 @@ pub(crate) fn git_operations_tool(
     ))
 }
 
-/// Builds `backup` over the shared `data_root` under `security`, gated like
-/// `all_tools_with_runtime` gates it (`root_config.backup.enabled`, true by
-/// default). `None` when disabled. The archive root is the daemon's data
-/// directory, not any agent's workspace; `security` is what differs per
-/// agent, so a bounded rebuild passes the TARGET's policy here.
+/// Rebuilds `backup` for the shared data root under the supplied agent policy,
+/// gated like `all_tools_with_runtime` (`root_config.backup.enabled`).
 pub(crate) fn backup_tool(
     data_root: &std::path::Path,
     security: Arc<SecurityPolicy>,
@@ -663,10 +660,8 @@ pub(crate) fn backup_tool(
     )))
 }
 
-/// Builds `data_management` over the shared `data_root` under `security`,
-/// gated like `all_tools_with_runtime` gates it
-/// (`root_config.data_retention.enabled`, false by default). `None` when
-/// disabled. Same split as [`backup_tool`]: shared root, per-agent policy.
+/// Rebuilds `data_management` for the shared data root under the supplied
+/// agent policy, gated like `all_tools_with_runtime` (`data_retention.enabled`).
 pub(crate) fn data_management_tool(
     data_root: &std::path::Path,
     security: Arc<SecurityPolicy>,
