@@ -16302,12 +16302,14 @@ command = "echo hi"
 
     /// Captures the system prompt the nested independent loop receives and the
     /// tool results fed back, then finishes after one tool round.
+    #[cfg(unix)]
     #[derive(Default)]
     struct FullTargetProbeProvider {
         system_prompts: std::sync::Mutex<Vec<String>>,
         tool_messages: std::sync::Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl FullTargetProbeProvider {
         fn system_prompt(&self) -> String {
             self.system_prompts
@@ -16323,6 +16325,7 @@ command = "echo hi"
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ModelProvider for FullTargetProbeProvider {
         async fn chat_with_system(
@@ -16380,6 +16383,7 @@ command = "echo hi"
         }
     }
 
+    #[cfg(unix)]
     impl ::zeroclaw_api::attribution::Attributable for FullTargetProbeProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(

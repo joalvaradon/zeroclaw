@@ -5611,6 +5611,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
