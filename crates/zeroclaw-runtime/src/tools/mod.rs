@@ -172,6 +172,7 @@ use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
@@ -603,6 +604,37 @@ pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     "email_search",
     "email_read",
 ];
+
+/// Test-only counterpart to `SAFE_FOR_BOUNDED_REUSE`, consulted only through
+/// `is_test_only_safe_for_bounded_reuse` below so it never reaches a release
+/// binary. These are mock fixtures from `zeroclaw-runtime`'s own
+/// `#[cfg(test)] mod tests` - test-owned `Tool` impls that mutate a
+/// test-local `Arc<AtomicBool>`/`CostTracker` to simulate a mid-run config
+/// change, never real tools a production registry could construct. They
+/// cannot be classified by any of the real categories (identity/workspace/
+/// channel/SOP-rebind) because they carry no such state to rebind - reusing
+/// the caller's instance verbatim is what the test needs to observe.
+#[cfg(test)]
+const TEST_ONLY_SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
+    "config_lowering_tool",
+    "config_mode_flip_tool",
+    "live_config_flip_tool",
+];
+
+/// `true` iff `name` is one of `TEST_ONLY_SAFE_FOR_BOUNDED_REUSE`, compiled
+/// out entirely (always `false`, zero-cost) outside `cargo test` - the
+/// `#[cfg(test)]` list above does not exist in that build, so the call site
+/// in `delegate.rs` goes through this pair of functions rather than naming
+/// the list directly, which would fail to compile for a release binary.
+#[cfg(test)]
+pub(crate) fn is_test_only_safe_for_bounded_reuse(name: &str) -> bool {
+    TEST_ONLY_SAFE_FOR_BOUNDED_REUSE.contains(&name)
+}
+
+#[cfg(not(test))]
+pub(crate) fn is_test_only_safe_for_bounded_reuse(_name: &str) -> bool {
+    false
+}
 
 /// The vision `image_info` tool, wrapped exactly like every other filesystem-boundary
 /// tool (`RateLimitedTool` + `PathGuardedTool`). Factored out of the big assembly
@@ -2137,6 +2169,16 @@ impl AllToolsResult {
     }
 }
 
+fn runtime_for_all_tools(
+    root_config: &zeroclaw_config::schema::Config,
+    tui_env: Option<&HashMap<String, String>>,
+) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
+    let tui_path = tui_env.and_then(|env| env.get("PATH")).map(OsStr::new);
+    Ok(Arc::from(
+        zeroclaw_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
+    ))
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -2162,12 +2204,13 @@ pub fn all_tools(
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
 ) -> anyhow::Result<AllToolsResult> {
+    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())?;
     all_tools_with_runtime(
         config,
         security,
         risk_profile,
         agent_alias,
-        Arc::new(NativeRuntime::new()),
+        runtime,
         memory,
         composio_key,
         composio_entity_id,
@@ -3999,6 +4042,53 @@ mod tests {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shell = tmp.path().join("all-tools-configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut root_config = Config::default();
+        root_config.runtime.shell = Some("all-tools-configured-shell".to_string());
+        let path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-decoy"),
+            shell.parent().unwrap().as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let command = runtime
+            .build_shell_command("echo all-tools", tmp.path())
+            .unwrap();
+
+        assert_eq!(
+            command.as_std().get_program(),
+            shell.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+        use std::ffi::OsString;
+
+        for path in [OsString::new(), OsString::from("relative-only")] {
+            let mut root_config = Config::default();
+            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            let tui_env =
+                HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
         }
     }
 
