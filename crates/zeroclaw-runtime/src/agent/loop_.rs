@@ -922,6 +922,7 @@ pub async fn agent_turn(
         context_token_budget,
         channel,
         origin,
+        None,
         memory,
         agent_alias,
         turn_id,
@@ -961,6 +962,7 @@ async fn agent_turn_with_sop_reassembly(
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
@@ -1076,7 +1078,7 @@ async fn agent_turn_with_sop_reassembly(
         // point; source/transport/trust stay phase-1 placeholders until
         // per-transport stamping lands.
         memory,
-        ingress: IngressContext::from_origin(origin),
+        ingress: IngressContext::from_parts(origin, internal_principal),
         agent_alias,
         parent_agent_alias: None,
         served_route_sink: None,
@@ -1219,6 +1221,11 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// The internal principal that initiated this turn, stamped into the
+    /// ingress envelope. Supplied by internal dispatch surfaces (cron
+    /// scheduler, daemon heartbeat, SOP driver); `None` for entries with
+    /// no principal contract (CLI, one-shot).
+    pub internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
     /// Tool-scope contract for a SOP step executed headlessly (cron and the
     /// other non-agent-loop trigger surfaces). `Some` narrows every turn of
     /// this run to the step's active scope and removes the SOP control tools,
@@ -1400,6 +1407,7 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let internal_principal = overrides.internal_principal.clone();
         let sop_step_scope = overrides.sop_step_scope.clone();
         let security = match overrides.security {
             Some(sec) => sec,
@@ -2173,7 +2181,10 @@ pub async fn run(
                                         crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
                                     ),
                                 }),
-                                ingress: IngressContext::from_origin(origin),
+                                ingress: IngressContext::from_parts(
+                                    origin,
+                                    internal_principal.clone(),
+                                ),
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
@@ -2785,7 +2796,10 @@ pub async fn run(
                                             crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
                                         ),
                                     }),
-                                    ingress: IngressContext::from_origin(origin),
+                                    ingress: IngressContext::from_parts(
+                                        origin,
+                                        internal_principal.clone(),
+                                    ),
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
@@ -3098,15 +3112,16 @@ pub async fn process_message(
     session_id: Option<&str>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
-    process_message_inner(
+    process_message_shared(
         Arc::new(config),
-        None,
         agent_alias,
         message,
         session_id,
         allowed_tools,
         origin,
+        internal_principal,
     )
     .await
 }
@@ -3122,6 +3137,7 @@ pub(crate) async fn process_message_shared(
     session_id: Option<&str>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     process_message_inner(
         config,
@@ -3131,6 +3147,7 @@ pub(crate) async fn process_message_shared(
         session_id,
         allowed_tools,
         origin,
+        internal_principal,
     )
     .await
 }
@@ -3144,6 +3161,7 @@ pub(crate) async fn process_message_shared_with_live_config(
     session_id: Option<&str>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     process_message_inner(
         config,
@@ -3153,6 +3171,7 @@ pub(crate) async fn process_message_shared_with_live_config(
         session_id,
         allowed_tools,
         origin,
+        internal_principal,
     )
     .await
 }
@@ -3176,6 +3195,7 @@ pub async fn process_message_with_live_config(
         session_id,
         allowed_tools,
         origin,
+        None,
     )
     .await
 }
@@ -3192,6 +3212,7 @@ async fn process_message_inner(
     // shared-snapshot path) have no caller to bound against and pass `None`.
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -3761,6 +3782,7 @@ async fn process_message_inner(
                     // `None` (today's channel-less auto-deny). See above.
                     routed_approval_channel_ref,
                     origin,
+                    internal_principal,
                     Some(crate::agent::memory_inject::TurnMemory {
                         handle: mem.as_ref(),
                         query: effective_message.clone(),
@@ -6909,6 +6931,7 @@ mod tests {
             },
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Channel,
+            internal_principal: None,
         })
         .await;
 
@@ -19142,6 +19165,7 @@ Let me check the result."#;
             Some("session"),
             None,
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
 
@@ -19219,6 +19243,7 @@ Let me check the result."#;
             Some("session"),
             None,
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
         let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
@@ -19575,6 +19600,7 @@ Let me check the result."#;
             Some("session"),
             None,
             TurnOrigin::SubTurn,
+            None,
         )
         .await
         .expect_err(

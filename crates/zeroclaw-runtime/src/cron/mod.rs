@@ -23,7 +23,7 @@ pub(crate) use store::install_after_read_hook_for_tests;
 pub use store::{JobGuard, unguarded};
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
+    RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
     claim_job_for_agent_with_token, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
     job_not_found, list_jobs, list_jobs_by_agent, list_runs, list_runs_for_agent, record_last_run,
     record_last_run_with_status, record_run, release_job, release_job_for_token, remove_job,
