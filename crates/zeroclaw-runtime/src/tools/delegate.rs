@@ -5158,9 +5158,7 @@ impl DelegateTool {
                             }
                             let reuse_is_earned = !deny_unclassified_reuse
                                 || crate::tools::SAFE_FOR_BOUNDED_REUSE.contains(&tool.name())
-                                || crate::tools::is_test_only_safe_for_bounded_reuse(
-                                    tool.name(),
-                                );
+                                || crate::tools::is_test_only_safe_for_bounded_reuse(tool.name());
                             if reuse_is_earned {
                                 Some(Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
                             } else {
