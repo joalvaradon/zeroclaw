@@ -31,6 +31,24 @@
 //!   under the owning agent's policy, never through a tool call, so the only
 //!   bound available is whether the caller held `shell` itself.
 //!
+//! The tool NAMES are only one dimension of what the caller withholds. The
+//! other is its COMMAND policy, and it needs no shape of its own here: a bounded
+//! target's `SecurityPolicy` carries the command bounds of every caller above
+//! it (`SecurityPolicy::caller_command_bounds`, attached in
+//! `DelegateTool::policy_for_target`), and every scheduler tool REGISTERED
+//! WITH THAT POLICY already judges the command it stores or re-arms with it.
+//! That holds for a delegate-derived registration and for a `spawn_subagent`
+//! child of one, which inherits the policy by clone. It does NOT hold for a
+//! ceiling that reaches a turn built for another agent from tool names alone
+//! (a `send_message_to_peer` relay, a live SOP step naming another agent): that
+//! turn rebuilds its policy from config and carries no chain. The one gap
+//! closed here for a registration that does carry it is a
+//! job whose command is NOT being written (a `cron_update` of another field, a
+//! `schedule` resume): [`require_job_within_ceiling`] re-judges the STORED
+//! command for that case. A deferred AGENT job has no command yet, so the only
+//! bound is not to defer the capability: a stored list that keeps `shell` is
+//! refused ([`refuse_deferred_shell`]).
+//!
 //! Two things this enumeration is deliberately explicit about, because getting
 //! either wrong is how the gaps this module exists to close were opened:
 //!
@@ -108,7 +126,33 @@ pub(crate) fn cap_stored_allowed_tools(
              tool ceiling, and an empty allowed_tools is stored as unrestricted"
         ));
     }
+    refuse_deferred_shell(tool, &capped)?;
     Ok(Some(capped))
+}
+
+/// Refuse a deferred AGENT job whose tool list keeps `shell`.
+///
+/// A job that starts an agent later runs it under the OWNING agent's policy,
+/// rebuilt from config when the job fires — the bounded caller's command
+/// policy is not part of what the scheduler has, and a job row has nowhere to
+/// carry it. So a stored list that keeps `shell` hands the later run a shell
+/// judged by the target's command policy alone. Shell commands stored as
+/// shell jobs are covered differently (the command is judged against the
+/// caller's command policy when it is written); an agent job's commands do
+/// not exist yet, so the only bound available is not to defer the capability.
+///
+/// Refusing rather than stripping: silently dropping `shell` would store a
+/// job that behaves differently from the one requested. The caller can list
+/// the tools it wants, without `shell`.
+fn refuse_deferred_shell(tool: &str, stored: &[String]) -> Result<(), String> {
+    if stored.iter().any(|name| name == SHELL_TOOL_NAME) {
+        return Err(format!(
+            "{tool}: refused — this agent job would keep '{SHELL_TOOL_NAME}', and a deferred \
+             agent later runs it under the owning agent's command policy alone, without the \
+             calling agent's; list the tools the job needs without '{SHELL_TOOL_NAME}'"
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse to launch a job whose stored tool set is not already within the
@@ -145,6 +189,10 @@ pub(crate) fn require_within_ceiling(
             outside.join(", ")
         ));
     }
+    // Within the ceiling is not enough for `shell`: the launch or re-arm would
+    // start an agent whose shell carries the owning agent's command policy
+    // alone. See `refuse_deferred_shell`.
+    refuse_deferred_shell(tool, stored)?;
     Ok(())
 }
 
@@ -186,13 +234,42 @@ pub(crate) fn require_shell_within_ceiling(
 /// job. One predicate for every tool that judges a job, so the arms cannot drift
 /// apart, and usable as the guard `cron::update_job_for_agent` evaluates inside
 /// its write transaction.
+///
+/// A shell job is also judged by its STORED command. Patching a job's name or
+/// schedule, or re-arming it, leaves whatever command it already holds in
+/// force, and that command was last judged when it was written — possibly by
+/// the owning agent in an unbounded turn, under a policy that carries none of
+/// this caller's restrictions. `security` is the bounded tool's own policy, so
+/// `validate_command_execution_for_shell` applies the caller chain it carries.
+/// The same signal as the ceiling checks above decides whether this runs: with
+/// no ceiling in force (an unbounded registration) nothing is re-judged and that
+/// path is unchanged.
+///
+/// `approved` is whatever the calling tool took from its own request, and it
+/// only ever relaxes the approval gates a Supervised policy applies to
+/// medium- and high-risk commands; it never widens an allowlist.
 pub(crate) fn require_job_within_ceiling(
     tool: &str,
     ceiling: Option<&CallerCeiling>,
+    security: &crate::security::SecurityPolicy,
+    runtime: &dyn crate::platform::RuntimeAdapter,
+    approved: bool,
     job: &crate::cron::CronJob,
 ) -> Result<(), String> {
     match job.job_type {
-        crate::cron::JobType::Shell => require_shell_within_ceiling(tool, ceiling),
+        crate::cron::JobType::Shell => {
+            require_shell_within_ceiling(tool, ceiling)?;
+            if ceiling.is_some() {
+                crate::cron::validate_shell_command_with_security(
+                    runtime,
+                    security,
+                    &job.command,
+                    approved,
+                )
+                .map_err(|reason| format!("{tool}: refused — {reason}"))?;
+            }
+            Ok(())
+        }
         crate::cron::JobType::Agent => {
             require_within_ceiling(tool, ceiling, job.allowed_tools.as_deref())
         }
@@ -249,9 +326,11 @@ mod tests {
         // the caller's sealed set, NOT the owning agent's full registry. Broken
         // state: passing `None` through, which the scheduler reads as
         // unrestricted.
-        let handle = sealed_ceiling(&["shell", "cron_add"]);
+        // (`file_read`, not `shell`: a stored list that keeps `shell` is refused
+        // by `refuse_deferred_shell`, tested below.)
+        let handle = sealed_ceiling(&["file_read", "cron_add"]);
         let stored = cap_stored_allowed_tools("cron_add", Some(&handle), None).expect("capped");
-        assert_eq!(names(&stored), vec!["shell", "cron_add"]);
+        assert_eq!(names(&stored), vec!["file_read", "cron_add"]);
     }
 
     #[test]
@@ -259,15 +338,71 @@ mod tests {
         // Both halves in one assertion: `file_write` is dropped (the negative)
         // and `shell` survives (the positive). Without the positive half this
         // test would also pass against a cap that stores nothing at all.
-        let handle = sealed_ceiling(&["shell", "cron_add"]);
-        let requested = Some(vec!["shell".to_string(), "file_write".to_string()]);
+        let handle = sealed_ceiling(&["file_read", "cron_add"]);
+        let requested = Some(vec!["file_read".to_string(), "file_write".to_string()]);
         let stored =
             cap_stored_allowed_tools("cron_add", Some(&handle), requested).expect("capped");
         assert_eq!(
             names(&stored),
-            vec!["shell"],
+            vec!["file_read"],
             "the out-of-ceiling tool is dropped and the admitted one survives"
         );
+    }
+
+    // ── deferred agent jobs never keep `shell` ──────────────────────────────
+
+    #[test]
+    fn an_agent_job_naming_shell_is_refused_at_write() {
+        // The caller holds `shell`, so the intersection keeps it — and a later
+        // run of the stored agent would carry the target's command policy only.
+        let handle = sealed_ceiling(&["shell", "cron_add"]);
+        let requested = Some(vec!["shell".to_string(), "cron_add".to_string()]);
+        let error = cap_stored_allowed_tools("cron_add", Some(&handle), requested)
+            .expect_err("a stored list that keeps `shell` must be refused");
+        assert!(error.contains("'shell'"), "{error}");
+    }
+
+    #[test]
+    fn an_agent_job_inheriting_a_ceiling_with_shell_is_refused_at_write() {
+        // "Unset means inherit the caller's ceiling", which contains `shell`.
+        let handle = sealed_ceiling(&["shell", "cron_add"]);
+        cap_stored_allowed_tools("cron_add", Some(&handle), None)
+            .expect_err("inheriting a ceiling that holds `shell` keeps it");
+    }
+
+    #[test]
+    fn an_agent_job_without_shell_is_still_stored() {
+        // Control: the refusal is about `shell`, not about agent jobs under a
+        // ceiling that happens to contain it.
+        let handle = sealed_ceiling(&["shell", "cron_add"]);
+        let stored = cap_stored_allowed_tools(
+            "cron_add",
+            Some(&handle),
+            Some(vec!["cron_add".to_string()]),
+        )
+        .expect("a list without `shell` is unaffected");
+        assert_eq!(names(&stored), vec!["cron_add"]);
+    }
+
+    #[test]
+    fn launching_a_stored_agent_job_that_keeps_shell_is_refused() {
+        // `shell` is within the ceiling, so `require_within_ceiling` alone
+        // would pass it; the launch would still start an agent whose shell has
+        // no caller restriction.
+        let handle = sealed_ceiling(&["shell", "cron_run"]);
+        let error = require_within_ceiling("cron_run", Some(&handle), Some(&["shell".to_string()]))
+            .expect_err("an agent job keeping `shell` must not launch from a bounded turn");
+        assert!(error.contains("'shell'"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_shell_entry_is_not_refused_when_no_ceiling_is_in_force() {
+        // The unbounded path is untouched: no ceiling, no bound.
+        require_within_ceiling("cron_run", None, Some(&["shell".to_string()]))
+            .expect("no ceiling in force");
+        let stored = cap_stored_allowed_tools("cron_add", None, Some(vec!["shell".to_string()]))
+            .expect("no ceiling in force");
+        assert_eq!(names(&stored), vec!["shell"]);
     }
 
     #[test]
@@ -297,8 +432,8 @@ mod tests {
     fn launching_a_job_within_the_ceiling_is_allowed() {
         // The positive half of the two refusals below: without it, a
         // `require_within_ceiling` that refused everything would look correct.
-        let handle = sealed_ceiling(&["shell", "cron_add"]);
-        require_within_ceiling("cron_run", Some(&handle), Some(&["shell".to_string()]))
+        let handle = sealed_ceiling(&["file_read", "cron_add"]);
+        require_within_ceiling("cron_run", Some(&handle), Some(&["file_read".to_string()]))
             .expect("a job inside the ceiling still runs");
     }
 

@@ -580,6 +580,92 @@ mod tests {
         );
     }
 
+    /// A bounded tool whose policy carries ONE caller command bound, laid over
+    /// the test agent's own (permissive) policy. The job is wired to the agent
+    /// the way `force_runs_job_and_records_history` does, so ownership never
+    /// decides the outcome.
+    async fn command_bounded_run(
+        bound_commands: &[&str],
+        command: &str,
+    ) -> (TempDir, Arc<Config>, String, ToolResult) {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", command).unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+
+        let mut policy = SecurityPolicy::for_agent(&cfg, TEST_AGENT).expect("resolvable profiles");
+        policy.caller_command_bounds = vec![zeroclaw_config::policy::CallerCommandBound {
+            autonomy: crate::security::AutonomyLevel::Full,
+            allowed_commands: bound_commands.iter().map(|c| (*c).to_string()).collect(),
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+        }];
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&cfg.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        let tool = CronRunTool::new_with_runtime(
+            Arc::clone(&cfg),
+            Arc::new(policy),
+            TEST_AGENT,
+            runtime,
+            // `shell` is IN the ceiling, so the shell-membership check passes
+            // and only the caller's command policy can refuse.
+            Some(sealed_ceiling(&["cron_run", "shell"])),
+        );
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        // The tempdir is returned so the store outlives the run for the
+        // caller's reads.
+        (tmp, cfg, job.id, result)
+    }
+
+    #[tokio::test]
+    async fn a_bounded_run_refuses_a_stored_command_the_caller_command_policy_denies() {
+        // The job's command is one the owning agent's own policy admits, so
+        // before the fix the only gate `cron_run` applied — the owning agent's
+        // policy — let it launch. The caller allows only `ls`.
+        let (_tmp, cfg, job_id, result) = command_bounded_run(&["ls"], "echo run-now").await;
+
+        assert!(
+            !result.success,
+            "a bounded caller launched a stored command its own command policy denies: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("not allowed by security policy"),
+            "the refusal must come from the command policy, not from another gate"
+        );
+        assert!(
+            cron::list_runs(&cfg, &job_id, 10).unwrap().is_empty(),
+            "a refused launch must not record a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_run_launches_the_same_job_when_the_caller_command_policy_allows_it() {
+        // Control for the refusal above: same job, same ceiling, same tool; the
+        // caller's allowlist gains `echo`. Without it the refusal could come
+        // from any other gate.
+        let (_tmp, cfg, job_id, result) = command_bounded_run(&["echo"], "echo run-now").await;
+
+        assert!(result.success, "control: {:?}", result.error);
+        assert_eq!(cron::list_runs(&cfg, &job_id, 10).unwrap().len(), 1);
+    }
+
     struct BlockingRuntime {
         started: Arc<tokio::sync::Notify>,
     }

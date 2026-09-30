@@ -843,6 +843,22 @@ impl DelegateTool {
             if self.security.risk_profile_name == target_policy.risk_profile_name {
                 target_policy.workspace_dir = self.security.workspace_dir.clone();
             }
+
+            // Command binding: the delegation contract makes the caller's
+            // command policy authoritative for what the target may run, and
+            // "run" is wider than the turn. The target's policy also validates
+            // the shell jobs it stores for later, the command a `spawn_subagent`
+            // child runs, and everything a further hop below it runs, and none
+            // of those go through a wrapper on the target's `shell`. So the
+            // caller's command fields travel INSIDE the policy, where
+            // `validate_command_execution_for_shell` is the one place that reads
+            // them. `self.security` already carries every caller above this
+            // one (it is itself a bounded target's policy when this is a
+            // further hop), so the chain is the whole path from the root.
+            target_policy.caller_command_bounds = self.security.caller_command_bounds.clone();
+            target_policy.caller_command_bounds.push(
+                zeroclaw_config::policy::CallerCommandBound::from_caller(&self.security),
+            );
         }
 
         Ok(Arc::new(target_policy))
@@ -4348,19 +4364,10 @@ impl DelegateTool {
                                 )) as Box<dyn Tool>,
                             );
                         }
-                        // Whichever shell was built above, the caller's command
-                        // policy gates it too (see `CallerCommandPolicyShell`).
-                        if let Some(shell) = tools.remove("shell") {
-                            tools.insert(
-                                "shell".to_string(),
-                                Box::new(CallerCommandPolicyShell::new(
-                                    shell,
-                                    &self.security,
-                                    &target_policy,
-                                    runtime,
-                                )) as Box<dyn Tool>,
-                            );
-                        }
+                        // Whichever shell was built above validates commands with
+                        // `target_policy`, which carries the caller's command
+                        // bounds (see `policy_for_target`), so no separate
+                        // wrapper is needed to gate it.
                         tools
                     } else {
                         HashMap::new()
@@ -5608,113 +5615,6 @@ impl Tool for ToolArcRef {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        self.inner.execute(args).await
-    }
-}
-
-/// A bounded target's `shell`, gated first by the caller's command policy.
-///
-/// The target's own shell keeps the target's workspace, sandbox and command
-/// validation. The delegation contract makes the caller's command policy
-/// authoritative for inherited command tools, so a command must also pass the
-/// caller's command fields (`autonomy`, `allowed_commands`,
-/// `block_high_risk_commands`, `require_approval_for_medium_risk`). Those are
-/// laid over the TARGET's policy, so path arguments are still judged against
-/// the target's workspace, never the caller's. A command runs only if both
-/// policies admit it: neither side can widen the other.
-struct CallerCommandPolicyShell {
-    inner: Box<dyn Tool>,
-    command_policy: SecurityPolicy,
-    runtime: Arc<dyn crate::platform::RuntimeAdapter>,
-}
-
-impl CallerCommandPolicyShell {
-    fn new(
-        inner: Box<dyn Tool>,
-        caller: &SecurityPolicy,
-        target: &SecurityPolicy,
-        runtime: Arc<dyn crate::platform::RuntimeAdapter>,
-    ) -> Self {
-        let command_policy = SecurityPolicy {
-            autonomy: caller.autonomy,
-            allowed_commands: caller.allowed_commands.clone(),
-            block_high_risk_commands: caller.block_high_risk_commands,
-            require_approval_for_medium_risk: caller.require_approval_for_medium_risk,
-            ..target.clone()
-        };
-        Self {
-            inner,
-            command_policy,
-            runtime,
-        }
-    }
-}
-
-impl ::zeroclaw_api::attribution::Attributable for CallerCommandPolicyShell {
-    fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        self.inner.role()
-    }
-    fn alias(&self) -> &str {
-        self.inner.alias()
-    }
-    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
-        self.inner.tool_provenance()
-    }
-}
-
-#[async_trait]
-impl Tool for CallerCommandPolicyShell {
-    fn requires_unrestricted_principal(&self) -> bool {
-        self.inner.requires_unrestricted_principal()
-    }
-
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        self.inner.output_schema()
-    }
-
-    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
-        self.inner.param_domains()
-    }
-
-    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
-        self.inner.spec()
-    }
-
-    fn invocation_triggers(&self) -> Vec<String> {
-        self.inner.invocation_triggers()
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // A missing command is the inner shell's error to report.
-        if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
-            let approved = args
-                .get("approved")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if let Err(reason) = self.command_policy.validate_command_execution_for_shell(
-                command,
-                approved,
-                self.runtime.shell_dialect(),
-            ) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(reason),
-                });
-            }
-        }
         self.inner.execute(args).await
     }
 }

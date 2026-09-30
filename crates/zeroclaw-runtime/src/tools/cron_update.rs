@@ -335,6 +335,13 @@ impl Tool for CronUpdateTool {
                 }
             }
         }
+        // Read before the guard below, which judges a stored shell command with
+        // it, and by the store for a patched one.
+        let approved = args
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         // Capping the patch is not enough: a patch that leaves `allowed_tools`
         // unset widens nothing by itself, yet every other patched field is
         // applied unconditionally by `update_job_inner`, so a bounded turn could
@@ -353,11 +360,19 @@ impl Tool for CronUpdateTool {
         // A patch that can only DISABLE is exempt, matching `schedule`, which
         // guards `resume` and leaves `pause` alone: refusing it would leave a
         // bounded target unable to switch off a job it may not switch on.
+        //
+        // For a shell job the guard also re-judges the STORED command against
+        // this tool's policy, which carries the callers' command bounds: a patch
+        // that names no `command` leaves whatever the row already holds in
+        // force.
         let ceiling = self.caller_ceiling.clone();
         let bound = |job: &cron::CronJob| {
             crate::tools::caller_ceiling::require_job_within_ceiling(
                 "cron_update",
                 ceiling.as_ref(),
+                &self.security,
+                self.runtime.as_ref(),
+                approved,
                 job,
             )
         };
@@ -367,11 +382,6 @@ impl Tool for CronUpdateTool {
             } else {
                 &cron::unguarded
             };
-
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
             return Ok(blocked);

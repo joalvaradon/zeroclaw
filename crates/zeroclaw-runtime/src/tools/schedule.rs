@@ -199,7 +199,7 @@ impl Tool for ScheduleTool {
 
                         anyhow::Error::msg("Missing 'id' parameter for pause action")
                     })?;
-                Ok(self.handle_pause_resume(id, true))
+                Ok(self.handle_pause_resume(id, true, false))
             }
             "resume" => {
                 if let Some(blocked) = self.enforce_mutation_allowed(action) {
@@ -222,7 +222,14 @@ impl Tool for ScheduleTool {
 
                         anyhow::Error::msg("Missing 'id' parameter for resume action")
                     })?;
-                Ok(self.handle_pause_resume(id, false))
+                // The same `approved` the create routes read: a resume re-judges
+                // the stored command (see `handle_pause_resume`), and approval
+                // is the one input that judgement takes from the request.
+                let approved = args
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Ok(self.handle_pause_resume(id, false, approved))
             }
             other => Ok(ToolResult {
                 success: false,
@@ -574,7 +581,7 @@ impl ScheduleTool {
         }
     }
 
-    fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
+    fn handle_pause_resume(&self, id: &str, pause: bool, approved: bool) -> ToolResult {
         // Authorization travels with the write: an agent that receives or guesses
         // another agent's id must not disable or re-enable it, and a success
         // reply must not confirm that the foreign id exists.
@@ -595,6 +602,9 @@ impl ScheduleTool {
                 crate::tools::caller_ceiling::require_job_within_ceiling(
                     "schedule",
                     ceiling.as_ref(),
+                    &self.security,
+                    self.runtime.as_ref(),
+                    approved,
                     job,
                 )
             };
@@ -775,6 +785,95 @@ mod tests {
             !cron::get_job(&config, &job.id).unwrap().enabled,
             "the refusal must not have re-armed the job"
         );
+    }
+
+    /// A paused job holding a medium-risk command the owning agent stored with
+    /// approval, plus a bounded tool whose policy carries one caller bound.
+    async fn paused_medium_risk_job() -> (TempDir, Config, Arc<SecurityPolicy>, crate::cron::CronJob)
+    {
+        // Supervised, with `touch` allowed: the medium-risk approval gate is
+        // what this fixture exists to reach (`touch` is not in the default
+        // allowlist, and under the default profile nothing asks for approval).
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_test_agent_profiles(
+            tmp.path().join("workspace"),
+            tmp.path().join("config.toml"),
+            zeroclaw_config::schema::RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Supervised,
+                allowed_commands: vec!["echo".into(), "touch".into()],
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            },
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let security = Arc::new(SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap());
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch marker.txt",
+            None,
+            true,
+        )
+        .expect("the owning agent may store a medium-risk command with approval");
+        cron::pause_job_for_agent(&config, &job.id, TEST_AGENT).unwrap();
+
+        let mut policy = (*security).clone();
+        policy.caller_command_bounds =
+            vec![zeroclaw_config::policy::CallerCommandBound::from_caller(
+                &security,
+            )];
+        (tmp, config, Arc::new(policy), job)
+    }
+
+    #[tokio::test]
+    async fn a_bounded_resume_re_judges_the_stored_command_and_takes_the_request_approval() {
+        // Resume names no command, so the stored one stays in force; the bounded
+        // guard re-judges it. That judgement needs the same `approved` input the
+        // create routes and `cron_update` take from the request — otherwise a
+        // Supervised job could never be resumed from a bounded turn.
+        let (_tmp, config, security, job) = paused_medium_risk_job().await;
+        let tool = bounded_tool(&config, &security, &["schedule", "shell"]);
+
+        let refused = tool
+            .execute(json!({ "action": "resume", "id": job.id }))
+            .await
+            .unwrap();
+        assert!(!refused.success, "{refused:?}");
+        assert!(
+            refused
+                .error
+                .unwrap_or_default()
+                .contains("requires explicit approval"),
+            "the refusal must come from the command policy's approval gate"
+        );
+        assert!(!cron::get_job(&config, &job.id).unwrap().enabled);
+
+        let approved = tool
+            .execute(json!({ "action": "resume", "id": job.id, "approved": true }))
+            .await
+            .unwrap();
+        assert!(approved.success, "control: {:?}", approved.error);
+        assert!(cron::get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_resume_still_re_judges_nothing() {
+        // No ceiling in force: the same medium-risk job resumes without
+        // approval, exactly as before this guard learned to look at commands.
+        let (_tmp, config, security, job) = paused_medium_risk_job().await;
+        let tool = ScheduleTool::new((*security).clone().into(), config.clone(), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({ "action": "resume", "id": job.id }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(cron::get_job(&config, &job.id).unwrap().enabled);
     }
 
     #[tokio::test]
