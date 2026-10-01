@@ -79,6 +79,7 @@ use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
+use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -2873,11 +2874,26 @@ pub(crate) struct OwnedAgentExecution {
     /// system prompt reports the same dialect the step will execute under.
     /// `None` for a shell-less runtime.
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// Keeps the target admission alive for the cached nested execution
+    /// surface, and prevents an alias-generation change from reusing it.
+    execution_admission: Option<AgentExecutionAdmission>,
     /// The step agent's own filesystem policy, built by
     /// `assemble_owned_execution` the same way a fresh agent turn builds it.
     /// Carried so the nested sub-loop's no-vision image-marker gate applies
     /// the step agent's read ledger, never the parent's.
     security: Arc<crate::security::SecurityPolicy>,
+}
+
+impl OwnedAgentExecution {
+    fn matches_admission(&self, next: Option<&AgentExecutionAdmission>) -> bool {
+        match (self.execution_admission.as_ref(), next) {
+            (None, None) => true,
+            (Some(admission), Some(next)) => {
+                admission.alias() == next.alias() && admission.generation() == next.generation()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -2891,6 +2907,7 @@ pub(crate) struct OwnedAgentExecution {
 /// SOP so the nested step keeps its SOP tools bound to the same engine. This
 /// connects MCP servers, so the driver memoizes the result per alias across a
 /// drain and re-assembles only on an alias change.
+#[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
@@ -2900,6 +2917,42 @@ pub(crate) async fn assemble_owned_execution(
     parent_approval: Option<&crate::approval::ApprovalManager>,
     caller_allowed: Option<&[String]>,
 ) -> Result<OwnedAgentExecution> {
+    assemble_owned_execution_with_admission(
+        config,
+        live_config,
+        alias,
+        sop_engine,
+        sop_audit,
+        parent_approval,
+        caller_allowed,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn assemble_owned_execution_with_admission(
+    config: &zeroclaw_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    alias: &str,
+    sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    parent_approval: Option<&crate::approval::ApprovalManager>,
+    caller_allowed: Option<&[String]>,
+    execution_admission: Option<AgentExecutionAdmission>,
+) -> Result<OwnedAgentExecution> {
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate().map_err(|error| {
+            anyhow::Error::msg(format!(
+                "SOP authority witness rejected before nested execution assembly: {error}"
+            ))
+        })?;
+        if admission.alias() != alias {
+            anyhow::bail!(
+                "SOP authority witness targets `{}` but nested execution requested `{alias}`",
+                admission.alias()
+            );
+        }
+    }
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     // The one canonical per-agent runtime-knob surface: identity plus every
     // runtime-profile override baked in. Fail closed on an unknown alias —
@@ -2940,7 +2993,7 @@ pub(crate) async fn assemble_owned_execution(
         (None, None)
     };
 
-    let built = crate::tools::all_tools_with_runtime(
+    let built = crate::tools::all_tools_with_runtime_and_execution_capability(
         Arc::new(config.clone()),
         &security,
         &risk_profile,
@@ -2962,6 +3015,9 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         live_config,
+        execution_admission
+            .as_ref()
+            .map(AgentExecutionAdmission::capability),
         // The step agent's scheduler tools need the ceiling's VALUE, not just
         // membership in it: `caller_allowed` decides which tools this step is
         // offered, but a job it stores outlives the step entirely. Without this
@@ -3059,6 +3115,7 @@ pub(crate) async fn assemble_owned_execution(
         // Captured from the same adapter this step's tools were built with, so
         // the prompt names the shell the step will actually run under.
         shell_profile,
+        execution_admission,
         // The same policy the step's tools were built with, carried for the
         // nested sub-loop's no-vision image-marker gate.
         security,
@@ -3194,7 +3251,45 @@ async fn drive_live_sop_actions(
                     run_id,
                     step,
                     context,
+                    execution_witness,
                 } => {
+                    let managed = match queued.engine.lock() {
+                        Ok(engine) => engine.has_execution_capability(),
+                        Err(poisoned) => poisoned.into_inner().has_execution_capability(),
+                    };
+                    if managed && execution_witness.is_none() {
+                        return Err(anyhow::Error::msg(
+                            "managed SOP ExecuteStep is missing its authority witness",
+                        ));
+                    }
+                    let execution_admission = execution_witness
+                        .as_ref()
+                        .map(|witness| {
+                            let alias = step.agent.as_deref().or(agent_alias).ok_or_else(|| {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": run_id,
+                                            "step": step.number,
+                                        })
+                                    ),
+                                    "managed SOP step has no executing agent"
+                                );
+                                anyhow::Error::msg("managed SOP step has no executing agent")
+                            })?;
+                            witness.admit(alias).map_err(anyhow::Error::from)
+                        })
+                        .transpose()?;
+                    let execution_config = execution_admission
+                        .as_ref()
+                        .map(AgentExecutionAdmission::config);
                     let started_at = crate::sop::engine::now_iso8601();
                     let user_message = ChatMessage::user(context.clone());
                     history.push(user_message.clone());
@@ -3222,15 +3317,19 @@ async fn drive_live_sop_actions(
                         let alias =
                             step_alias.expect("needs_reassembly implies a step agent alias");
                         if let Some(reassembly) = sop_reassembly.as_ref() {
-                            if !exec_cache.contains_key(alias) {
-                                match assemble_owned_execution(
-                                    reassembly.config,
+                            let cache_matches = exec_cache.get(alias).is_some_and(|owned| {
+                                owned.matches_admission(execution_admission.as_ref())
+                            });
+                            if !cache_matches {
+                                match assemble_owned_execution_with_admission(
+                                    execution_config.as_deref().unwrap_or(reassembly.config),
                                     reassembly.live_config.clone(),
                                     alias,
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
                                     approval,
                                     reassembly.caller_allowed,
+                                    execution_admission.clone(),
                                 )
                                 .await
                                 {
@@ -3291,6 +3390,10 @@ async fn drive_live_sop_actions(
                         } else {
                             None
                         };
+                        let execution_config = owned
+                            .and_then(|owned| owned.execution_admission.as_ref())
+                            .map(AgentExecutionAdmission::config)
+                            .or(execution_config);
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -3343,10 +3446,14 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.max_tool_result_chars,
                                 o.agent.resolved.context_limits(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
-                                &sop_reassembly
-                                    .as_ref()
-                                    .expect("owned implies a reassembly handle")
-                                    .config
+                                &execution_config
+                                    .as_deref()
+                                    .unwrap_or(
+                                        sop_reassembly
+                                            .as_ref()
+                                            .expect("owned implies a reassembly handle")
+                                            .config,
+                                    )
                                     .pacing,
                             ),
                             None => (
@@ -3406,10 +3513,12 @@ async fn drive_live_sop_actions(
                         if let Some(o) = owned {
                             match build_owned_step_system_prompt(
                                 o,
-                                sop_reassembly
-                                    .as_ref()
-                                    .expect("owned implies a reassembly handle")
-                                    .config,
+                                execution_config.as_deref().unwrap_or(
+                                    sop_reassembly
+                                        .as_ref()
+                                        .expect("owned implies a reassembly handle")
+                                        .config,
+                                ),
                                 step_alias.expect("needs_reassembly implies a step agent alias"),
                                 &sop_excluded_tools,
                             ) {
@@ -5856,6 +5965,95 @@ mod sop_step_reassembly_tests {
         assert!(reader.approval.is_non_interactive());
     }
 
+    /// A bounded caller's ceiling has to survive the hop into a nested step
+    /// agent: the step is assembled from its OWN profile, so without the
+    /// ceiling it recovers every tool the caller's turn was refused.
+    ///
+    /// Both ends are asserted. The unbounded control proves the agent really
+    /// holds the tool the ceiling is meant to take away; without it the negative
+    /// would pass for a profile that never offered the tool at all.
+    #[tokio::test]
+    async fn assembling_a_step_agent_applies_the_callers_ceiling() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-ceiling-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "both".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string(), "file_write".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "both".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "both".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let unbounded =
+            assemble_owned_execution(&config, None, "both", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("unbounded step agent assembles");
+        let unbounded_names = tool_names(&unbounded.tools_registry);
+        assert!(
+            unbounded_names.contains(&"file_read".to_string())
+                && unbounded_names.contains(&"file_write".to_string()),
+            "control: with no ceiling the step agent holds both tools: {unbounded_names:?}"
+        );
+
+        let ceiling = vec!["file_read".to_string()];
+        let bounded = assemble_owned_execution(
+            &config,
+            None,
+            "both",
+            Arc::clone(&engine),
+            None,
+            None,
+            Some(ceiling.as_slice()),
+        )
+        .await
+        .expect("bounded step agent assembles");
+        let bounded_names = tool_names(&bounded.tools_registry);
+        assert!(
+            bounded_names.contains(&"file_read".to_string()),
+            "a tool the ceiling admits must still be offered: {bounded_names:?}"
+        );
+        assert!(
+            !bounded_names.contains(&"file_write".to_string()),
+            "a tool outside the ceiling must not be recovered: {bounded_names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn reassembled_step_file_download_observes_live_revocation() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
@@ -6799,6 +6997,7 @@ mod sop_step_reassembly_tests {
             mcp_tool_names,
             mcp_prompt_section: String::new(),
             shell_profile: None,
+            execution_admission: None,
             // Test fixture: no config-backed policy, so the default (its
             // `workspace_dir` is ".") stands in and the marker gate fails
             // closed under it.
@@ -6811,6 +7010,17 @@ mod sop_step_reassembly_tests {
     /// `ExecuteStep` action (already resolved to a cross-agent step).
     fn start_single_cross_agent_step(
         step_agent: &str,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_with_capability(Some(step_agent), None)
+    }
+
+    fn start_single_step_with_capability(
+        step_agent: Option<&str>,
+        capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     ) -> (
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
@@ -6833,7 +7043,7 @@ mod sop_step_reassembly_tests {
                 number: 1,
                 title: "delegate".to_string(),
                 body: "run".to_string(),
-                agent: Some(step_agent.to_string()),
+                agent: step_agent.map(str::to_string),
                 ..SopStep::default()
             }],
             cooldown_secs: 0,
@@ -6846,6 +7056,9 @@ mod sop_step_reassembly_tests {
             decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        if let Some(capability) = capability {
+            engine = engine.with_execution_capability(capability);
+        }
         engine.set_sops_for_test(vec![sop]);
         let event = SopEvent {
             source: SopTriggerSource::Manual,
@@ -6858,7 +7071,7 @@ mod sop_step_reassembly_tests {
             SopRunAction::ExecuteStep { run_id, step, .. } => {
                 assert_eq!(
                     step.agent.as_deref(),
-                    Some(step_agent),
+                    step_agent,
                     "the step must resolve to a cross-agent delegation"
                 );
                 run_id.clone()
@@ -6974,6 +7187,61 @@ mod sop_step_reassembly_tests {
     // ── Blocker regressions: the REAL nested loop with distinct providers ────
 
     const PARENT_MARKER: &str = "PARENT-ONLY-SECRET-7f3a";
+
+    #[tokio::test]
+    async fn managed_unnamed_live_sop_step_admits_the_executing_agent() {
+        struct AdmissionObserver(crate::live_config_authority::AgentLifecycleCoordinator);
+        impl crate::observability::Observer for AdmissionObserver {
+            fn record_event(&self, event: &crate::observability::ObserverEvent) {
+                if matches!(
+                    event,
+                    crate::observability::ObserverEvent::LlmRequest { .. }
+                ) {
+                    assert_eq!(self.0.active_turn_count("alpha"), 0);
+                    assert_eq!(self.0.active_turn_count("zeta"), 1);
+                    assert!(self.0.begin_delete("zeta").is_err());
+                }
+            }
+            fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "admission-observer"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert("alpha".into(), Default::default());
+        config.agents.insert("zeta".into(), Default::default());
+        let authority = crate::LiveConfigAuthority::new(config);
+        let lifecycle = authority.agent_lifecycle();
+        let (engine, run_id, action) =
+            start_single_step_with_capability(None, Some(authority.execution_capability()));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("test")];
+        let mut cache = std::collections::HashMap::new();
+        drive_step(
+            engine.clone(),
+            action,
+            &TextProvider,
+            &tools,
+            &AdmissionObserver(lifecycle.clone()),
+            &mut history,
+            None,
+            None,
+            None,
+            Some("zeta"),
+            None,
+            None,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+        assert!(lifecycle.begin_delete("zeta").is_ok());
+    }
 
     /// Cross-agent steps run on an isolated child transcript: the parent
     /// history (distinct provider, marker message) never reaches the child
@@ -7671,6 +7939,7 @@ mod sop_step_reassembly_tests {
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
                 shell_profile: None,
+                execution_admission: None,
                 // Test fixture: see the helper above.
                 security: Arc::new(crate::security::SecurityPolicy::default()),
             },

@@ -5,9 +5,10 @@
 //!
 //! `send_message_to_peer_tool` never received that treatment:
 //! `SendMessageToPeerTool::execute` starts the recipient's turn through
-//! `crate::agent::loop_::process_message`, which had no `allowed_tools`
-//! parameter at all, so the recipient was always assembled from its OWN full
-//! risk profile regardless of any ceiling in force on the sender's turn.
+//! `crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal`,
+//! which had no `allowed_tools` parameter at all, so the recipient was always
+//! assembled from its OWN full risk profile regardless of any ceiling in force
+//! on the sender's turn.
 //!
 //! Two production paths reach the tool with a sealed ceiling in force:
 //!
@@ -366,9 +367,9 @@ async fn drive_bounded_send_message_to_peer() -> (Option<BTreeSet<String>>, Stri
 }
 
 /// THIS TEST MUST FAIL if `send_message_to_peer_tool` stops carrying the
-/// sealed ceiling into the recipient's own turn: today `execute()` calls
-/// `process_message` with no `allowed_tools` at all, so the peer is always
-/// assembled from its own full risk profile.
+/// sealed ceiling into the recipient's own turn: if `execute()` hands
+/// `process_message_shared_with_live_config_and_admission_and_principal` no
+/// `allowed_tools`, the peer is assembled from its own full risk profile.
 #[test]
 fn a_peer_relayed_from_a_bounded_delegate_is_bound_by_the_callers_ceiling() {
     let (peer_turn, report) = drive_relay_blocking();

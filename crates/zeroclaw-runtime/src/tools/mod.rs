@@ -124,6 +124,8 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+use crate::live_config_authority::AgentExecutionCapability;
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -1710,13 +1712,15 @@ pub(crate) fn cron_run_tool(
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
+    execution_capability: Option<AgentExecutionCapability>,
 ) -> Arc<dyn Tool> {
-    Arc::new(CronRunTool::new_with_runtime(
+    Arc::new(CronRunTool::new_with_runtime_and_capability(
         config,
         security,
         agent_alias.to_string(),
         runtime,
         caller_ceiling,
+        execution_capability,
     ))
 }
 
@@ -1763,18 +1767,25 @@ pub(crate) fn schedule_tool(
 ///
 /// The ceiling has to reach here too, same reasoning as `spawn_subagent_tool`
 /// below: `execute` starts the RECIPIENT's own turn through
-/// `agent::loop_::process_message`, a fresh registry assembled from the
+/// `agent::loop_::process_message_shared_with_live_config_and_admission_and_principal`,
+/// a fresh registry assembled from the
 /// recipient's own full risk profile unless bound — a bounded sender must not
 /// be able to hand a peer's turn more than its own sealed ceiling.
 pub(crate) fn send_message_to_peer_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     agent_alias: &str,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
     Arc::new(
-        SendMessageToPeerTool::new_with_live_config(config, agent_alias.to_string(), live_config)
-            .with_caller_ceiling(caller_ceiling),
+        SendMessageToPeerTool::new_with_live_config_and_capability(
+            config,
+            agent_alias.to_string(),
+            live_config,
+            execution_capability,
+        )
+        .with_caller_ceiling(caller_ceiling),
     )
 }
 
@@ -1799,10 +1810,12 @@ pub(crate) fn spawn_subagent_tool(
     security: Arc<SecurityPolicy>,
     is_subagent_caller: bool,
     caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
+    execution_capability: Option<AgentExecutionCapability>,
 ) -> Arc<dyn Tool> {
     Arc::new(
         SpawnSubagentTool::new(config, agent_alias.to_string(), security)
             .with_caller_ceiling(caller_ceiling)
+            .with_execution_capability(execution_capability)
             .with_subagent_caller(is_subagent_caller),
     )
 }
@@ -2627,13 +2640,13 @@ pub fn all_tools_with_runtime(
     )
 }
 
-/// Create the full tool registry with an optional ACP session read view.
+/// Build the registry on its dedicated stack with lifecycle and ACP context.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
-pub fn all_tools_with_runtime_and_acp_sessions(
+pub(crate) fn all_tools_with_runtime_context(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
@@ -2658,6 +2671,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
     // The per-run caller ceiling, when this registry is being built for a loop
     // that has one. A per-run context fact the tools themselves need, in the
@@ -2711,6 +2725,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
             sop_engine,
             sop_audit,
             live_config,
+            execution_capability,
             acp_sessions,
             caller_ceiling,
         )
@@ -2735,8 +2750,133 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     })
 }
 
-/// Registry build body; runs on the dedicated builder thread spawned by
-/// [`all_tools_with_runtime`].
+/// Create the full tool registry with an optional ACP session read view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_acp_sessions(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<ForwardedEnvironment>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
+    // Forwarded to `all_tools_with_runtime_context`: the per-run caller ceiling
+    // the scheduler / `spawn_subagent` / `send_message_to_peer` tools carry.
+    // `None` when this registry has no caller above it.
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
+) -> anyhow::Result<AllToolsResult> {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+        acp_sessions,
+        caller_ceiling,
+    )
+}
+
+/// Create the managed registry while carrying the authority-backed execution
+/// capability into tools that can start work for another target alias.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_execution_capability(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
+    // See the doc-comment on this parameter on `all_tools_with_runtime_context`.
+    caller_ceiling: Option<caller_ceiling::CallerCeiling>,
+) -> anyhow::Result<AllToolsResult> {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env.map(Arc::new),
+        sop_engine,
+        sop_audit,
+        live_config,
+        execution_capability,
+        None,
+        caller_ceiling,
+    )
+}
+
+/// Registry build body; runs on the dedicated builder thread.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -2763,10 +2903,8 @@ fn all_tools_with_runtime_on_thread(
     tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    // Live config handle for `send_via` peer-group authority. `Some` from the
-    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
-    // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
     // See the doc-comment on this same parameter on
     // `all_tools_with_runtime_and_acp_sessions`, which forwards it here
@@ -2865,6 +3003,7 @@ fn all_tools_with_runtime_on_thread(
             agent_alias,
             runtime.clone(),
             caller_ceiling.clone(),
+            execution_capability.clone(),
         ),
         cron_runs_tool(config.clone(), agent_alias),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -2897,26 +3036,22 @@ fn all_tools_with_runtime_on_thread(
             // bounded chain can persist and then hand the replay an uncapped way
             // to spawn out of it.
             caller_ceiling.clone(),
+            execution_capability.clone(),
         ),
         send_message_to_peer_tool(
             config.clone(),
             agent_alias,
             live_config.clone(),
+            execution_capability.clone(),
             caller_ceiling.clone(),
         ),
         model_routing_config_tool(security.clone(), config.clone()),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         proxy_config_tool(security.clone(), config.clone()),
-        // master added a sandboxed command boundary here
-        // (`new_with_command_boundary`); adopted rather than reverted to the
-        // plain `git_operations_tool` factory. NOT threaded into
-        // `delegate.rs`'s `Bounded` rebuild, which still calls the plain
-        // factory (`delegate.rs:3774`, "rebuilt via the SAME per-tool
-        // factories... so this can't drift from the real construction path
-        // either") — that comment's own invariant is what master's inline
-        // change here now breaks for this one tool. Declared, not fixed:
-        // out of scope for this caller-ceiling fix, no context on the
-        // sandbox/command-boundary design to change it safely mid-merge.
+        // Sandboxed command boundary. A `Bounded` delegate target rebuilds this
+        // tool through `git_operations_tool` (`delegate.rs`'s
+        // `rebuild_target_git_operations_tool`), which builds the same boundary
+        // from the TARGET's own sandbox and runtime kind.
         Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
             Arc::new(RuntimeGitCommandBoundary {
@@ -3528,6 +3663,7 @@ fn all_tools_with_runtime_on_thread(
             ask_user: ask_user_handle.as_ref().cloned(),
             escalate: escalate_handle.as_ref().cloned(),
         })
+        .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
