@@ -89,3 +89,46 @@ test('known limit: a repeated prompt is lost when the local copy was truncated b
   ];
   assert.deepEqual(uncommittedLocalTail(committed, local), []);
 });
+
+const tool = (content: string): HydrationBubble => ({
+  role: 'agent',
+  content,
+  toolCall: { name: 'search' },
+});
+
+test('every pending prompt is kept, with the tool bubbles between them', () => {
+  // A reload mid-turn, then a second prompt queued behind the first one, then
+  // another reload before either commits: nothing the browser showed may go.
+  const local = [user('first', true), tool('tool-1'), user('second', true)];
+  assert.deepEqual(uncommittedLocalTail([], local), local);
+});
+
+test('an earlier prompt the snapshot already holds is not brought back with the pending one', () => {
+  const local = [user('first', true), user('second', true)];
+  assert.deepEqual(uncommittedLocalTail([stamp('first')], local), [user('second', true)]);
+  // Same text twice: the first occurrence is the committed one.
+  const repeated = [user('continue', true), user('continue', true)];
+  assert.deepEqual(uncommittedLocalTail([stamp('continue')], repeated), [user('continue', true)]);
+  assert.deepEqual(uncommittedLocalTail([], repeated), repeated);
+});
+
+test('answered turns are not brought back with a pending prompt', () => {
+  const local = [
+    user('one', true), agent('a1'),
+    user('two', true), agent('a2'),
+    user('three', true), agent('a3'),
+  ];
+  assert.deepEqual(uncommittedLocalTail([], local), [user('three', true), agent('a3')]);
+});
+
+test('a prompt that begins with the runtime prefix is compared verbatim while it is still local', () => {
+  // The user typed the prefix themselves; the gateway then put its own in front.
+  const typed = '[CURRENT DATE & TIME: 2000-01-01 00:00:00 UTC] hello';
+  assert.deepEqual(uncommittedLocalTail([stamp(typed)], [user(typed, true), agent('done')]), []);
+  assert.deepEqual(uncommittedLocalTail([], [user(typed, true)]), [user(typed, true)]);
+  // Once rebuilt from the server the row is no longer local and carries the gateway prefix.
+  assert.deepEqual(
+    uncommittedLocalTail([stamp(typed)], [user(stamp(typed)), agent('done'), user('next', true)]),
+    [user('next', true)],
+  );
+});

@@ -1202,3 +1202,77 @@ test('reloading twice while the same detached turn is still running keeps the pr
     await unmount(mounted.renderer);
   }
 });
+
+test('a second prompt queued behind a running turn does not displace the first one on the next reload', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('first'); });
+  await settle();
+  await unmount(first.renderer);
+
+  // After the reload the composer is usable, so a follow-up can be sent while the
+  // first turn is still running; the gateway queues it behind that turn.
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  await act(async () => { second.context().sendMessage('second'); });
+  await settle();
+  await unmount(second.renderer);
+
+  // Neither prompt is committed yet when the page is reloaded again.
+  const runtime3 = new FakeSessionRuntime();
+  runtime3.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const third = await mountChat(runtime3, false);
+  await openSocket(runtime3, 0);
+  await settle();
+
+  assert.deepEqual(third.context().messages.map((m) => m.content), ['first', 'second']);
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('first'),
+    'the browser copy must keep the first prompt too',
+  );
+  await unmount(third.renderer);
+});
+
+test('known limit: a conversation deleted elsewhere keeps its last exchange in this browser', async () => {
+  // The gateway answers 200 with no messages both for a turn it has not committed
+  // yet and for a session that no longer exists, so the client cannot tell them
+  // apart (`GET /state` can, but this path does not consult it). Only the last
+  // exchange comes back, never the whole cached chat. Pinned so it is not changed
+  // by accident.
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('one'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer one' });
+  });
+  await settle();
+  await act(async () => { first.context().sendMessage('two'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer two' });
+  });
+  await settle();
+  assert.deepEqual(
+    first.context().messages.map((m) => m.content),
+    ['one', 'answer one', 'two', 'answer two'],
+  );
+  await unmount(first.renderer);
+
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  assert.deepEqual(second.context().messages.map((m) => m.content), ['two', 'answer two']);
+  await unmount(second.renderer);
+});
