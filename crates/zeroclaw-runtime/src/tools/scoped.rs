@@ -217,8 +217,8 @@ pub struct ScopedAssembled {
     /// them through `tool_search`: the policy-admitted stubs, and only when
     /// `tool_search` itself survived assembly. They are not in [`Self::registry`]
     /// (they live in `activated_handle`'s set after activation), so a ceiling sealed
-    /// from the registry alone would drop them; see
-    /// [`crate::tools::caller_ceiling::seal_to_registry`]. Empty in eager mode.
+    /// from the registry alone would drop them; see `seal_to_registry` in
+    /// `tools/caller_ceiling.rs` (crate-private, so not linked). Empty in eager mode.
     pub deferred_mcp_tool_names: Vec<String>,
 }
 
