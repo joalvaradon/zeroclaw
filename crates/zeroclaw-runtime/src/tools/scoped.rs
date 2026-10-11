@@ -213,6 +213,13 @@ pub struct ScopedAssembled {
     /// The same search instance exposed in the registry, for session narrowing.
     pub tool_search_handle: Option<Arc<tools::ToolSearchTool>>,
     pub mcp_tool_names: HashSet<String>,
+    /// Prefixed names of the deferred MCP tools this turn may CALL once it activates
+    /// them through `tool_search`: the policy-admitted stubs, and only when
+    /// `tool_search` itself survived assembly. They are not in [`Self::registry`]
+    /// (they live in `activated_handle`'s set after activation), so a ceiling sealed
+    /// from the registry alone would drop them; see
+    /// [`crate::tools::caller_ceiling::seal_to_registry`]. Empty in eager mode.
+    pub deferred_mcp_tool_names: Vec<String>,
 }
 
 impl ScopedAssembled {
@@ -376,6 +383,7 @@ impl ScopedToolRegistry {
         // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
+        let mut deferred_mcp_tool_names: Vec<String> = Vec::new();
 
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
@@ -574,6 +582,18 @@ impl ScopedToolRegistry {
                             mcp_policy.as_ref(),
                             &preactivated_names,
                         );
+                        // What this turn may call once it activates it: the
+                        // policy-admitted stubs. Taken before the set is moved into
+                        // the search tool; the final gate below keeps it only when
+                        // `tool_search` survives assembly.
+                        deferred_mcp_tool_names = filtered_deferred
+                            .stubs
+                            .iter()
+                            .filter(|stub| {
+                                eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref())
+                            })
+                            .map(|stub| stub.prefixed_name.clone())
+                            .collect();
                         let mut tool_search =
                             tools::ToolSearchTool::new(filtered_deferred, activated);
                         if let Some(mut policy) = mcp_policy {
@@ -735,6 +755,15 @@ impl ScopedToolRegistry {
             deferred_section.clear();
         }
 
+        // Deferred tools are callable only through `tool_search`; if the caller's set
+        // or an exclusion removed it above, none of them is.
+        if !tools_registry
+            .iter()
+            .any(|tool| tool.name() == "tool_search")
+        {
+            deferred_mcp_tool_names.clear();
+        }
+
         ScopedAssembled {
             registry: ScopedToolRegistry(tools_registry),
             delegate_handle,
@@ -749,6 +778,7 @@ impl ScopedToolRegistry {
             activated_handle,
             tool_search_handle,
             mcp_tool_names,
+            deferred_mcp_tool_names,
         }
     }
 }
@@ -1763,6 +1793,119 @@ mod tests {
         );
     }
 
+    /// A turn bounded by `caller_allowed` that defers its MCP tools. The ceiling
+    /// sealed for later work (jobs, children, peer relays) must be able to name
+    /// the deferred tools the turn may activate; they are not in the registry.
+    /// Broken state this pins: they were dropped, so a valid tool disappeared from
+    /// every job and child the turn created.
+    #[tokio::test]
+    async fn deferred_mcp_tools_the_turn_may_activate_are_reported_for_the_ceiling() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let server = mock_mcp_http_server_with_tools(&[
+            ("allowed", "Allowed tool"),
+            ("denied", "Denied tool"),
+        ])
+        .await;
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "test-srv".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "test-bundle".into(),
+            McpBundleConfig {
+                servers: vec!["test-srv".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: vec!["test-bundle".into()],
+                ..Default::default()
+            },
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            excluded_tools: Some(vec!["test-srv__denied".into()]),
+            ..SecurityPolicy::default()
+        });
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("test-agent"))
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+
+        let assemble = |caller_allowed: Vec<String>| {
+            let config = &config;
+            let security = &security;
+            let registry = Arc::clone(&registry);
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ScopedToolRegistry::assemble(ScopedAssembly {
+                        config,
+                        agent_alias: "test-agent",
+                        security,
+                        built: built_with(Vec::new()),
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: Some(caller_allowed.as_slice()),
+                        connect_mcp: true,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: Some(registry),
+                    }),
+                )
+                .await
+                .expect("assemble must not hang")
+            }
+        };
+
+        // The caller names the allowed tool, the denied one, and `tool_search`.
+        // Only the admitted stub is reported; the denied one never is.
+        let out = assemble(vec![
+            "test-srv__allowed".into(),
+            "test-srv__denied".into(),
+            "tool_search".into(),
+        ])
+        .await;
+        assert_eq!(
+            out.deferred_mcp_tool_names,
+            vec!["test-srv__allowed".to_string()],
+            "the admitted deferred tool, and only it, must be reported"
+        );
+
+        // Without `tool_search` in the caller's set the turn cannot activate
+        // anything, so nothing deferred is callable and nothing is reported.
+        let out = assemble(vec!["test-srv__allowed".into()]).await;
+        assert!(
+            out.registry.iter().all(|tool| tool.name() != "tool_search"),
+            "the fixture must really have dropped tool_search"
+        );
+        assert!(
+            out.deferred_mcp_tool_names.is_empty(),
+            "no tool_search means no activatable tool: {:?}",
+            out.deferred_mcp_tool_names
+        );
+    }
+
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
             registry: ScopedToolRegistry(Vec::new()),
@@ -1778,6 +1921,7 @@ mod tests {
             activated_handle: None,
             tool_search_handle: None,
             mcp_tool_names: HashSet::new(),
+            deferred_mcp_tool_names: Vec::new(),
         }
     }
 

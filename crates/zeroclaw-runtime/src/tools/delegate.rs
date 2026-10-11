@@ -24052,6 +24052,69 @@ command = "rm independent-delegate-marker"
         );
     }
 
+    /// Deferred MCP loading and a bounded target. A deferred MCP tool the caller
+    /// ALREADY activated sits in the caller's parent set as a plain MCP wrapper
+    /// (the activation hook pushes it there), so a target granted its server gets
+    /// it - and the ceiling is sealed from the registry the target receives, so
+    /// it is in the ceiling too. `tool_search` is never in that parent set and is
+    /// not classified for reuse, so the target cannot activate anything further:
+    /// the ceiling describes exactly what the target can call.
+    ///
+    /// Pins the contrast with `ScopedToolRegistry::assemble`, where the deferred
+    /// tools are NOT in the registry and have to be reported separately
+    /// (`deferred_mcp_tool_names`); the bounded assembly never has that gap.
+    #[tokio::test]
+    async fn bounded_target_gets_an_already_activated_deferred_mcp_tool_and_no_tool_search() {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig};
+
+        let tmp = TempDir::new().unwrap();
+        // The caller's own allow-list must name both tools: the bounded set is
+        // drawn from what the CALLER's policy admits, so an MCP tool it does not
+        // list never reaches the rebuild at all.
+        let mut config =
+            (*bounded_reuse_config(&["tool_search", "srv__do_thing"], false, &tmp)).clone();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "srv".to_string(),
+            ..McpServerConfig::default()
+        }];
+        config.mcp_bundles.insert(
+            "srv_bundle".to_string(),
+            McpBundleConfig {
+                servers: vec!["srv".to_string()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .agents
+            .get_mut("target")
+            .expect("target agent exists")
+            .mcp_bundles = vec!["srv_bundle".to_string()];
+        let config = Arc::new(config);
+
+        let names = bounded_offered_tool_names(
+            &config,
+            "target",
+            vec![
+                mcp_fixture_tool("srv", "do_thing"),
+                Arc::new(NamedFixtureTool("tool_search")),
+            ],
+        )
+        .await;
+
+        assert!(
+            names.iter().any(|n| n == "srv__do_thing"),
+            "an MCP tool the caller already activated must reach a target granted \
+             its server, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "tool_search"),
+            "the target must not receive tool_search, or it could activate tools \
+             the sealed ceiling does not name, got {names:?}"
+        );
+    }
+
     /// Sharing a risk profile is NOT a reason to hand over caller instances.
     ///
     /// Two same-profile agents still have different aliases, and the

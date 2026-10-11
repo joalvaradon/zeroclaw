@@ -87,7 +87,8 @@ pub(crate) fn pending_for_turn(incoming: Option<&[String]>) -> Option<CallerCeil
 }
 
 /// Seal a turn's ceiling to what the turn ACTUALLY holds: the names of its
-/// assembled `registry` that the caller's `incoming` allowlist also names.
+/// assembled `registry`, plus the deferred MCP tools it may activate, that the
+/// caller's `incoming` allowlist also names.
 ///
 /// The incoming list is what the CALLER could use. The recipient's own policy
 /// (and anything else the assembly subtracts) removes tools from the turn after
@@ -102,16 +103,27 @@ pub(crate) fn seal_to_registry(
     handle: Option<&CallerCeiling>,
     incoming: Option<&[String]>,
     registry: &[Box<dyn zeroclaw_api::tool::Tool>],
+    deferred: &[String],
 ) {
     let (Some(handle), Some(incoming)) = (handle, incoming) else {
         return;
     };
-    let effective = registry
+    // `deferred` are the MCP tools the turn can call after activating them through
+    // `tool_search`: they are not in `registry` yet, but they are part of what the
+    // turn holds, so leaving them out would silently strip valid tools from every
+    // job, child and relay it creates.
+    let mut effective: Vec<String> = Vec::new();
+    for name in registry
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| incoming.iter().any(|allowed| allowed == name))
-        .map(str::to_string)
-        .collect();
+        .chain(deferred.iter().map(String::as_str))
+    {
+        if incoming.iter().any(|allowed| allowed == name)
+            && !effective.iter().any(|seen| seen == name)
+        {
+            effective.push(name.to_string());
+        }
+    }
     let _ = handle.set(effective);
 }
 
@@ -347,7 +359,7 @@ mod tests {
         assert!(handle.get().is_none(), "the handle starts unsealed");
 
         let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
-        seal_to_registry(Some(&handle), Some(&incoming), &registry);
+        seal_to_registry(Some(&handle), Some(&incoming), &registry, &[]);
 
         assert_eq!(
             handle.get().map(Vec::as_slice),
@@ -365,8 +377,47 @@ mod tests {
         let incoming = vec!["shell".to_string()];
         let handle = pending_for_turn(Some(&incoming)).unwrap();
         let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
-        seal_to_registry(Some(&handle), Some(&incoming), &registry);
+        seal_to_registry(Some(&handle), Some(&incoming), &registry, &[]);
         assert_eq!(handle.get().map(Vec::len), Some(0));
+    }
+
+    /// Broken state this pins: a deferred MCP tool the caller named is callable by the
+    /// turn (it activates it through `tool_search`) but is not in the registry, so
+    /// sealing from the registry alone dropped it from every job and child.
+    #[test]
+    fn an_allowed_deferred_tool_is_sealed_though_it_is_not_in_the_registry() {
+        let incoming = vec!["calculator".to_string(), "srv__do".to_string()];
+        let handle = pending_for_turn(Some(&incoming)).unwrap();
+        let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
+        seal_to_registry(
+            Some(&handle),
+            Some(&incoming),
+            &registry,
+            &["srv__do".to_string()],
+        );
+        assert_eq!(
+            handle.get().map(Vec::as_slice),
+            Some(&["calculator".to_string(), "srv__do".to_string()][..])
+        );
+    }
+
+    /// The other half: a deferred name the caller did NOT name stays out, so the
+    /// sealed set is still a subset of the caller's bound.
+    #[test]
+    fn a_deferred_tool_the_caller_did_not_name_is_not_sealed_in() {
+        let incoming = vec!["calculator".to_string()];
+        let handle = pending_for_turn(Some(&incoming)).unwrap();
+        let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
+        seal_to_registry(
+            Some(&handle),
+            Some(&incoming),
+            &registry,
+            &["srv__do".to_string()],
+        );
+        assert_eq!(
+            handle.get().map(Vec::as_slice),
+            Some(&["calculator".to_string()][..])
+        );
     }
 
     /// Control: without an allowlist there is no bound, and sealing is a no-op.
@@ -374,7 +425,7 @@ mod tests {
     fn a_turn_without_an_allowlist_has_no_handle() {
         assert!(pending_for_turn(None).is_none());
         let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
-        seal_to_registry(None, None, &registry);
+        seal_to_registry(None, None, &registry, &[]);
     }
 
     fn names(list: &Option<Vec<String>>) -> Vec<&str> {

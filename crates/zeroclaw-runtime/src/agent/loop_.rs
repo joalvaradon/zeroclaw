@@ -1696,6 +1696,7 @@ pub async fn run(
             channel_room_handle,
             activated_handle,
             mcp_tool_names,
+            deferred_mcp_tool_names,
             ..
         } = assembled;
         // Keep the sealed registry sealed: the engine's `ResolvedIo.tools_registry`
@@ -1706,6 +1707,7 @@ pub async fn run(
             turn_ceiling.as_ref(),
             allowed_tools.as_deref(),
             &tools_registry,
+            &deferred_mcp_tool_names,
         );
 
         // Populate all channel-driven tool handles from the registered factory.
@@ -3680,6 +3682,7 @@ async fn process_message_inner(
             channel_room_handle,
             activated_handle: activated_handle_pm,
             mcp_tool_names: mcp_tool_names_pm,
+            deferred_mcp_tool_names,
             ..
         } = assembled;
         // Stays sealed: `agent_turn_with_sop_reassembly` now takes
@@ -3689,6 +3692,7 @@ async fn process_message_inner(
             turn_ceiling.as_ref(),
             allowed_tools.as_deref(),
             &tools_registry,
+            &deferred_mcp_tool_names,
         );
 
         // Populate all channel-driven tool handles from the registered factory.
