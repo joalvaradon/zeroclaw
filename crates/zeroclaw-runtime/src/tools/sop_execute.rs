@@ -205,21 +205,20 @@ impl Tool for SopExecuteTool {
                                     ),
                                     "bounded sop_execute: parked run could not be cancelled"
                                 );
-                                refusal = Some(format!(
-                                    "sop_execute: refused — SOP '{sop_name}' left outside this \
-                                     turn (parked or pending on a dependency), which a bounded \
-                                     caller's tool ceiling cannot follow past this turn; run \
-                                     {run_id} could NOT be cancelled ({e}) and may still be \
-                                     active - treat it as unresolved, not closed"
+                                refusal = Some(crate::i18n::get_required_cli_string_with_args(
+                                    "bounded-ceiling-sop-execute-uncancelled",
+                                    &[
+                                        ("sop", sop_name),
+                                        ("run", run_id.as_str()),
+                                        ("error", e.to_string().as_str()),
+                                    ],
                                 ));
                             }
                             Ok(_) => {
                                 cancelled_run = engine.get_run(&run_id).cloned();
-                                refusal = Some(format!(
-                                    "sop_execute: refused — SOP '{sop_name}' left outside this turn \
-                                     (parked or pending on a dependency), which a bounded caller's \
-                                     tool ceiling cannot follow past this turn; run {run_id} has \
-                                     been cancelled"
+                                refusal = Some(crate::i18n::get_required_cli_string_with_args(
+                                    "bounded-ceiling-sop-execute-cancelled",
+                                    &[("sop", sop_name), ("run", run_id.as_str())],
                                 ));
                             }
                         }

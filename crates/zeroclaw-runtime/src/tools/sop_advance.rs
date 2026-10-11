@@ -237,21 +237,19 @@ impl Tool for SopAdvanceTool {
                                     ),
                                     "bounded sop_advance: parked run could not be cancelled"
                                 );
-                                refusal = Some(format!(
-                                    "sop_advance: refused — run {parked_id} left outside this \
-                                     turn (parked or pending on a dependency), which a bounded \
-                                     caller's tool ceiling cannot follow past this turn; the run \
-                                     could NOT be cancelled ({e}) and may still be active - \
-                                     treat it as unresolved, not closed"
+                                refusal = Some(crate::i18n::get_required_cli_string_with_args(
+                                    "bounded-ceiling-sop-advance-uncancelled",
+                                    &[
+                                        ("run", parked_id.as_str()),
+                                        ("error", e.to_string().as_str()),
+                                    ],
                                 ));
                             }
                             Ok(_) => {
                                 cancelled_run = engine.get_run(&parked_id).cloned();
-                                refusal = Some(format!(
-                                    "sop_advance: refused — run {parked_id} left outside this turn \
-                                     (parked or pending on a dependency), which a bounded caller's \
-                                     tool ceiling cannot follow past this turn; the run has been \
-                                     cancelled"
+                                refusal = Some(crate::i18n::get_required_cli_string_with_args(
+                                    "bounded-ceiling-sop-advance-cancelled",
+                                    &[("run", parked_id.as_str())],
                                 ));
                             }
                         }

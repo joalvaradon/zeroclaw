@@ -137,10 +137,9 @@ fn sealed<'a>(
         None => Ok(None),
         Some(handle) => match handle.get() {
             Some(list) => Ok(Some(list.as_slice())),
-            None => Err(format!(
-                "{tool}: refused — this tool was registered under bounded delegation \
-                 but the caller's tool ceiling was never sealed, so the job's tool \
-                 set cannot be bounded"
+            None => Err(crate::i18n::get_required_cli_string_with_args(
+                "bounded-ceiling-unsealed",
+                &[("tool", tool)],
             )),
         },
     }
@@ -172,9 +171,9 @@ pub(crate) fn cap_stored_allowed_tools(
         None => ceiling.to_vec(),
     };
     if capped.is_empty() {
-        return Err(format!(
-            "{tool}: refused — no requested tool survives the calling agent's bounded \
-             tool ceiling, and an empty allowed_tools is stored as unrestricted"
+        return Err(crate::i18n::get_required_cli_string_with_args(
+            "bounded-ceiling-no-tool-survives",
+            &[("tool", tool)],
         ));
     }
     refuse_deferred_shell(tool, &capped)?;
@@ -197,10 +196,9 @@ pub(crate) fn cap_stored_allowed_tools(
 /// the tools it wants, without `shell`.
 fn refuse_deferred_shell(tool: &str, stored: &[String]) -> Result<(), String> {
     if stored.iter().any(|name| name == SHELL_TOOL_NAME) {
-        return Err(format!(
-            "{tool}: refused — this agent job would keep '{SHELL_TOOL_NAME}', and a deferred \
-             agent later runs it under the owning agent's command policy alone, without the \
-             calling agent's; list the tools the job needs without '{SHELL_TOOL_NAME}'"
+        return Err(crate::i18n::get_required_cli_string_with_args(
+            "bounded-ceiling-deferred-shell",
+            &[("tool", tool), ("shell", SHELL_TOOL_NAME)],
         ));
     }
     Ok(())
@@ -222,10 +220,9 @@ pub(crate) fn require_within_ceiling(
         return Ok(());
     };
     let Some(stored) = stored else {
-        return Err(format!(
-            "{tool}: refused — this job stores no allowed_tools, so it would run with \
-             the owning agent's full registry, outside the calling agent's bounded \
-             tool ceiling"
+        return Err(crate::i18n::get_required_cli_string_with_args(
+            "bounded-ceiling-job-unrestricted",
+            &[("tool", tool)],
         ));
     };
     let outside: Vec<&str> = stored
@@ -234,10 +231,9 @@ pub(crate) fn require_within_ceiling(
         .map(String::as_str)
         .collect();
     if !outside.is_empty() {
-        return Err(format!(
-            "{tool}: refused — this job's stored allowed_tools reach beyond the calling \
-             agent's bounded tool ceiling ({})",
-            outside.join(", ")
+        return Err(crate::i18n::get_required_cli_string_with_args(
+            "bounded-ceiling-job-beyond",
+            &[("tool", tool), ("outside", outside.join(", ").as_str())],
         ));
     }
     // Within the ceiling is not enough for `shell`: the launch or re-arm would
@@ -273,10 +269,9 @@ pub(crate) fn require_shell_within_ceiling(
     if ceiling.iter().any(|allowed| allowed == SHELL_TOOL_NAME) {
         return Ok(());
     }
-    Err(format!(
-        "{tool}: refused — this stores or re-arms a shell job, whose command the \
-         scheduler later runs under the owning agent's policy, and 'shell' is \
-         outside the calling agent's bounded tool ceiling"
+    Err(crate::i18n::get_required_cli_string_with_args(
+        "bounded-ceiling-shell-job",
+        &[("tool", tool)],
     ))
 }
 
@@ -317,7 +312,12 @@ pub(crate) fn require_job_within_ceiling(
                     &job.command,
                     approved,
                 )
-                .map_err(|reason| format!("{tool}: refused — {reason}"))?;
+                .map_err(|reason| {
+                    crate::i18n::get_required_cli_string_with_args(
+                        "bounded-ceiling-refused-reason",
+                        &[("tool", tool), ("reason", reason.to_string().as_str())],
+                    )
+                })?;
             }
             Ok(())
         }

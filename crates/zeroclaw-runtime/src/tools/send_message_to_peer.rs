@@ -273,12 +273,9 @@ impl Tool for SendMessageToPeerTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some(
-                                "send_message_to_peer: refused — a delegated caller \
-                                 ceiling was declared but never published, so the \
-                                 recipient's turn cannot be bounded"
-                                    .into(),
-                            ),
+                            error: Some(crate::i18n::get_required_cli_string(
+                                "bounded-ceiling-peer-unpublished",
+                            )),
                         });
                     }
                 },

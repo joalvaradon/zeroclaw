@@ -270,11 +270,9 @@ impl Tool for BoundedSopApproveDenied {
         Ok(ToolResult {
             success: false,
             output: ToolOutput::default(),
-            error: Some(
-                "sop_approve is not available to a bounded delegate target: approval \
-                 authority belongs to the calling agent's identity, not the target's."
-                    .to_string(),
-            ),
+            error: Some(crate::i18n::get_required_cli_string(
+                "bounded-ceiling-sop-approve-denied",
+            )),
         })
     }
 }

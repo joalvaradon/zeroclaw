@@ -8380,6 +8380,178 @@ permissions = ["http_client"]
         );
     }
 
+    /// What each bounded-ceiling refusal renders to, key by key. These are the exact
+    /// English strings the tools returned before they moved into the catalog, so the
+    /// move cannot have changed a word the model or an operator reads.
+    #[test]
+    fn bounded_ceiling_refusals_come_from_the_english_catalog_with_their_wording_pinned() {
+        type Message = (
+            &'static str,
+            &'static [(&'static str, &'static str)],
+            &'static str,
+        );
+        const MESSAGES: &[Message] = &[
+            (
+                "bounded-ceiling-unsealed",
+                &[("tool", "cron_add")],
+                "cron_add: refused — this tool was registered under bounded delegation but the \
+                 caller's tool ceiling was never sealed, so the job's tool set cannot be bounded",
+            ),
+            (
+                "bounded-ceiling-no-tool-survives",
+                &[("tool", "cron_add")],
+                "cron_add: refused — no requested tool survives the calling agent's bounded tool \
+                 ceiling, and an empty allowed_tools is stored as unrestricted",
+            ),
+            (
+                "bounded-ceiling-deferred-shell",
+                &[("tool", "cron_add"), ("shell", "shell")],
+                "cron_add: refused — this agent job would keep 'shell', and a deferred agent \
+                 later runs it under the owning agent's command policy alone, without the \
+                 calling agent's; list the tools the job needs without 'shell'",
+            ),
+            (
+                "bounded-ceiling-job-unrestricted",
+                &[("tool", "cron_run")],
+                "cron_run: refused — this job stores no allowed_tools, so it would run with the \
+                 owning agent's full registry, outside the calling agent's bounded tool ceiling",
+            ),
+            (
+                "bounded-ceiling-job-beyond",
+                &[("tool", "cron_run"), ("outside", "file_write, shell")],
+                "cron_run: refused — this job's stored allowed_tools reach beyond the calling \
+                 agent's bounded tool ceiling (file_write, shell)",
+            ),
+            (
+                "bounded-ceiling-shell-job",
+                &[("tool", "schedule")],
+                "schedule: refused — this stores or re-arms a shell job, whose command the \
+                 scheduler later runs under the owning agent's policy, and 'shell' is outside \
+                 the calling agent's bounded tool ceiling",
+            ),
+            (
+                "bounded-ceiling-refused-reason",
+                &[("tool", "cron_update"), ("reason", "command not allowed")],
+                "cron_update: refused — command not allowed",
+            ),
+            (
+                "bounded-ceiling-sop-workshop-action",
+                &[("action", "apply")],
+                "sop_workshop `apply` is not available under a caller tool ceiling: it persists \
+                 a proposal or SOP definition that runs later, outside that ceiling. `list` and \
+                 `inspect` remain available.",
+            ),
+            (
+                "bounded-ceiling-sop-execute-uncancelled",
+                &[("sop", "deploy"), ("run", "run-1"), ("error", "store down")],
+                "sop_execute: refused — SOP 'deploy' left outside this turn (parked or pending \
+                 on a dependency), which a bounded caller's tool ceiling cannot follow past this \
+                 turn; run run-1 could NOT be cancelled (store down) and may still be active - \
+                 treat it as unresolved, not closed",
+            ),
+            (
+                "bounded-ceiling-sop-execute-cancelled",
+                &[("sop", "deploy"), ("run", "run-1")],
+                "sop_execute: refused — SOP 'deploy' left outside this turn (parked or pending \
+                 on a dependency), which a bounded caller's tool ceiling cannot follow past this \
+                 turn; run run-1 has been cancelled",
+            ),
+            (
+                "bounded-ceiling-sop-advance-uncancelled",
+                &[("run", "run-1"), ("error", "store down")],
+                "sop_advance: refused — run run-1 left outside this turn (parked or pending on a \
+                 dependency), which a bounded caller's tool ceiling cannot follow past this \
+                 turn; the run could NOT be cancelled (store down) and may still be active - \
+                 treat it as unresolved, not closed",
+            ),
+            (
+                "bounded-ceiling-sop-advance-cancelled",
+                &[("run", "run-1")],
+                "sop_advance: refused — run run-1 left outside this turn (parked or pending on a \
+                 dependency), which a bounded caller's tool ceiling cannot follow past this \
+                 turn; the run has been cancelled",
+            ),
+            (
+                "bounded-ceiling-sop-approve-denied",
+                &[],
+                "sop_approve is not available to a bounded delegate target: approval authority \
+                 belongs to the calling agent's identity, not the target's.",
+            ),
+            (
+                "bounded-ceiling-peer-unpublished",
+                &[],
+                "send_message_to_peer: refused — a delegated caller ceiling was declared but \
+                 never published, so the recipient's turn cannot be bounded",
+            ),
+            (
+                "bounded-ceiling-spawn-unpublished",
+                &[],
+                "spawn_subagent: refused — a delegated caller ceiling was declared but never \
+                 published, so the child cannot be bounded",
+            ),
+        ];
+
+        for (key, args, expected) in MESSAGES {
+            let rendered = crate::i18n::get_cli_string_with_args(key, args)
+                .unwrap_or_else(|| panic!("`{key}` is missing from locales/en/cli.ftl"));
+            assert_eq!(
+                &rendered, expected,
+                "the wording of `{key}` must stay what the tool returned"
+            );
+        }
+    }
+
+    /// The guard behind the catalog move: a bounded-ceiling refusal written back as a
+    /// bare literal in a tool's production code is not user-facing text that goes
+    /// through Fluent (AGENTS.md, "User-Facing Text"). Reads each file's source up to
+    /// its test module.
+    #[test]
+    fn bounded_ceiling_refusals_are_not_bare_literals_in_the_tool_sources() {
+        let sources = [
+            ("caller_ceiling.rs", include_str!("caller_ceiling.rs")),
+            ("sop_workshop.rs", include_str!("sop_workshop.rs")),
+            ("sop_execute.rs", include_str!("sop_execute.rs")),
+            ("sop_advance.rs", include_str!("sop_advance.rs")),
+            ("sop_approve.rs", include_str!("sop_approve.rs")),
+            (
+                "send_message_to_peer.rs",
+                include_str!("send_message_to_peer.rs"),
+            ),
+            ("spawn_subagent.rs", include_str!("spawn_subagent.rs")),
+        ];
+        let markers = [
+            "refused — this tool was registered",
+            "refused — no requested tool",
+            "refused — this agent job would keep",
+            "refused — this job stores no",
+            "refused — this job's stored",
+            "refused — this stores or re-arms",
+            "refused — {reason}",
+            "is not available under a caller tool ceiling",
+            "is not available to a bounded delegate target",
+            "declared but never published",
+            "left outside this",
+        ];
+        for (file, source) in sources {
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .expect("split always yields a first part");
+            assert!(
+                source.contains("#[cfg(test)]\nmod tests"),
+                "{file}: the test-module marker this guard splits on is gone, so the guard \
+                 would scan the tests as production code"
+            );
+            for marker in markers {
+                assert!(
+                    !production.contains(marker),
+                    "{file} writes a bounded-ceiling refusal as a bare literal ({marker:?}); \
+                     route it through a Fluent key in locales/en/cli.ftl"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn every_inventoried_tool_registers_under_a_maximal_config() {
         // Rows a unit test cannot construct, with the reason.

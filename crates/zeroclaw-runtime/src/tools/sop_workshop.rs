@@ -204,11 +204,9 @@ impl Tool for SopWorkshopTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "sop_workshop `{}` is not available under a caller tool ceiling: it \
-                     persists a proposal or SOP definition that runs later, outside that \
-                     ceiling. `list` and `inspect` remain available.",
-                    action.wire_name()
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "bounded-ceiling-sop-workshop-action",
+                    &[("action", action.wire_name())],
                 )),
             });
         }

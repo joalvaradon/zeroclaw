@@ -311,11 +311,9 @@ impl Tool for SpawnSubagentTool {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(
-                            "spawn_subagent: refused — a delegated caller ceiling was \
-                             declared but never published, so the child cannot be bounded"
-                                .into(),
-                        ),
+                        error: Some(crate::i18n::get_required_cli_string(
+                            "bounded-ceiling-spawn-unpublished",
+                        )),
                     });
                 }
             },
