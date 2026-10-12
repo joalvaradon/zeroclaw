@@ -3738,7 +3738,12 @@ mod tests {
 
     #[test]
     fn t06_append_only_replace_is_atomic_with_the_flag() {
-        for rows in [&[u("q1"), a("a1"), u("boom")][..], &[u("boom")][..]] {
+        let append = &[u("q1"), a("a1"), u("boom")][..];
+        let replacement = &[u("boom")][..];
+        // With the flag false on both sides every stored row stays in place
+        // and only the failing tail is inserted (the append-only branch). The
+        // other two cases delete and reinsert.
+        for (rows, incoming_crumb) in [(append, false), (append, true), (replacement, true)] {
             let tmp = TempDir::new().unwrap();
             let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
             seed_sequentially(&backend, "k", &[u("q1"), a("a1")]);
@@ -3755,10 +3760,14 @@ mod tests {
                 .unwrap();
             }
             nap();
-            assert!(backend.replace_conversation_state("k", rows, true).is_err());
             assert!(
                 backend
-                    .replace_conversation_state_if_exists("k", rows, true)
+                    .replace_conversation_state("k", rows, incoming_crumb)
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .replace_conversation_state_if_exists("k", rows, incoming_crumb)
                     .is_err()
             );
             let after = stamped(&backend, "k");
