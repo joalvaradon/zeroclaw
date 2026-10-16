@@ -2820,6 +2820,275 @@ mod tests {
         assert_eq!(reported, vec![allowed(), other()]);
     }
 
+    /// Config for an agent granted one deferred MCP server (`test-srv`), with an
+    /// optional `mode = "always"` filter group over `always_pattern`.
+    fn deferred_mcp_config(server_uri: String, always_pattern: Option<&str>) -> Config {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+            RuntimeProfileConfig, ToolFilterGroup, ToolFilterGroupMode,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "test-srv".into(),
+            transport: McpTransport::Http,
+            url: Some(server_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "test-bundle".into(),
+            McpBundleConfig {
+                servers: vec!["test-srv".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        let mut runtime_profile = RuntimeProfileRef::default();
+        if let Some(pattern) = always_pattern {
+            runtime_profile = RuntimeProfileRef::new("always-profile");
+            config.runtime_profiles.insert(
+                "always-profile".into(),
+                RuntimeProfileConfig {
+                    tool_filter_groups: vec![ToolFilterGroup {
+                        mode: ToolFilterGroupMode::Always,
+                        tools: vec![pattern.into()],
+                        keywords: Vec::new(),
+                    }],
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                runtime_profile,
+                mcp_bundles: vec!["test-bundle".into()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    /// Assembles `test-agent` over a connected `registry`, with `delegate_handle`
+    /// installed as the delegate parent set when given.
+    async fn assemble_deferred_mcp(
+        config: &Config,
+        registry: &Arc<tools::McpRegistry>,
+        excluded: Option<Vec<String>>,
+        caller_allowed: Option<&[String]>,
+        delegate_handle: Option<DelegateParentToolsHandle>,
+    ) -> ScopedAssembled {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            excluded_tools: excluded,
+            ..SecurityPolicy::default()
+        });
+        let mut built = built_with(Vec::new());
+        built.delegate_handle = delegate_handle;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ScopedToolRegistry::assemble(ScopedAssembly {
+                config,
+                agent_alias: "test-agent",
+                security: &security,
+                built,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed,
+                connect_mcp: true,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: Some(Arc::clone(registry)),
+            }),
+        )
+        .await
+        .expect("assemble must not hang")
+    }
+
+    /// A `mode = "always"` group pre-activates only the deferred MCP tools the
+    /// turn's policy admits: one the caller's set does not name, or the
+    /// exclusion list removes, is never activated, reported to the ceiling, or
+    /// handed to the delegate parent set, even when the group's pattern covers it.
+    /// Broken state this pins: pre-activation resolving groups against the
+    /// unfiltered stubs, so a pattern such as `test-srv__*` activates a tool the
+    /// caller never named and the model can call it without `tool_search`.
+    #[tokio::test]
+    async fn always_group_preactivates_only_tools_the_turn_policy_admits() {
+        let server = mock_mcp_http_server_with_tools(&[
+            ("allowed", "Allowed tool"),
+            ("other", "Other tool"),
+        ])
+        .await;
+        let config = deferred_mcp_config(server.uri(), Some("test-srv__*"));
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("test-agent"))
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+        let allowed = || "test-srv__allowed".to_string();
+        let other = || "test-srv__other".to_string();
+        let search = || "tool_search".to_string();
+        let activated = |out: &ScopedAssembled, name: &str| {
+            out.activated_handle
+                .as_ref()
+                .expect("deferred mode keeps the activation handle")
+                .lock()
+                .unwrap()
+                .is_activated(name)
+        };
+        let parent_names = |handle: &DelegateParentToolsHandle| -> Vec<String> {
+            handle
+                .read()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect()
+        };
+        let sealed_ceiling = |out: &ScopedAssembled, incoming: &[String]| {
+            let handle = crate::tools::caller_ceiling::pending_for_turn(Some(incoming));
+            crate::tools::caller_ceiling::seal_to_registry(
+                handle.as_ref(),
+                Some(incoming),
+                &out.registry.0,
+                &out.deferred_mcp_tool_names,
+            );
+            handle
+                .expect("an incoming list yields a handle")
+                .get()
+                .expect("the ceiling is sealed")
+                .clone()
+        };
+
+        // The caller names `allowed` but not `other`, with and without `tool_search`.
+        for incoming in [vec![allowed(), search()], vec![allowed()]] {
+            let parent: DelegateParentToolsHandle = Arc::new(parking_lot::RwLock::new(Vec::new()));
+            let out = assemble_deferred_mcp(
+                &config,
+                &registry,
+                None,
+                Some(&incoming),
+                Some(Arc::clone(&parent)),
+            )
+            .await;
+            let case = format!("(caller {incoming:?})");
+            assert!(
+                activated(&out, &allowed()),
+                "the group must pre-activate the tool the caller named {case}"
+            );
+            assert!(
+                !activated(&out, &other()),
+                "the group pattern covers a tool the caller did not name; it must stay \
+                 inactive {case}"
+            );
+            assert!(
+                !out.deferred_mcp_tool_names.contains(&other()),
+                "an unnamed tool must not be reported as callable {case}: {:?}",
+                out.deferred_mcp_tool_names
+            );
+            assert!(
+                out.deferred_mcp_tool_names.contains(&allowed()),
+                "the named, pre-activated tool is reported {case}: {:?}",
+                out.deferred_mcp_tool_names
+            );
+            let ceiling = sealed_ceiling(&out, &incoming);
+            assert!(
+                ceiling.contains(&allowed()) && !ceiling.contains(&other()),
+                "the sealed ceiling names the pre-activated tool and not the unnamed one \
+                 {case}: {ceiling:?}"
+            );
+            let parent_set = parent_names(&parent);
+            assert!(
+                parent_set.contains(&allowed()),
+                "the pre-activated tool must reach the delegate parent set {case}: {parent_set:?}"
+            );
+            assert!(
+                !parent_set.contains(&other()),
+                "an unnamed tool must not reach the delegate parent set {case}: {parent_set:?}"
+            );
+        }
+
+        // An exclusion removes `other` from pre-activation as well.
+        let out = assemble_deferred_mcp(&config, &registry, Some(vec![other()]), None, None).await;
+        assert!(
+            activated(&out, &allowed()),
+            "the group must pre-activate the tool the exclusion leaves"
+        );
+        assert!(
+            !activated(&out, &other()),
+            "an excluded tool must stay inactive though the group pattern covers it"
+        );
+
+        // Control: with no per-run set and no exclusion the same group activates
+        // both, so `other` is held back above only by the caller's set or exclusion.
+        let parent: DelegateParentToolsHandle = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let out =
+            assemble_deferred_mcp(&config, &registry, None, None, Some(Arc::clone(&parent))).await;
+        assert!(
+            activated(&out, &allowed()) && activated(&out, &other()),
+            "control: the group must pre-activate both tools"
+        );
+        let parent_set = parent_names(&parent);
+        assert!(
+            parent_set.contains(&allowed()) && parent_set.contains(&other()),
+            "control: both pre-activated tools reach the delegate parent set: {parent_set:?}"
+        );
+    }
+
+    /// A caller's set that does not name `tool_search` leaves no deferred MCP
+    /// listing in the prompt: the listing instructs the model to call
+    /// `tool_search`, which the ceiling just removed.
+    /// Broken state this pins: the registry dropping `tool_search` while the
+    /// listing that tells the model to call it survives.
+    #[tokio::test]
+    async fn caller_set_without_tool_search_renders_no_deferred_section() {
+        let server = mock_mcp_http_server_with_tools(&[
+            ("allowed", "Allowed tool"),
+            ("other", "Other tool"),
+        ])
+        .await;
+        let config = deferred_mcp_config(server.uri(), None);
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("test-agent"))
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+        let has_search =
+            |out: &ScopedAssembled| out.registry.iter().any(|tool| tool.name() == "tool_search");
+
+        // Control: with `tool_search` named, the listing advertises the stub the
+        // caller named, so the empty listing below is not vacuous.
+        let named = vec!["test-srv__allowed".to_string(), "tool_search".to_string()];
+        let out = assemble_deferred_mcp(&config, &registry, None, Some(&named), None).await;
+        assert!(has_search(&out), "control must hold tool_search");
+        assert!(
+            out.deferred_section().contains("test-srv__allowed"),
+            "control must render the deferred listing: {:?}",
+            out.deferred_section()
+        );
+
+        let unnamed = vec!["test-srv__allowed".to_string()];
+        let out = assemble_deferred_mcp(&config, &registry, None, Some(&unnamed), None).await;
+        assert!(
+            !has_search(&out),
+            "the caller's set must have removed tool_search"
+        );
+        assert!(
+            out.deferred_section().is_empty(),
+            "no deferred listing may be rendered without tool_search: {:?}",
+            out.deferred_section()
+        );
+    }
+
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
             registry: ScopedToolRegistry(Vec::new(), None),
