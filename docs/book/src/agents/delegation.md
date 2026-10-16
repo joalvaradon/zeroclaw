@@ -216,7 +216,9 @@ Because the chain lives in the policy, every consumer that validates a command a
 
 A `cron_update` that names no `command`, and a `schedule` resume, leave a stored command in force. For a bounded registration the guard re-judges that stored command against the same chain before the change is committed.
 
-The chain travels by cloning the policy, so it does not reach a turn that is started for a different agent and rebuilds that agent's policy from config. Today that is a `send_message_to_peer` relay (`process_message_inner`) and a live nested SOP step that names another agent (`assemble_owned_execution`): both receive only the caller's tool-name ceiling, so the recipient's `shell` is judged by the recipient's own command policy. This is a known boundary of the mechanism, not a guarantee.
+The chain travels by cloning the policy, so it does not reach a turn that is started for a different agent and rebuilds that agent's policy from config. Today that is a `send_message_to_peer` relay (`process_message_inner`) and a live nested SOP step that names another agent (`assemble_owned_execution_with_admission`): both receive only the caller's tool-name ceiling, so the recipient's `shell` is judged by the recipient's own command policy. This is a known boundary of the mechanism, not a guarantee.
+
+The tool-name ceiling names a deferred MCP tool only while `tool_search` survives the caller's assembly, because that tool is how a deferred MCP tool is activated; the exception is a deferred tool already activated by a `mode = "always"` entry of `tool_filter_groups`, which stays callable without `tool_search` and stays in the ceiling.
 
 A hop to an `independent` target below a bounded one is configured design, not a gap: an independent target resolves its own policy and builds its own registry, so it carries neither the tool ceiling nor the command chain of the callers above it. Only bounded hops extend the chain.
 
