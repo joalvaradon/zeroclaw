@@ -625,8 +625,9 @@ pub const REBOUND_BY_DOWNCAST_TOOL_NAMES: &[&str] = &["sop_execute", "sop_advanc
 /// `#[cfg(test)] mod tests` - test-owned `Tool` impls that mutate a
 /// test-local `Arc<AtomicBool>`/`CostTracker` to simulate a mid-run config
 /// change, or that hold a gate open so a test can observe a tool while it is
-/// running (`gate_tool`), never real tools a production registry could
-/// construct. They cannot be classified by any of the real categories
+/// running (`gate_tool`), or that panic inside `execute` so a test can observe
+/// how a background worker recovers (`panic_tool`), never real tools a
+/// production registry could construct. They cannot be classified by any of the real categories
 /// (identity/workspace/channel/SOP-rebind) because they carry no such state to
 /// rebind - reusing the caller's instance verbatim is what the test needs to
 /// observe.
@@ -636,6 +637,7 @@ const TEST_ONLY_SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     "config_mode_flip_tool",
     "live_config_flip_tool",
     "gate_tool",
+    "panic_tool",
 ];
 
 /// `true` iff `name` is one of `TEST_ONLY_SAFE_FOR_BOUNDED_REUSE`, compiled
