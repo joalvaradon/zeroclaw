@@ -2608,6 +2608,11 @@ mod tests {
                 vec!["test-srv__allowed".to_string()],
                 "control must report the deferred tool (caller {caller_allowed:?})"
             );
+            assert!(
+                out.deferred_section().contains("test-srv__allowed"),
+                "control must render the deferred listing (caller {caller_allowed:?}): {:?}",
+                out.deferred_section()
+            );
         }
 
         for caller_allowed in [named_caller(), None] {
