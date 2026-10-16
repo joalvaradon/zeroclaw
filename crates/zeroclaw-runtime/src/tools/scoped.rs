@@ -2366,9 +2366,12 @@ mod tests {
     /// Built-in schema deferral and deferred MCP tools share one `tool_search`
     /// seam. The built-in deferral may add a `tool_search` of its own, but only
     /// when no MCP-backed one exists, and that one activates nothing executable.
+    /// It runs only where `tool_search` is admitted, so when the caller's set took
+    /// it away the deferral stays off and hides no built-in.
     /// Broken state this pins: a turn whose `tool_search` the caller's set took
     /// away, with built-in deferral on, still reporting deferred MCP tools to the
-    /// ceiling (or holding two `tool_search` tools when the caller kept it).
+    /// ceiling (or holding two `tool_search` tools when the caller kept it), and a
+    /// built-in deferral that never ran, which would let both cases pass unchecked.
     #[tokio::test]
     async fn builtin_deferral_does_not_revive_deferred_mcp_tools_without_tool_search() {
         use zeroclaw_config::schema::{
@@ -2476,6 +2479,11 @@ mod tests {
             kept.deferred_mcp_tool_names,
             vec!["test-srv__allowed".to_string()]
         );
+        assert_eq!(
+            kept.registry.hidden_builtin_names(),
+            HashSet::from(["catalog_probe".to_string()]),
+            "built-in deferral must have run and hidden the non-eager built-in"
+        );
 
         // The caller's set took `tool_search` away. Built-in deferral must not
         // bring one back, and nothing deferred may stay callable.
@@ -2490,6 +2498,135 @@ mod tests {
             "no tool_search means no activatable MCP tool: {:?}",
             dropped.deferred_mcp_tool_names
         );
+        assert!(
+            dropped.registry.hidden_builtin_names().is_empty(),
+            "built-in deferral must stay off where tool_search is not admitted: {:?}",
+            dropped.registry.hidden_builtin_names()
+        );
+    }
+
+    /// An `excluded_tools` entry naming `tool_search` takes the deferred MCP
+    /// tools out of reach whatever the caller's set says: the registry holds no
+    /// `tool_search`, nothing is reported to the ceiling, and no deferred
+    /// listing is rendered.
+    /// Broken state this pins: the exclusion removing `tool_search` while the
+    /// stubs stay reported (or listed) as callable, because only the caller's
+    /// set decides whether they are cleared.
+    #[tokio::test]
+    async fn excluded_tool_search_leaves_no_deferred_mcp_tool_callable() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let server = mock_mcp_http_server_with_tools(&[("allowed", "Allowed tool")]).await;
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "test-srv".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "test-bundle".into(),
+            McpBundleConfig {
+                servers: vec!["test-srv".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: vec!["test-bundle".into()],
+                ..Default::default()
+            },
+        );
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("test-agent"))
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+
+        let assemble = |excluded: Option<Vec<String>>, caller_allowed: Option<Vec<String>>| {
+            let config = &config;
+            let registry = Arc::clone(&registry);
+            async move {
+                let security = Arc::new(SecurityPolicy {
+                    workspace_dir: std::env::temp_dir(),
+                    excluded_tools: excluded,
+                    ..SecurityPolicy::default()
+                });
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ScopedToolRegistry::assemble(ScopedAssembly {
+                        config,
+                        agent_alias: "test-agent",
+                        security: &security,
+                        built: built_with(Vec::new()),
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: caller_allowed.as_deref(),
+                        connect_mcp: true,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: Some(registry),
+                    }),
+                )
+                .await
+                .expect("assemble must not hang")
+            }
+        };
+        let has_search =
+            |out: &ScopedAssembled| out.registry.iter().any(|tool| tool.name() == "tool_search");
+        let named_caller = || {
+            Some(vec![
+                "test-srv__allowed".to_string(),
+                "tool_search".to_string(),
+            ])
+        };
+
+        // Control: without the exclusion the same scenarios hold `tool_search`
+        // and report the stub, so the cases below test the exclusion itself.
+        for caller_allowed in [named_caller(), None] {
+            let out = assemble(None, caller_allowed.clone()).await;
+            assert!(
+                has_search(&out),
+                "control must hold tool_search (caller {caller_allowed:?})"
+            );
+            assert_eq!(
+                out.deferred_mcp_tool_names,
+                vec!["test-srv__allowed".to_string()],
+                "control must report the deferred tool (caller {caller_allowed:?})"
+            );
+        }
+
+        for caller_allowed in [named_caller(), None] {
+            let out = assemble(Some(vec!["tool_search".into()]), caller_allowed.clone()).await;
+            assert!(
+                !has_search(&out),
+                "an excluded tool_search must not be registered (caller {caller_allowed:?})"
+            );
+            assert!(
+                out.deferred_mcp_tool_names.is_empty(),
+                "no tool_search means no activatable MCP tool (caller {caller_allowed:?}): {:?}",
+                out.deferred_mcp_tool_names
+            );
+            assert!(
+                out.deferred_section().is_empty(),
+                "no deferred listing may be rendered (caller {caller_allowed:?}): {:?}",
+                out.deferred_section()
+            );
+        }
     }
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
