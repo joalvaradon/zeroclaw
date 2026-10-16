@@ -2363,6 +2363,135 @@ mod tests {
         );
     }
 
+    /// Built-in schema deferral and deferred MCP tools share one `tool_search`
+    /// seam. The built-in deferral may add a `tool_search` of its own, but only
+    /// when no MCP-backed one exists, and that one activates nothing executable.
+    /// Broken state this pins: a turn whose `tool_search` the caller's set took
+    /// away, with built-in deferral on, still reporting deferred MCP tools to the
+    /// ceiling (or holding two `tool_search` tools when the caller kept it).
+    #[tokio::test]
+    async fn builtin_deferral_does_not_revive_deferred_mcp_tools_without_tool_search() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+            RuntimeProfileConfig,
+        };
+
+        let server = mock_mcp_http_server_with_tools(&[("allowed", "Allowed tool")]).await;
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "test-srv".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "test-bundle".into(),
+            McpBundleConfig {
+                servers: vec!["test-srv".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "catalog".into(),
+            RuntimeProfileConfig {
+                deferred_builtin_tools: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                runtime_profile: "catalog".into(),
+                mcp_bundles: vec!["test-bundle".into()],
+                ..Default::default()
+            },
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&config.mcp_servers_for_agent("test-agent"))
+                .await
+                .expect("source registry must connect to the mock MCP server"),
+        );
+
+        let assemble = |caller_allowed: Vec<String>| {
+            let config = &config;
+            let security = &security;
+            let registry = Arc::clone(&registry);
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ScopedToolRegistry::assemble(ScopedAssembly {
+                        config,
+                        agent_alias: "test-agent",
+                        security,
+                        built: built_with(vec![Box::new(MockTool("catalog_probe"))]),
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: Some(caller_allowed.as_slice()),
+                        connect_mcp: true,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: Some(registry),
+                    }),
+                )
+                .await
+                .expect("assemble must not hang")
+            }
+        };
+        let search_count = |out: &ScopedAssembled| {
+            out.registry
+                .iter()
+                .filter(|tool| tool.name() == "tool_search")
+                .count()
+        };
+
+        // Control: the caller kept `tool_search`. Exactly one is held, it is the
+        // MCP-backed one, and the deferred tool is reported for the ceiling.
+        let kept = assemble(vec![
+            "test-srv__allowed".into(),
+            "catalog_probe".into(),
+            "tool_search".into(),
+        ])
+        .await;
+        assert_eq!(search_count(&kept), 1, "exactly one tool_search is held");
+        assert!(
+            kept.tool_search_handle.is_some(),
+            "the held tool_search is the MCP-backed one"
+        );
+        assert_eq!(
+            kept.deferred_mcp_tool_names,
+            vec!["test-srv__allowed".to_string()]
+        );
+
+        // The caller's set took `tool_search` away. Built-in deferral must not
+        // bring one back, and nothing deferred may stay callable.
+        let dropped = assemble(vec!["test-srv__allowed".into(), "catalog_probe".into()]).await;
+        assert_eq!(
+            search_count(&dropped),
+            0,
+            "built-in deferral must not add a tool_search the caller's set removed"
+        );
+        assert!(
+            dropped.deferred_mcp_tool_names.is_empty(),
+            "no tool_search means no activatable MCP tool: {:?}",
+            dropped.deferred_mcp_tool_names
+        );
+    }
+
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
             registry: ScopedToolRegistry(Vec::new(), None),
