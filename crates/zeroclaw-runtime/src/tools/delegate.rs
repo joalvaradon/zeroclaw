@@ -11874,6 +11874,210 @@ mod tests {
         );
     }
 
+    /// The negative of the signing test above: a tool the bounded-reuse list
+    /// would hand over (`calculator`) never reaches a background child whose
+    /// caller is denied it by name, so the child's call is unknown and nothing
+    /// is signed.
+    #[tokio::test]
+    async fn execute_background_does_not_hand_a_caller_denied_reusable_tool_to_the_child() {
+        use crate::agent::tool_receipts::{
+            ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
+        };
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                "calculator",
+                "call_calc_denied",
+                serde_json::json!({"function": "add", "values": [2.0, 3.0]}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "background done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("receipt-test-model".to_string()),
+            api_key: Some("receipt-test-key".to_string()),
+            timeout_secs: Some(5),
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                // The caller is denied `calculator` by name.
+                allowed_tools: vec![
+                    DelegateTool::NAME.to_string(),
+                    "report_template".to_string(),
+                ],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["calculator".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        assert!(!caller_security.is_tool_allowed("calculator"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(tmp.path().join("workspace"))
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            // The caller also holds `report_template` (bounded-reuse safe), so
+            // the child is offered one tool: a provider rejects a tool call
+            // made against an empty tool list instead of answering it as
+            // unknown, and the offered tool is the control that the filter
+            // drops `calculator` by name rather than dropping everything.
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(CalculatorTool::new()),
+                Arc::new(crate::tools::ReportTemplateTool::new()),
+            ])));
+
+        let collector: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scope = ReceiptScope {
+            generator: ReceiptGenerator::new(),
+            collector: Arc::clone(&collector),
+        };
+        let result = TOOL_LOOP_RECEIPT_CONTEXT
+            .scope(Some(scope), async {
+                tool.execute(json!({
+                    "agent": "target",
+                    "prompt": "run in background",
+                    "background": true
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            bg_result.status,
+            BackgroundTaskStatus::Completed,
+            "{bg_result:?}"
+        );
+
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        let tail_len = view["progress"]["receipt_tail"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert_eq!(tail_len, 0, "a denied tool signs nothing: {view}");
+
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the sub-loop still makes its two requests: {bodies:?}"
+        );
+        let offered: Vec<serde_json::Value> = bodies
+            .iter()
+            .map(|body| serde_json::from_str(body.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        let names: Vec<&str> = offered[0]["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            names,
+            ["report_template"],
+            "the child is offered what its caller holds and nothing it is denied"
+        );
+        let returned = offered[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "tool")
+            .map(|message| decoded_tool_message(message["content"].as_str().unwrap()))
+            .expect("the denied call comes back to the model as a tool message");
+        assert!(
+            returned.contains("Unknown tool: calculator"),
+            "the denied call must be unknown to the child: {returned:?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("[receipt: zc-receipt-")),
+            "no tool result may be signed: {bodies:?}"
+        );
+        assert!(collector.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn single_call_background_delegate_counts_its_model_request() {
         let (server, _captured) = start_scripted_chat_server(&[
