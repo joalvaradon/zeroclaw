@@ -11718,7 +11718,7 @@ mod tests {
                     mode: DelegationMode::Allow,
                 },
                 // The bounded child inherits only what its caller holds.
-                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "calculator".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
