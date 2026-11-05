@@ -7,7 +7,9 @@ Contenido de la rama del fork (solo estos archivos nuevos en la raíz):
 - `posible-bug-ws-stop-pierde-contexto-8794.md`: análisis con tabla de evidencia, contrato leído y resultados de ejecución.
 - `posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md`: plan de corrección (PR 1 y PR 2) y casos de prueba.
 - `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch`: 13 tests (T1 a T12 y las dos variantes de T9). Modifica `crates/zeroclaw-runtime/src/agent/safety_net.rs` y `crates/zeroclaw-gateway/src/ws.rs`.
-- `posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch`: el fix de PR 1 (solo `crates/zeroclaw-runtime/src/agent/turn/mod.rs`). Aplicable por separado.
+- `posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch`: el fix simple de PR 1 (solo `crates/zeroclaw-runtime/src/agent/turn/mod.rs`). Aplicable por separado.
+- `posible-bug-ws-stop-pierde-contexto-8794-fix-pr1-firma.patch`: alternativa al anterior (no aplicar los dos), con cambio de firma de `prepare_tool_calls`; hace pasar T13.
+- `posible-bug-ws-stop-pierde-contexto-8794-impacto-firma-y-hallazgo-lateral.md`: impacto medido de ambos cambios.
 - Este archivo.
 
 ## 1. Requisitos en Windows 11
@@ -30,7 +32,7 @@ git worktree add --detach C:\repos-git\zeroclaw-8794 65f8eb3c9284e396d9de7872c3d
 git remote add fork https://github.com/joalvaradon/zeroclaw.git
 git fetch fork fix/8794-ws-stop-keeps-tool-rounds
 $b = "fork/fix/8794-ws-stop-keeps-tool-rounds"
-$names = "posible-bug-ws-stop-pierde-contexto-8794.md","posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md","posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch","posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch","posible-bug-ws-stop-pierde-contexto-8794-retomar-windows.md"
+$names = "posible-bug-ws-stop-pierde-contexto-8794.md","posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md","posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch","posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch","posible-bug-ws-stop-pierde-contexto-8794-fix-pr1-firma.patch","posible-bug-ws-stop-pierde-contexto-8794-impacto-firma-y-hallazgo-lateral.md","posible-bug-ws-stop-pierde-contexto-8794-retomar-windows.md"
 New-Item -ItemType Directory C:\repos-git\analisis-8794 -Force | Out-Null
 foreach ($n in $names) { git show "${b}:$n" | Out-File -Encoding utf8NoBOM "C:\repos-git\analisis-8794\$n" }
 ```

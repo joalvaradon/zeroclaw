@@ -1,8 +1,8 @@
 diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
-index 60202f1..7cf9836 100644
+index 60202f1..90a86c0 100644
 --- a/crates/zeroclaw-gateway/src/ws.rs
 +++ b/crates/zeroclaw-gateway/src/ws.rs
-@@ -6833,4 +6833,248 @@ data: {\"type\":\"message_stop\"}\n\n",
+@@ -6833,4 +6833,290 @@ data: {\"type\":\"message_stop\"}\n\n",
              "model_context_window is additive and omitted when unset"
          );
      }
@@ -250,12 +250,54 @@ index 60202f1..7cf9836 100644
 +        drop(client);
 +        fixture.shutdown();
 +    }
++
++    /// T14, characterization of the side finding. Prediction: PASSES on master.
++    /// While a turn is in flight the durable store holds nothing of it: the
++    /// user's message is written only when the turn ends, so a process that
++    /// dies mid-turn leaves no trace of the prompt. After an abort the store
++    /// holds the prompt and the interruption marker.
++    #[test]
++    fn issue_8794_t14_store_holds_nothing_of_a_turn_in_flight() {
++        run_ws_regression("ws-8794-t14", issue_8794_t14_inner);
++    }
++
++    async fn issue_8794_t14_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t14";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        assert!(fixture.has_live_turn(&session_key), "the turn is in flight");
++        assert_eq!(
++            fixture.session_state(&session_key).as_deref(),
++            Some("running")
++        );
++        assert!(
++            fixture.backend.load(&session_key).is_empty(),
++            "nothing of the in-flight turn is durable yet: {:?}",
++            fixture.backend.load(&session_key)
++        );
++
++        issue_8794_abort(&fixture, session_id).await;
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        let stored = fixture.backend.load(&session_key);
++        assert!(
++            stored
++                .iter()
++                .any(|m| m.role == "user" && m.content.contains("read the note")),
++            "after the turn ends the prompt is durable: {stored:?}"
++        );
++        fixture.release_next();
++        drop(client);
++        fixture.shutdown();
++    }
  }
 diff --git a/crates/zeroclaw-runtime/src/agent/safety_net.rs b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-index 627a23e..90537ca 100644
+index 627a23e..6a0edf3 100644
 --- a/crates/zeroclaw-runtime/src/agent/safety_net.rs
 +++ b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-@@ -4090,3 +4090,454 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+@@ -4090,3 +4090,555 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
          "a switch written through the poisoned guard must be observed by the loop"
      );
  }
@@ -708,5 +750,106 @@ index 627a23e..90537ca 100644
 +            .iter()
 +            .any(|m| m.content.contains("zeroclaw_fixture_marker")),
 +        "native tool output is not part of the durable rows today: {durable:?}"
++    );
++}
++
++/// Approval channel that denies the first request and never answers the next,
++/// so a batch can hold one already-resolved call and one call still waiting.
++struct DenyThenHangApprovalChannel {
++    requests: Arc<AtomicUsize>,
++}
++impl ::zeroclaw_api::attribution::Attributable for DenyThenHangApprovalChannel {
++    fn role(&self) -> ::zeroclaw_api::attribution::Role {
++        ::zeroclaw_api::attribution::Role::Channel(
++            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
++        )
++    }
++    fn alias(&self) -> &str {
++        "acp"
++    }
++}
++#[async_trait]
++impl zeroclaw_api::channel::Channel for DenyThenHangApprovalChannel {
++    fn name(&self) -> &str {
++        "acp"
++    }
++    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
++        Ok(())
++    }
++    async fn listen(
++        &self,
++        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
++    ) -> anyhow::Result<()> {
++        Ok(())
++    }
++    async fn request_approval(
++        &self,
++        _recipient: &str,
++        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
++    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
++        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
++            Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
++        } else {
++            std::future::pending().await
++        }
++    }
++}
++
++/// T13, fidelity of the cancelled-at-approval round. Batch of two calls: the
++/// first is denied by the operator (and the UI already showed that denial),
++/// the second waits for approval and the turn is cancelled. The recorded
++/// history must keep the real denial for the first call and mark only the
++/// second as interrupted. Prediction with the T1 fix alone: FAILS, because the
++/// error from `prepare_tool_calls` drops the denial and every call gets the
++/// interrupted text.
++#[tokio::test]
++async fn issue_8794_t13_cancel_during_approval_keeps_earlier_denial_result() {
++    let requests = Arc::new(AtomicUsize::new(0));
++    let risk = zeroclaw_config::schema::RiskProfileConfig {
++        always_ask: vec!["echo".into(), "echo2".into()],
++        ..zeroclaw_config::schema::RiskProfileConfig::default()
++    };
++    let mut agent = approval_agent(
++        Box::new(ScriptedProvider::new(vec![tool_response(vec![
++            tool_call("t13a", "echo"),
++            tool_call("t13b", "echo2"),
++        ])])),
++        vec![
++            Box::new(CountingTool {
++                name: "echo",
++                calls: Arc::new(AtomicUsize::new(0)),
++            }),
++            Box::new(CountingTool {
++                name: "echo2",
++                calls: Arc::new(AtomicUsize::new(0)),
++            }),
++        ],
++        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
++        Some(Arc::new(DenyThenHangApprovalChannel {
++            requests: Arc::clone(&requests),
++        })),
++    );
++    let token = tokio_util::sync::CancellationToken::new();
++    let cancel = token.clone();
++    let (tx, mut rx) = mpsc::channel(256);
++    let handle = zeroclaw_spawn::spawn!(async move {
++        agent
++            .turn_streamed_with_steering_state("t13", tx, Some(token), None)
++            .await
++    });
++    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++        while requests.load(Ordering::SeqCst) < 2 {
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        }
++    })
++    .await;
++    assert!(waited.is_ok(), "turn must park on the second approval");
++    cancel.cancel();
++    while rx.recv().await.is_some() {}
++    let err = handle.await.expect("task join").expect_err("cancelled");
++    assert!(
++        debug_contains(&err.new_messages, "Denied by user"),
++        "the earlier call keeps the operator's real denial: {:?}",
++        err.new_messages
 +    );
 +}
