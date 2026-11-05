@@ -1,6 +1,6 @@
 # Plan de trabajo: issue 8794, Stop en el dashboard pierde el trabajo del turno
 
-EJECUCIÓN PARCIAL (2026-11-05): se compiló y se ejecutaron 5 tests de runtime en el clon del upstream (T1, T2, T5, T6, T7); T1 fue visto en rojo con la aserción prevista. Detalle y salida en el análisis, sección "Ejecución real de tests de runtime". Parche listo: `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch` (aplicar con `git apply` sobre `65f8eb3c`). T3, T4, T8 a T12 siguen sin escribir.
+EJECUCIÓN (2026-11-05): se compilaron y ejecutaron los tests de runtime (T1, T2, T5 a T9) y de gateway (T3, T4, T10, T11, T12) en el clon del upstream. Rojos vistos con la aserción prevista: T1, T4, T10, T11. Verdes de control o caracterización: T2, T3, T5 a T9, T12. Detalle y salida en el análisis, secciones "Ejecución real". Parche con todos los tests: `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch` (se aplica con `git apply` sobre `65f8eb3c`). Para retomar en otro equipo: `posible-bug-ws-stop-pierde-contexto-8794-retomar-windows.md`. Sin fix escrito: el verde posterior de los rojos queda pendiente.
 
 Estado: BORRADOR con una pasada en frío (subagente opus, 2026-11-05) ya incorporada. Los tests de runtime sí se ejecutaron (ver arriba); el fix no está escrito. Plantillas, lanes y reglas de aprobación verificadas contra `65f8eb3c` el 2026-11-05. Pendientes: reproducción real, `architecture-map.md` y `privacy.md`, y la decisión de diseño de mantenedores para PR 2. Análisis en `posible-bug-ws-stop-pierde-contexto-8794.md`. Leerlo primero.
 

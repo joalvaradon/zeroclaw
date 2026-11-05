@@ -167,8 +167,27 @@ La regla de permiso fue autorizada por el usuario y se compiló y ejecutó en el
 
 Límites: T1 se vio en rojo contra el código sin arreglar, pero el fix no está escrito, así que no se vio el verde posterior. T6 y T5 son pruebas de caracterización, no rojos. La discriminación del fixture de T2/T7 usa la salida `zeroclaw_fixture_marker` presente solo en el resultado de la herramienta. No se ejecutó el resto de la suite de `zeroclaw-runtime` ni `./scripts/ci/parallel_runtime_test_gate.sh`.
 
-## Pendiente de ejecución
+## Ejecución real de tests de gateway y runtime, segunda tanda (2026-11-05, `65f8eb3c`)
 
-- T3, T4, T10, T11, T12 (nivel gateway, `ws.rs`): no escritos. Requieren compilar `zeroclaw-gateway` en modo test y construir el fixture `ParkedTurnFixture`; sin intentar.
-- T8 y T9 (paralelo y modo prompt-guided): no escritos.
-- Reproducción en daemon real: no hecha.
+Comandos: `cargo test -p zeroclaw-gateway --lib --locked -j4 -- issue_8794 --test-threads=1` (gateway) y `cargo test -p zeroclaw-runtime --lib --locked -j4 -- issue_8794 --test-threads=1` (runtime), con `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`. Los tests de gateway usan el fixture `ParkedTurnFixture` existente (proveedor con forma Anthropic, SQLite real) y el endpoint real de abort. El archivo `note.txt` contiene el marcador neutral `zeroclaw_fixture_marker`, que solo aparece en el resultado de la herramienta.
+
+Salida: gateway `2 passed; 3 failed` sobre 5 tests (T3, T12 verdes; T4, T10, T11 rojos); runtime `7 passed; 1 failed` sobre 8 (solo T1 rojo).
+
+| Test | Nivel | Predicción | Resultado | Lectura |
+|---|---|---|---|---|
+| T3 `issue_8794_t3_same_connection_follow_up_keeps_tool_round` | gateway | VERDE | VERDE | En la misma conexión, el mensaje posterior al Stop sigue llevando el `tool_use` y su `tool_result` (confirma el análisis de memoria, E7). |
+| T4 `issue_8794_t4_reconnect_after_stop_keeps_tool_round` | gateway | ROJO | ROJO en la aserción `the interrupted turn's tool result must survive a reconnect` | Tras reconectar, el agente se reconstruye desde la tienda y la petición ya no contiene el resultado de la herramienta. Reproduce el síntoma del issue, con herramientas nativas. |
+| T10 `issue_8794_t10_immediate_reopen_after_stop_keeps_tool_round` | gateway | ROJO | ROJO en `the tool result must survive an immediate reconnect after Stop` | Igual que T4 pero cerrando el socket justo después del abort, sin esperar. |
+| T11 `issue_8794_t11_failed_durable_write_keeps_in_memory_tool_round` | gateway | ROJO (H6, sin confirmar) | ROJO en `a failed durable write must not discard the live agent's tool round`, tras pasar la comprobación de sanidad de que el fallo se inyectó | Un trigger SQL real (`BEFORE INSERT ON sessions`) hace fallar el reemplazo durable posterior al Stop. El turno siguiente en la misma conexión pierde la ronda de herramientas. H6 queda CONFIRMADA por ejecución. |
+| T12 `issue_8794_t12_message_right_after_stop_is_not_lost` | gateway | desconocida (H5) | VERDE en 6 de 6 ejecuciones (1 + 5 repeticiones) | Un mensaje enviado justo después del POST de abort llega al proveedor. H5 NO se confirma con este escenario. La carrera pudo no ejercitarse a fondo; queda como hipótesis sin respaldo. |
+| T8 `issue_8794_t8_parallel_batch_cancel_keeps_finished_result_and_marks_sibling` | runtime | VERDE (C4) | VERDE | En un lote paralelo, la herramienta terminada conserva su salida real y la hermana inconclusa recibe el resultado interrumpido. |
+| T9 nativo `issue_8794_t9_native_round_is_dropped_by_durable_projection` | runtime | VERDE (caracteriza E3) | VERDE | La proyección durable (`durable_chat_messages`) descarta la ronda de herramientas nativa. |
+| T9 prompt-guided `issue_8794_t9_prompt_guided_round_survives_durable_projection` | runtime | VERDE | VERDE | En modo prompt-guided la salida de la herramienta es una fila de chat y sí se conserva. Confirma la corrección de E3. |
+| T1, T2, T5, T6, T7 | runtime | ver tanda 1 | iguales a la tanda 1 | Sin cambios. |
+
+Desviaciones respecto al plan y límites:
+- T9 se movió de gateway a runtime. El fixture de gateway solo emula a Anthropic, que siempre envía herramientas nativas; con el despachador XML el guard del stream retiró el `<tool_call>` como protocolo filtrado (la segunda petición no llevaba resultado de herramienta), de modo que el escenario no era válido. Un T9 de gateway requeriría un servidor OpenAI-compatible nuevo. El test de runtime verifica la propiedad en la proyección, no el recorrido completo por el WebSocket.
+- T11 se corrigió una vez: con `BEFORE DELETE` el trigger no disparaba porque el mensaje del usuario se persiste al terminar el turno y no había filas que borrar. Con `BEFORE INSERT` el fallo se inyecta y la comprobación de sanidad lo valida.
+- Hallazgo lateral (VERIFICADO por la transcripción vacía observada): durante un turno, la tabla `sessions` no contiene aún el mensaje del usuario; se escribe al finalizar. Si el daemon cae a mitad de turno, la tienda no refleja nada de ese turno. No se investigó más.
+- Los tests siguen sin fix: ninguno se vio en verde después de corregir. No se ejecutó el resto de la suite ni `parallel_runtime_test_gate.sh`.
+- No hecho: reproducción en daemon real.

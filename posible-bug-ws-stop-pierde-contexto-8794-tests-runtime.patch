@@ -1,8 +1,259 @@
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index 60202f1..471e397 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -6833,4 +6833,246 @@ data: {\"type\":\"message_stop\"}\n\n",
+             "model_context_window is additive and omitted when unset"
+         );
+     }
++
++    // ── Issue 8794: Stop must not erase the interrupted turn's tool work ──
++    //
++    // Scenario shared by the tests below: the first provider reply calls
++    // `file_read`, the tool runs and its result goes to the provider in
++    // request 2, which stays parked; the test then stops the turn through the
++    // abort endpoint. Fixtures are synthetic: the file holds a neutral marker
++    // that appears only in the tool result, never in a prompt or a reply.
++    // Predictions are written before the first run and recorded in the
++    // analysis file next to the observed result.
++
++    const ISSUE_8794_MARKER: &str = "zeroclaw_fixture_marker";
++
++    /// A fixture whose workspace holds `note.txt`; the first provider reply
++    /// calls `file_read` on it.
++    async fn issue_8794_fixture() -> ParkedTurnFixture {
++        let fixture = ParkedTurnFixture::spawn_with(None, |config| {
++            std::fs::write(config.data_dir.join("note.txt"), ISSUE_8794_MARKER)
++                .expect("fixture file");
++        })
++        .await;
++        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
++        fixture
++    }
++
++    /// Start the turn, let request 1 finish with the tool call, and return
++    /// request 2 (the one that carries the tool result and stays parked).
++    async fn issue_8794_park_after_tool_round(
++        fixture: &mut ParkedTurnFixture,
++        client: &mut WsClient,
++    ) -> serde_json::Value {
++        fixture
++            .start_parked_turn(client, "read the note")
++            .await;
++        fixture.release_next();
++        let second = fixture.next_provider_request().await;
++        assert!(
++            second.to_string().contains(ISSUE_8794_MARKER),
++            "sanity: the tool result reached the provider within the turn"
++        );
++        second
++    }
++
++    async fn issue_8794_abort(fixture: &ParkedTurnFixture, session_id: &str) {
++        let response = crate::api::handle_api_session_abort(
++            axum::extract::State(fixture.state.clone()),
++            HeaderMap::new(),
++            axum::extract::Path(session_id.to_string()),
++        )
++        .await
++        .into_response();
++        assert_eq!(response.status(), axum::http::StatusCode::OK);
++    }
++
++    /// T3. Prediction: GREEN on master. Same connection: the live agent keeps
++    /// its in-memory history, so the request after Stop still carries the
++    /// tool-use block and the tool result.
++    #[test]
++    fn issue_8794_t3_same_connection_follow_up_keeps_tool_round() {
++        run_ws_regression("ws-8794-t3", issue_8794_t3_inner);
++    }
++
++    async fn issue_8794_t3_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t3";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        issue_8794_abort(&fixture, session_id).await;
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        send_chat(&mut client, "redirect: summarize what you read").await;
++        let third = fixture.next_provider_request().await.to_string();
++
++        assert!(
++            third.contains("toolu_fixture"),
++            "the follow-up keeps the interrupted turn's tool-use block"
++        );
++        assert!(
++            third.contains(ISSUE_8794_MARKER),
++            "the follow-up keeps the interrupted turn's tool result"
++        );
++        fixture.release_next();
++        fixture.release_next();
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        drop(client);
++        fixture.shutdown();
++    }
++
++    /// T4. Prediction: RED on master (native tools). After a reconnect the
++    /// agent is rebuilt from the durable transcript, which drops tool rows
++    /// (`durable_chat_messages`), so request 3 lacks the tool result.
++    #[test]
++    fn issue_8794_t4_reconnect_after_stop_keeps_tool_round() {
++        run_ws_regression("ws-8794-t4", issue_8794_t4_inner);
++    }
++
++    async fn issue_8794_t4_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t4";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        issue_8794_abort(&fixture, session_id).await;
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        disconnect_viewer(client).await;
++        let (mut client, _) = fixture.connect(session_id).await;
++        send_chat(&mut client, "redirect: summarize what you read").await;
++        let third = fixture.next_provider_request().await.to_string();
++
++        assert!(
++            third.contains(ISSUE_8794_MARKER),
++            "the interrupted turn's tool result must survive a reconnect"
++        );
++        fixture.release_next();
++        fixture.release_next();
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        drop(client);
++        fixture.shutdown();
++    }
++
++    /// T10. Prediction: RED on master (native tools). The client aborts and
++    /// drops the socket at once (as on a model or session switch), without
++    /// waiting for the turn to settle, then reopens and continues.
++    #[test]
++    fn issue_8794_t10_immediate_reopen_after_stop_keeps_tool_round() {
++        run_ws_regression("ws-8794-t10", issue_8794_t10_inner);
++    }
++
++    async fn issue_8794_t10_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t10";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        issue_8794_abort(&fixture, session_id).await;
++        disconnect_viewer(client).await;
++        let (mut client, _) = fixture.connect(session_id).await;
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        send_chat(&mut client, "redirect: summarize what you read").await;
++        let third = fixture.next_provider_request().await.to_string();
++
++        assert!(
++            third.contains(ISSUE_8794_MARKER),
++            "the tool result must survive an immediate reconnect after Stop"
++        );
++        fixture.release_next();
++        fixture.release_next();
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        drop(client);
++        fixture.shutdown();
++    }
++
++    /// T11. Prediction: RED on master (H6, unconfirmed). A real SQLite trigger
++    /// makes the post-cancel transcript replacement fail. The cancelled branch
++    /// ignores the failure and advances the watermark, so the next turn on the
++    /// same connection may rebuild its history from the stale store and lose
++    /// the in-memory tool round. The sanity check below proves the failure was
++    /// really injected.
++    #[test]
++    fn issue_8794_t11_failed_durable_write_keeps_in_memory_tool_round() {
++        run_ws_regression("ws-8794-t11", issue_8794_t11_inner);
++    }
++
++    async fn issue_8794_t11_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t11";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        let db = fixture._tmp.path().join("workspace/sessions/sessions.db");
++        let conn = rusqlite::Connection::open(&db).expect("open the session database");
++        conn.execute_batch(
++            "CREATE TRIGGER issue_8794_fail_rewrite BEFORE INSERT ON sessions \
++             BEGIN SELECT RAISE(ABORT, 'simulated durable replacement failure'); END;",
++        )
++        .expect("install the failure trigger");
++        drop(conn);
++
++        issue_8794_abort(&fixture, session_id).await;
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        let interrupted =
++            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
++        assert!(
++            !fixture
++                .backend
++                .load(&session_key)
++                .iter()
++                .any(|message| message.content.contains(&interrupted)),
++            "sanity: the durable replacement really failed"
++        );
++
++        send_chat(&mut client, "redirect: summarize what you read").await;
++        let third = fixture.next_provider_request().await.to_string();
++        assert!(
++            third.contains(ISSUE_8794_MARKER),
++            "a failed durable write must not discard the live agent's tool round"
++        );
++        fixture.release_next();
++        fixture.release_next();
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        drop(client);
++        fixture.shutdown();
++    }
++
++    /// T12. Prediction: unknown (H5 is an unverified hypothesis). A message
++    /// sent right after the abort request, before the `aborted` frame is
++    /// read, must be processed (a provider request carrying it) or explicitly
++    /// rejected; it must not vanish. The test asserts the processed outcome.
++    #[test]
++    fn issue_8794_t12_message_right_after_stop_is_not_lost() {
++        run_ws_regression("ws-8794-t12", issue_8794_t12_inner);
++    }
++
++    async fn issue_8794_t12_inner() {
++        let mut fixture = issue_8794_fixture().await;
++        let session_id = "issue-8794-t12";
++        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
++        let (mut client, _) = fixture.connect(session_id).await;
++        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
++
++        issue_8794_abort(&fixture, session_id).await;
++        send_chat(&mut client, "zeroclaw_fixture_followup sent right after stop").await;
++        let arrived = tokio::time::timeout(Duration::from_secs(5), fixture.request_seen.recv())
++            .await;
++        let carried = matches!(
++            &arrived,
++            Ok(Some(request)) if request.to_string().contains("zeroclaw_fixture_followup")
++        );
++        assert!(
++            carried,
++            "the message sent right after Stop must reach the provider: {arrived:?}"
++        );
++        fixture.release_next();
++        fixture.release_next();
++        fixture.wait_for_turn_to_settle(&session_key).await;
++        drop(client);
++        fixture.shutdown();
++    }
+ }
 diff --git a/crates/zeroclaw-runtime/src/agent/safety_net.rs b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-index 627a23e..61a2c78 100644
+index 627a23e..27fcfd6 100644
 --- a/crates/zeroclaw-runtime/src/agent/safety_net.rs
 +++ b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-@@ -4090,3 +4090,304 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+@@ -4090,3 +4090,441 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
          "a switch written through the poisoned guard must be observed by the loop"
      );
  }
@@ -305,5 +556,142 @@ index 627a23e..61a2c78 100644
 +            .iter()
 +            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
 +        "the cancelled-at-approval round must be recorded (pairing contract C4/C6)"
++    );
++}
++
++/// Tool that never finishes on its own; only cancellation ends it.
++struct NeverFinishesTool {
++    name: &'static str,
++}
++zeroclaw_api::tool_attribution!(
++    NeverFinishesTool,
++    ::zeroclaw_api::attribution::ToolKind::Plugin
++);
++#[async_trait]
++impl Tool for NeverFinishesTool {
++    fn name(&self) -> &str {
++        self.name
++    }
++    fn description(&self) -> &str {
++        self.name
++    }
++    fn parameters_schema(&self) -> serde_json::Value {
++        serde_json::json!({"type": "object"})
++    }
++    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
++        std::future::pending().await
++    }
++}
++
++/// T8. Prediction: PASSES on master (contract C4). In a parallel batch, one
++/// tool finishes (and cancels the turn) while its sibling is still running:
++/// the finished tool keeps its real output and only the unfinished sibling
++/// gets the interrupted result, both inside `new_messages`.
++#[tokio::test]
++async fn issue_8794_t8_parallel_batch_cancel_keeps_finished_result_and_marks_sibling() {
++    let token = tokio_util::sync::CancellationToken::new();
++    let mut agent = build_agent_with_runtime(
++        Box::new(ScriptedProvider::new(vec![tool_response(vec![
++            tool_call("t8a", "gamma"),
++            tool_call("t8b", "slow"),
++        ])])),
++        vec![
++            Box::new(CancelAfterOutputTool {
++                name: "gamma",
++                token: token.clone(),
++            }),
++            Box::new(NeverFinishesTool { name: "slow" }),
++        ],
++        zeroclaw_config::schema::ResolvedRuntime {
++            parallel_tools: true,
++            ..Default::default()
++        },
++    );
++    let (tx, mut rx) = mpsc::channel(256);
++    let handle = zeroclaw_spawn::spawn!(async move {
++        agent
++            .turn_streamed_with_steering_state("t8", tx, Some(token), None)
++            .await
++    });
++    while rx.recv().await.is_some() {}
++    let err = handle.await.expect("task join").expect_err("cancelled");
++    assert!(
++        debug_contains(&err.new_messages, "zeroclaw_fixture_marker"),
++        "the finished tool keeps its real output"
++    );
++    let interrupted =
++        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
++    assert!(
++        debug_contains(&err.new_messages, &interrupted),
++        "the unfinished sibling gets the interrupted result"
++    );
++}
++
++/// Tool-round shapes for the durable projection used by the WebSocket store.
++/// Runs a turn whose single tool round finishes and cancels, then returns
++/// what `durable_chat_messages` keeps from the agent's history.
++async fn issue_8794_durable_after_cancelled_round(
++    prompt_guided: bool,
++) -> Vec<zeroclaw_providers::ChatMessage> {
++    let token = tokio_util::sync::CancellationToken::new();
++    let workspace = test_workspace();
++    let response = if prompt_guided {
++        text_response("<tool_call>{\"name\":\"gamma\",\"arguments\":{}}</tool_call>")
++    } else {
++        tool_response(vec![tool_call("t9a", "gamma")])
++    };
++    let dispatcher: Box<dyn ToolDispatcher> = if prompt_guided {
++        Box::new(XmlToolDispatcher)
++    } else {
++        Box::new(NativeToolDispatcher)
++    };
++    let mut agent = Agent::builder()
++        .model_provider(Box::new(ScriptedProvider::new(vec![response])))
++        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
++            vec![Box::new(CancelAfterOutputTool {
++                name: "gamma",
++                token: token.clone(),
++            }) as Box<dyn Tool>],
++        ))
++        .memory(mem_none(workspace.path()))
++        .observer(Arc::from(observability::NoopObserver {}))
++        .tool_dispatcher(dispatcher)
++        .workspace_dir(workspace.path().to_path_buf())
++        .build()
++        .expect("agent builder should succeed");
++    let (tx, mut rx) = mpsc::channel(256);
++    let outcome = agent
++        .turn_streamed_with_steering_state("t9", tx, Some(token), None)
++        .await;
++    while rx.recv().await.is_some() {}
++    outcome.expect_err("cancelled");
++    zeroclaw_providers::durable_chat_messages(agent.history())
++}
++
++/// T9 (control for E3), prompt-guided side. Prediction: PASSES on master. The
++/// tool round travels as plain chat rows, so the durable projection keeps the
++/// tool output.
++#[tokio::test]
++async fn issue_8794_t9_prompt_guided_round_survives_durable_projection() {
++    let durable = issue_8794_durable_after_cancelled_round(true).await;
++    assert!(
++        durable
++            .iter()
++            .any(|m| m.content.contains("zeroclaw_fixture_marker")),
++        "prompt-guided tool output is a chat row and is kept: {durable:?}"
++    );
++}
++
++/// T9 native side, characterization of E3. Prediction: PASSES on master, i.e.
++/// the durable projection DROPS the native tool round: no row carries the
++/// tool output. This pins the gap the issue describes.
++#[tokio::test]
++async fn issue_8794_t9_native_round_is_dropped_by_durable_projection() {
++    let durable = issue_8794_durable_after_cancelled_round(false).await;
++    assert!(
++        !durable
++            .iter()
++            .any(|m| m.content.contains("zeroclaw_fixture_marker")),
++        "native tool output is not part of the durable rows today: {durable:?}"
 +    );
 +}
