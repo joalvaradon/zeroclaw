@@ -1443,6 +1443,33 @@ fn note_own_transcript_write(
     }
 }
 
+/// Write the session's post-turn transcript and, only when the store took the
+/// write, record it as this connection's own so the next turn does not mistake
+/// it for another writer's change.
+///
+/// When the write fails the store still holds the transcript this connection
+/// last synced to, so the watermark stays as it was: the next turn then sees
+/// no change and keeps the live agent's history, instead of rebuilding it from
+/// the stale store and discarding the turn that just ran. The next successful
+/// write replaces the whole transcript from the agent's history, so the store
+/// converges without a delta.
+fn persist_post_turn_state(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    queue: &crate::session_queue::SessionActorQueue,
+    session_key: &str,
+    durable: &[zeroclaw_providers::ChatMessage],
+    breadcrumb_present: bool,
+    persisted_watermark: &mut PersistedWatermark,
+) {
+    if replace_conversation_state_unless_deleted(backend, session_key, durable, breadcrumb_present)
+    {
+        *persisted_watermark = PersistedWatermark {
+            generation: queue.advance_generation(session_key),
+            len: durable.len(),
+        };
+    }
+}
+
 /// Outcome of seeding an agent from a persisted transcript.
 struct RestoredHistory {
     /// Trim notice produced by seeding, to forward to the client.
@@ -2480,17 +2507,14 @@ async fn process_chat_message(
             } else {
                 zeroclaw_providers::durable_chat_messages(agent.history())
             };
-            let crumb = agent.history_has_trim_breadcrumb();
-            replace_conversation_state_unless_deleted(
+            persist_post_turn_state(
                 backend.as_ref(),
+                &state.session_queue,
                 session_key,
                 &durable,
-                crumb,
+                agent.history_has_trim_breadcrumb(),
+                persisted_watermark,
             );
-            *persisted_watermark = PersistedWatermark {
-                generation: state.session_queue.advance_generation(session_key),
-                len: durable.len(),
-            };
         }
 
         // Inform the client the turn was aborted
@@ -2540,9 +2564,14 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                *persisted_watermark =
-                    note_own_transcript_write(&state.session_queue, session_key, agent);
+                persist_post_turn_state(
+                    backend.as_ref(),
+                    &state.session_queue,
+                    session_key,
+                    &zeroclaw_providers::durable_chat_messages(agent.history()),
+                    agent.history_has_trim_breadcrumb(),
+                    persisted_watermark,
+                );
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -2715,9 +2744,14 @@ async fn process_chat_message(
         }
         Err(e) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                *persisted_watermark =
-                    note_own_transcript_write(&state.session_queue, session_key, agent);
+                persist_post_turn_state(
+                    backend.as_ref(),
+                    &state.session_queue,
+                    session_key,
+                    &zeroclaw_providers::durable_chat_messages(agent.history()),
+                    agent.history_has_trim_breadcrumb(),
+                    persisted_watermark,
+                );
             }
 
             // Set session state to error
@@ -6832,5 +6866,152 @@ data: {\"type\":\"message_stop\"}\n\n",
             v.get("model_context_window").is_none(),
             "model_context_window is additive and omitted when unset"
         );
+    }
+
+    // ── Issue 8794: a failed post-turn write must not rewind the live agent ──
+    //
+    // Scenario shared by the tests below: the first provider reply calls
+    // `file_read`, the tool runs and its result goes to the provider in
+    // request 2, which stays parked. The post-turn transcript write is then
+    // made to fail in the real SQLite store, and the next turn on the same
+    // connection must still see the live agent's history. The file holds a
+    // neutral marker that appears only in the tool result.
+
+    const ISSUE_8794_MARKER: &str = "zeroclaw_fixture_marker";
+
+    /// A fixture whose workspace holds `note.txt`; the first provider reply
+    /// calls `file_read` on it.
+    async fn issue_8794_fixture() -> ParkedTurnFixture {
+        let fixture = ParkedTurnFixture::spawn_with(None, |config| {
+            std::fs::write(config.data_dir.join("note.txt"), ISSUE_8794_MARKER)
+                .expect("fixture file");
+        })
+        .await;
+        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
+        fixture
+    }
+
+    /// Start the turn, let request 1 finish with the tool call, and return
+    /// request 2 (the one that carries the tool result and stays parked).
+    async fn issue_8794_park_after_tool_round(
+        fixture: &mut ParkedTurnFixture,
+        client: &mut WsClient,
+    ) -> serde_json::Value {
+        fixture.start_parked_turn(client, "read the note").await;
+        fixture.release_next();
+        let second = fixture.next_provider_request().await;
+        assert!(
+            second.to_string().contains(ISSUE_8794_MARKER),
+            "sanity: the tool result reached the provider within the turn"
+        );
+        second
+    }
+
+    async fn issue_8794_abort(fixture: &ParkedTurnFixture, session_id: &str) {
+        let response = crate::api::handle_api_session_abort(
+            axum::extract::State(fixture.state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Make every later transcript write fail in the real SQLite store, by
+    /// rejecting inserts into `sessions` with a trigger.
+    fn issue_8794_fail_durable_inserts(fixture: &ParkedTurnFixture) {
+        let db = fixture._tmp.path().join("workspace/sessions/sessions.db");
+        let conn = rusqlite::Connection::open(&db).expect("open the session database");
+        conn.execute_batch(
+            "CREATE TRIGGER issue_8794_fail_rewrite BEFORE INSERT ON sessions \
+             BEGIN SELECT RAISE(ABORT, 'simulated durable replacement failure'); END;",
+        )
+        .expect("install the failure trigger");
+    }
+
+    /// A Stop whose durable transcript replacement fails (a real SQLite trigger
+    /// rejects the insert) must not make the next turn on the same connection
+    /// rebuild its history from the stale store and lose the tool round. The
+    /// sanity check proves the failure was really injected.
+    #[test]
+    fn issue_8794_failed_durable_write_after_stop_keeps_tool_round() {
+        run_ws_regression(
+            "ws-8794-failed-write-after-stop",
+            issue_8794_failed_durable_write_after_stop_inner,
+        );
+    }
+
+    async fn issue_8794_failed_durable_write_after_stop_inner() {
+        let mut fixture = issue_8794_fixture().await;
+        let session_id = "issue-8794-t11";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
+
+        issue_8794_fail_durable_inserts(&fixture);
+
+        issue_8794_abort(&fixture, session_id).await;
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        assert!(
+            !fixture
+                .backend
+                .load(&session_key)
+                .iter()
+                .any(|message| message.content.contains(&interrupted)),
+            "sanity: the durable replacement really failed"
+        );
+
+        send_chat(&mut client, "redirect: summarize what you read").await;
+        let third = fixture.next_provider_request().await.to_string();
+        assert!(
+            third.contains(ISSUE_8794_MARKER),
+            "a failed durable write must not discard the live agent's tool round"
+        );
+        fixture.release_next();
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        drop(client);
+        fixture.shutdown();
+    }
+
+    /// The same defect on the completed-turn path: when the post-turn write
+    /// fails, the next turn must keep the prompt and the tool round of the turn
+    /// that just finished instead of rebuilding from the empty store.
+    #[test]
+    fn issue_8794_failed_durable_write_after_completed_turn_keeps_history() {
+        run_ws_regression(
+            "ws-8794-failed-write-after-completion",
+            issue_8794_failed_durable_write_after_completed_turn_inner,
+        );
+    }
+
+    async fn issue_8794_failed_durable_write_after_completed_turn_inner() {
+        let mut fixture = issue_8794_fixture().await;
+        let session_id = "issue-8794-t15";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
+
+        issue_8794_fail_durable_inserts(&fixture);
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert!(
+            fixture.backend.load(&session_key).is_empty(),
+            "sanity: the durable write of the completed turn really failed"
+        );
+
+        send_chat(&mut client, "summarize what you read").await;
+        let third = fixture.next_provider_request().await.to_string();
+        assert!(
+            third.contains("read the note") && third.contains(ISSUE_8794_MARKER),
+            "a failed durable write must not discard the completed turn from the live agent"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        drop(client);
+        fixture.shutdown();
     }
 }
