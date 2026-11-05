@@ -16,7 +16,7 @@ Contenido de la rama del fork (solo estos archivos nuevos en la raíz):
 
 1. Git para Windows.
 2. Rust con el toolchain MSVC: instalar `rustup` y las Build Tools de Visual Studio con la carga "Desktop development with C++". El proyecto exige rustc 1.96 o superior (`rust-version` del `Cargo.toml`); el análisis usó 1.97.0.
-3. Espacio libre: la compilación de pruebas de runtime y gateway ocupó unos 8 GB en Linux. Conviene reservar más de 15 GB.
+3. Espacio libre: la compilación de pruebas de runtime y gateway ocupó 3,8 GB en Linux con el debuginfo desactivado; en Windows (MSVC) puede ser mayor. Conviene reservar más de 10 GB.
 4. Opcional: Claude Code para Windows, para continuar con asistencia.
 
 ## 2. Obtener el upstream y los archivos (PowerShell)
