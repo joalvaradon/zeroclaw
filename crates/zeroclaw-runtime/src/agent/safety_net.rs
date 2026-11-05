@@ -4090,3 +4090,390 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
         "a switch written through the poisoned guard must be observed by the loop"
     );
 }
+
+// ── Issue 8794: interrupted turns must keep their completed tool rounds ──
+//
+// Fixtures use a neutral, synthetic marker (`zeroclaw_fixture_marker`).
+
+fn debug_contains(messages: &[ConversationMessage], needle: &str) -> bool {
+    messages.iter().any(|m| format!("{m:?}").contains(needle))
+}
+
+fn interruption_marker() -> String {
+    crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+}
+
+/// Tool that cancels the turn after it has produced its output.
+struct CancelAfterOutputTool {
+    name: &'static str,
+    token: tokio_util::sync::CancellationToken,
+}
+zeroclaw_api::tool_attribution!(
+    CancelAfterOutputTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+#[async_trait]
+impl Tool for CancelAfterOutputTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.name
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        self.token.cancel();
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "zeroclaw_fixture_marker".to_string().into(),
+            error: None,
+        })
+    }
+}
+
+/// A cancel in the middle of a batch keeps the round: the finished tool keeps
+/// its real output and the call that never ran gets the interrupted result.
+#[tokio::test]
+async fn issue_8794_midbatch_cancel_keeps_round_in_new_messages() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let later_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call("t2a", "gamma"),
+            tool_call("t2b", "alpha"),
+        ])])),
+        vec![
+            Box::new(CancelAfterOutputTool {
+                name: "gamma",
+                token: token.clone(),
+            }),
+            Box::new(CountingTool {
+                name: "alpha",
+                calls: Arc::clone(&later_calls),
+            }),
+        ],
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t2", tx, Some(token), None)
+            .await
+    });
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert_eq!(later_calls.load(Ordering::SeqCst), 0, "alpha must not run");
+    assert!(
+        err.new_messages
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "the cancelled round's tool-call message must be recorded"
+    );
+    assert!(
+        debug_contains(&err.new_messages, "zeroclaw_fixture_marker"),
+        "the completed tool keeps its real output"
+    );
+}
+
+/// A cancel that lands after the only tool of round 1 finished exits at the
+/// next iteration's cancellation check: round 1 stays, and exactly one
+/// interruption marker is appended.
+#[tokio::test]
+async fn issue_8794_cancel_between_rounds_keeps_prior_round_single_marker() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "t7a", "gamma",
+        )])])),
+        vec![Box::new(CancelAfterOutputTool {
+            name: "gamma",
+            token: token.clone(),
+        })],
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t7", tx, Some(token), None)
+            .await
+    });
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert!(
+        err.new_messages
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "round 1 tool-call message must be kept"
+    );
+    assert!(debug_contains(&err.new_messages, "zeroclaw_fixture_marker"));
+    let marker = interruption_marker();
+    let markers = err
+        .new_messages
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant" && c.content.contains(&marker)))
+        .count();
+    assert_eq!(markers, 1, "exactly one interruption marker");
+}
+
+/// Approval channel that never answers, so the turn parks on the approval wait.
+struct HangingApprovalChannel {
+    requests: Arc<AtomicUsize>,
+}
+impl ::zeroclaw_api::attribution::Attributable for HangingApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "acp"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for HangingApprovalChannel {
+    fn name(&self) -> &str {
+        "acp"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Cancelling while an approval is pending must still record the round: the
+/// call never ran, but it stays paired with an interrupted result.
+#[tokio::test]
+async fn issue_8794_cancel_during_approval_records_the_round() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "t1a", "echo",
+        )])])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(HangingApprovalChannel {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t1", tx, Some(token), None)
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "turn must park on the approval request");
+    cancel.cancel();
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "tool never executed");
+    assert!(
+        err.new_messages
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "the cancelled-at-approval round must be recorded (each tool call keeps a paired result)"
+    );
+    let interrupted =
+        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
+    assert!(
+        err.new_messages.iter().any(|m| {
+            matches!(m, ConversationMessage::ToolResults(_))
+                && format!("{m:?}").contains("t1a")
+                && format!("{m:?}").contains(&interrupted)
+        }),
+        "the recorded call must be paired with an interrupted result (pairing contract C6)"
+    );
+}
+
+/// Tool that never finishes on its own; only cancellation ends it.
+struct NeverFinishesTool {
+    name: &'static str,
+}
+zeroclaw_api::tool_attribution!(
+    NeverFinishesTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+#[async_trait]
+impl Tool for NeverFinishesTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.name
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        std::future::pending().await
+    }
+}
+
+/// In a parallel batch, one tool finishes (and cancels the turn) while its
+/// sibling is still running: the finished tool keeps its real output and only
+/// the unfinished sibling gets the interrupted result, both inside
+/// `new_messages`.
+#[tokio::test]
+async fn issue_8794_parallel_batch_cancel_keeps_finished_result_and_marks_sibling() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call("t8a", "gamma"),
+            tool_call("t8b", "slow"),
+        ])])),
+        vec![
+            Box::new(CancelAfterOutputTool {
+                name: "gamma",
+                token: token.clone(),
+            }),
+            Box::new(NeverFinishesTool { name: "slow" }),
+        ],
+        zeroclaw_config::schema::ResolvedRuntime {
+            parallel_tools: true,
+            ..Default::default()
+        },
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t8", tx, Some(token), None)
+            .await
+    });
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert!(
+        debug_contains(&err.new_messages, "zeroclaw_fixture_marker"),
+        "the finished tool keeps its real output"
+    );
+    let interrupted =
+        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
+    assert!(
+        debug_contains(&err.new_messages, &interrupted),
+        "the unfinished sibling gets the interrupted result"
+    );
+}
+
+/// Approval channel that denies the first request and never answers the next,
+/// so a batch can hold one already-resolved call and one call still waiting.
+struct DenyThenHangApprovalChannel {
+    requests: Arc<AtomicUsize>,
+}
+impl ::zeroclaw_api::attribution::Attributable for DenyThenHangApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "acp"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for DenyThenHangApprovalChannel {
+    fn name(&self) -> &str {
+        "acp"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
+        } else {
+            std::future::pending().await
+        }
+    }
+}
+
+/// Cancelling while a later call waits for approval keeps the real result of
+/// an earlier call in the same batch: the operator's denial is recorded, and
+/// only the call still waiting is marked interrupted.
+#[tokio::test]
+async fn issue_8794_cancel_during_approval_keeps_earlier_denial_result() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into(), "echo2".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call("t13a", "echo"),
+            tool_call("t13b", "echo2"),
+        ])])),
+        vec![
+            Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(CountingTool {
+                name: "echo2",
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(DenyThenHangApprovalChannel {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t13", tx, Some(token), None)
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "turn must park on the second approval");
+    cancel.cancel();
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert!(
+        debug_contains(&err.new_messages, "Denied by user"),
+        "the earlier call keeps the operator's real denial: {:?}",
+        err.new_messages
+    );
+}

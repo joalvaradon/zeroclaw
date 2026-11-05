@@ -10,7 +10,6 @@ use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +17,26 @@ use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
+
+/// Why preparation ended before the batch could run, with the results it had
+/// already settled (denied, replaced, hook-cancelled, deduplicated) so the
+/// caller can still record the round faithfully.
+pub(crate) struct PreparationAborted {
+    pub(crate) error: anyhow::Error,
+    pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
+}
+
+impl std::fmt::Debug for PreparationAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparationAborted")
+            .field("error", &self.error)
+            .field(
+                "settled_results",
+                &self.ordered_results.iter().flatten().count(),
+            )
+            .finish()
+    }
+}
 
 pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
@@ -136,7 +155,7 @@ pub(crate) async fn prepare_tool_calls(
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
     dedup_enabled: bool,
-) -> Result<PreparedToolCalls> {
+) -> std::result::Result<PreparedToolCalls, PreparationAborted> {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
@@ -285,9 +304,10 @@ pub(crate) async fn prepare_tool_calls(
                     abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                return Err(
-                    TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
-                );
+                return Err(PreparationAborted {
+                    error: TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
+                    ordered_results,
+                });
             }
         }
 
@@ -323,7 +343,10 @@ pub(crate) async fn prepare_tool_calls(
                         abandon_prepared_context(ctx, retained_context, retained_tool).await;
                     }
                     abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    return Err(ToolLoopCancelled.into());
+                    return Err(PreparationAborted {
+                        error: ToolLoopCancelled.into(),
+                        ordered_results,
+                    });
                 }
             };
         // An approved call is not an approval loop: drop its signature from
@@ -903,7 +926,7 @@ mod tests {
             let Err(error) = preparation.await else {
                 panic!("cancelled approval must abort preparation");
             };
-            assert!(error.is::<super::ToolLoopCancelled>());
+            assert!(error.error.is::<super::ToolLoopCancelled>());
         })
         .await
         .expect("approval cancellation must finish promptly");
@@ -1012,7 +1035,9 @@ mod tests {
                     false,
                 )
                 .await
-                .unwrap_or_else(|error| panic!("{case}/{tool_name} preparation failed: {error}"));
+                .unwrap_or_else(|aborted| {
+                    panic!("{case}/{tool_name} preparation failed: {}", aborted.error)
+                });
 
                 assert_eq!(prepared.executable_calls.len(), 1, "{case}/{tool_name}");
                 assert_eq!(
@@ -1197,7 +1222,7 @@ mod tests {
         else {
             panic!("the repeated prompt-required call must abort preparation");
         };
-        assert!(error.to_string().contains("repeated prompt-required"));
+        assert!(error.error.to_string().contains("repeated prompt-required"));
 
         assert_eq!(
             *events.lock().unwrap(),
