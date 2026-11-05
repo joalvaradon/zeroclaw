@@ -249,3 +249,16 @@ Límites: el watermark que se conserva asume que, antes del turno, coincidía co
 ### Recomendación de PRs
 
 Por "una preocupación por PR": PR 1 (runtime, T1 y T13) y un PR separado para H6 (gateway, T11 y T15). Tocan archivos distintos y no tienen orden entre sí; ambos enlazan el issue como `Related #8794`. PR 2 (T4, T10 y el hallazgo lateral) depende de la decisión de diseño de los mantenedores.
+
+## Ramas con el código en el fork (2026-11-05)
+
+Dos ramas en `joalvaradon/zeroclaw`, ambas sobre la base `65f8eb3c9284e396d9de7872c3df6dba993b7093` del upstream (no sobre `master` del fork, que tiene otra historia). Autor de los commits: `joalvaradon` con el correo de la cuenta; sin firma ni atribución de IA, como exige el proyecto.
+
+| Rama | Commit | Contenido | Tests incluidos | Verificación en el clon |
+|---|---|---|---|---|
+| `fix/ws-stop-keeps-tool-rounds` | `3dd95ac` | Cambio de firma de `prepare_tool_calls` y registro de la ronda al cancelar en la aprobación (`turn/mod.rs`, `turn/call_prep.rs`) | cancelación en la aprobación, denegación previa conservada, cancelación a mitad de lote, entre rondas y en lote paralelo | 5 tests de la issue y 11 de `call_prep`: 16 pasan; `fmt` limpio; `clippy -D warnings` sin avisos |
+| `fix/ws-keep-history-on-failed-persist` | `20ebc23` | Helper `persist_post_turn_state` en `ws.rs` (H6) | escritura durable fallida tras Stop y tras turno completado | 2 tests nuevos pasan; suite de gateway: 772 pasan, 1 falla (permisos, por correr como root); `fmt` y `clippy` limpios |
+
+Criterio de los tests: solo van los que pasan y tienen valor de regresión. Se dejaron fuera T4 y T10 (rojos hasta PR 2), T3, T5, T6, T9, T12 y T14 (caracterizaciones o controles) y se quitaron las referencias a mi análisis de los comentarios. Los parches originales y los tests de caracterización siguen en esta carpeta.
+
+Las ramas no se compilaron de nuevo desde el fork: el contenido subido tiene el mismo hash de árbol que las ramas probadas en el clon (`cb04ce03...` y `43beaafb...`). Para abrir los PR: `https://github.com/zeroclaw-labs/zeroclaw/compare/master...joalvaradon:zeroclaw:<rama>`. Antes, revisar la plantilla de PR vigente y verificar que `master` del upstream no haya avanzado (si avanzó, rebasar y repetir pruebas).
