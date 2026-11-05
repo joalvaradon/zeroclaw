@@ -149,7 +149,26 @@ Privacidad y datos persistidos: `privacy.md` rige artefactos del repositorio (c�
 | C13 | "The success data path is untouched: a successful tool result fed back to the model ... carries raw bytes." Los scrubs aplican a logs, observer y eventos de UI, y a los brazos de fallo de `execute_one_tool`. El scrubber es de mejor esfuerzo y no cubre `Authorization: Bearer <token>` | `crates/zeroclaw-runtime/src/agent/turn/redact.rs` (comentario de módulo, VERIFICADO); `agent/tool_execution.rs`, test de caracterización `failure_output_scrub_leaves_bearer_prefixed_token_but_still_runs` (VERIFICADO) | PR 2 llevaría resultados exitosos sin depurar a `sessions.db`: nueva superficie de datos en reposo. Respuesta a la pregunta abierta de la sección de privacidad: no hay depuración en el camino de datos exitoso. En modo prompt-guided el store WS ya persiste el carrier `[Tool results]` como Chat (E3), por lo que ya existe precedente de salidas de herramientas en reposo (INFERIDO; no se inspeccionó una base real). Refuerza el candidato `risk:high` / `domain:security` para PR 2 y la respuesta "Secrets handling changed: Yes" en la plantilla de PR. |
 | C14 | Taxonomía de pruebas: unit en `#[cfg(test)]`, component, integration, system, live; "Don't mock SQLite for tests that exercise schema or SQL"; CI usa `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`; `./scripts/ci/parallel_runtime_test_gate.sh` repite los binarios completos de `zeroclaw-runtime` y `zeroclaw-channels` con 16 hilos y es requisito en CI para cambios de esos crates | `contributing/testing.md` | Los tests T2, T5 a T8 viven como unit tests en `zeroclaw-runtime`; T1, T3, T4, T10 a T12 como tests en `ws.rs` (patrón existente) con sqlite real, no simulada. PR 1 debe correr el gate paralelo antes de publicar: un test de cancelación que comparte estado puede fallar solo ahí. |
 
-## Qué quedó bloqueado y por qué
+## Ejecución real de tests de runtime (2026-11-05, SHA `65f8eb3c`)
 
-- Compilar y ejecutar tests del upstream (`cargo test -p zeroclaw-runtime --no-run`) fue denegado por el clasificador de permisos del entorno (acción clasificada como código externo). No se intentó eludir. Consecuencia: ningún test T1 a T12 está escrito ni visto en rojo, y las predicciones de los tests son lectura estática. El entorno tiene recursos para compilar (4 núcleos, 15 GB de RAM, 30 GB libres, índice de crates accesible), pero la compilación completa del workspace no se estimó.
-- Para desbloquear: el usuario puede autorizar esa ejecución (regla de permiso de Bash), o ejecutar el paso en su equipo o en una sesión en la nube con el repo adjunto con permiso de push.
+La regla de permiso fue autorizada por el usuario y se compiló y ejecutó en el clon del upstream (solo local, sin push al upstream).
+
+- Entorno: rustc 1.97.0, cargo 1.97.0, 4 núcleos. Comando de compilación: `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/home/user/zeroclaw-labs/target cargo test -p zeroclaw-runtime --lib --no-run --locked -j4`. Resultado: `Finished test profile [unoptimized] target(s) in 7m 16s`, sin errores.
+- Comando de ejecución: `cargo test -p zeroclaw-runtime --lib --locked -j4 -- issue_8794 --test-threads=1`. Salida (cola): `test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 6086 filtered out; finished in 0.49s`.
+- Tests añadidos en `crates/zeroclaw-runtime/src/agent/safety_net.rs` (parche: `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch`, 301 líneas añadidas; se aplica sobre `65f8eb3c` con `git apply`). Predicción escrita en el código antes de la primera ejecución:
+
+| Test | Predicción | Resultado real |
+|---|---|---|
+| `issue_8794_t1_cancel_during_approval_records_the_round` | ROJO (E8) | ROJO. Falla en la aserción `the cancelled-at-approval round must be recorded (pairing contract C4/C6)` (`safety_net.rs:4387`), tras pasar la comprobación de que el turno quedó parado en la solicitud de aprobación y que la herramienta no se ejecutó. Confirma E8 con ejecución. |
+| `issue_8794_t2_midbatch_cancel_keeps_round_in_new_messages` | VERDE (E7) | VERDE |
+| `issue_8794_t5_thinking_only_cancel_persists_only_marker` | VERDE (E11) | VERDE. El thinking transitorio no llega a `new_messages` y solo queda el marcador. |
+| `issue_8794_t6_streamed_tool_call_before_cancel_is_not_recorded` | VERDE (caracteriza el hueco H3) | VERDE. Un tool call emitido en el stream antes del Stop no queda registrado ni se ejecuta. |
+| `issue_8794_t7_cancel_between_rounds_keeps_prior_round_single_marker` | VERDE | VERDE. La ronda previa se conserva y hay exactamente un marcador. |
+
+Límites: T1 se vio en rojo contra el código sin arreglar, pero el fix no está escrito, así que no se vio el verde posterior. T6 y T5 son pruebas de caracterización, no rojos. La discriminación del fixture de T2/T7 usa la salida `zeroclaw_fixture_marker` presente solo en el resultado de la herramienta. No se ejecutó el resto de la suite de `zeroclaw-runtime` ni `./scripts/ci/parallel_runtime_test_gate.sh`.
+
+## Pendiente de ejecución
+
+- T3, T4, T10, T11, T12 (nivel gateway, `ws.rs`): no escritos. Requieren compilar `zeroclaw-gateway` en modo test y construir el fixture `ParkedTurnFixture`; sin intentar.
+- T8 y T9 (paralelo y modo prompt-guided): no escritos.
+- Reproducción en daemon real: no hecha.
