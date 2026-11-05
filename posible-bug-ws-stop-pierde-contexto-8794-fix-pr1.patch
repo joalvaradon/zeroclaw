@@ -1,0 +1,74 @@
+diff --git a/crates/zeroclaw-runtime/src/agent/turn/mod.rs b/crates/zeroclaw-runtime/src/agent/turn/mod.rs
+index 43908ea..ac015b1 100644
+--- a/crates/zeroclaw-runtime/src/agent/turn/mod.rs
++++ b/crates/zeroclaw-runtime/src/agent/turn/mod.rs
+@@ -3350,12 +3350,19 @@ async fn run_tool_call_loop_impl<'a>(
+                 .await;
+         }
+ 
++        // A cancel that lands while a call waits for approval ends preparation
++        // before anything ran. Preparation has already abandoned its hook
++        // contexts and its partial results do not survive the error, so the
++        // round continues below as a fully interrupted batch: every call of
++        // the model's reply gets the interrupted result and the round is
++        // still recorded, keeping each tool call paired with a result.
++        let mut cancelled_in_preparation = false;
+         let PreparedToolCalls {
+             mut ordered_results,
+             mut executable_indices,
+             mut executable_calls,
+             mut stream_calls,
+-        } = prepare_tool_calls(
++        } = match prepare_tool_calls(
+             &ctx,
+             tools_registry,
+             activated_tools,
+@@ -3365,7 +3372,20 @@ async fn run_tool_call_loop_impl<'a>(
+             iteration,
+             knobs.dedup_enabled,
+         )
+-        .await?;
++        .await
++        {
++            Ok(prepared) => prepared,
++            Err(error) if is_tool_loop_cancelled(&error) => {
++                cancelled_in_preparation = true;
++                PreparedToolCalls {
++                    ordered_results: (0..tool_calls.len()).map(|_| None).collect(),
++                    executable_indices: Vec::new(),
++                    executable_calls: Vec::new(),
++                    stream_calls: Vec::new(),
++                }
++            }
++            Err(error) => return Err(error),
++        };
+ 
+         // Hooks and approvals have resolved the effective call. Admit one
+         // recovery dispatch for the warned identity; record the remaining
+@@ -3490,9 +3510,13 @@ async fn run_tool_call_loop_impl<'a>(
+             knobs.provider_attempt_allowlist.clone(),
+             execution,
+         );
+-        let execution_result = match shared_budget.clone() {
+-            Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
+-            None => execution.await,
++        let execution_result = if cancelled_in_preparation {
++            Ok(Vec::new())
++        } else {
++            match shared_budget.clone() {
++                Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
++                None => execution.await,
++            }
+         };
+         let executed_slots = match execution_result {
+             Ok(slots) => slots,
+@@ -3515,7 +3539,8 @@ async fn run_tool_call_loop_impl<'a>(
+             }
+         };
+ 
+-        let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
++        let cancelled_mid_batch =
++            cancelled_in_preparation || executed_slots.iter().any(Option::is_none);
+ 
+         let mut executed_completed_indices: Vec<usize> = Vec::new();
+         let mut executed_completed_calls = Vec::new();

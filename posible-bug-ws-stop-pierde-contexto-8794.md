@@ -191,3 +191,28 @@ Desviaciones respecto al plan y límites:
 - Hallazgo lateral (VERIFICADO por la transcripción vacía observada): durante un turno, la tabla `sessions` no contiene aún el mensaje del usuario; se escribe al finalizar. Si el daemon cae a mitad de turno, la tienda no refleja nada de ese turno. No se investigó más.
 - Los tests siguen sin fix: ninguno se vio en verde después de corregir. No se ejecutó el resto de la suite ni `parallel_runtime_test_gate.sh`.
 - No hecho: reproducción en daemon real.
+
+## Fix de PR 1 escrito y verificado (2026-11-05, base `65f8eb3c`)
+
+Parche: `posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch` (solo `crates/zeroclaw-runtime/src/agent/turn/mod.rs`, 31 líneas añadidas y 6 quitadas). Se aplica sobre `65f8eb3c` limpio, junto o sin el parche de tests (comprobado con `git apply --check` en un worktree limpio).
+
+Cambio: en `run_tool_call_loop_impl`, `prepare_tool_calls(...).await?` pasa a un `match`. Si el error es una cancelación (`is_tool_loop_cancelled`), se marca `cancelled_in_preparation`, se sintetiza un lote sin resultados ni llamadas ejecutables, se omite la ejecución (`Ok(Vec::new())`) y `cancelled_mid_batch` queda en true. La ronda sigue por el camino de cancelación existente: cada llamada de la respuesta del modelo recibe el resultado `turn-tool-interrupted-before-result`, se llama a `append_tool_round` y recién entonces se devuelve `ToolLoopCancelled`. No se vuelve a llamar a `abandon_unexecuted_prepared_contexts` con contextos reales (las listas ejecutables están vacías), respetando el test `approval_cancellation_abandons_retained_and_waiting_calls_once`.
+
+Decisión de contrato documentada: con el error se pierden los resultados parciales de `prepare_tool_calls` (denegadas, reemplazadas, canceladas por hook), por lo que todas las llamadas de la respuesta reciben el resultado interrumpido, incluso las que preparación ya había resuelto. No se cambió la firma de `prepare_tool_calls`.
+
+Evidencia (ejecutada):
+
+| Comprobación | Comando | Resultado |
+|---|---|---|
+| T1 y los otros tests de la issue en runtime, más el test de abandono de contextos | `cargo test -p zeroclaw-runtime --lib --locked -j4 -- issue_8794 approval_cancellation --test-threads=1` | `test result: ok. 9 passed; 0 failed; 0 ignored; 6085 filtered out` |
+| T1 antes del fix | misma suite sobre `65f8eb3c` | ROJO en `the cancelled-at-approval round must be recorded (pairing contract C4/C6)` |
+| Suite completa de la librería de runtime | `cargo test -p zeroclaw-runtime --lib --locked -j4` | `test result: ok. 6084 passed; 0 failed; 10 ignored; 0 measured` (56.83 s) |
+| Suite de la librería de gateway | `cargo test -p zeroclaw-gateway --lib --locked -j4` | `772 passed; 4 failed`: T4, T10, T11 (rojos esperados, requieren PR 2 y la corrección de H6) y `api_config::tests::unreadable_existing_config_survives_failed_save_rollback` |
+| Formato | `cargo fmt --all -- --check` | limpio (tras `cargo fmt --all` sobre mis tests; el fix no tenía diferencias) |
+| Lint | `cargo clippy -p zeroclaw-runtime -p zeroclaw-gateway --all-targets --locked -j4 -- -D warnings` | `Finished dev profile`, sin avisos |
+
+Sobre el fallo ajeno de gateway: `unreadable_existing_config_survives_failed_save_rollback` pone el archivo en modo `0o000` y espera un fallo de lectura; la sesión corre como root (`id -u` = 0), que ignora los permisos. Es un artefacto del entorno (VERIFICADO por lectura del test y de `id -u`). No se ejecutó ese test sobre `master` sin cambios, de modo que "falla también sin el fix" es INFERIDO.
+
+Alcance del fix: cubre H2 solamente (cancelación durante la aprobación). No cubre H3 (tool calls emitidos en el stream y T6, decisión abierta), H1 (PR 2: T4 y T10) ni H6 (T11, escritura durable fallida en `ws.rs`).
+
+Límites: T1 se vio en rojo antes del fix con la aserción original; la aserción reforzada de emparejamiento (resultado interrumpido de la llamada `t1a`) se añadió después y solo se vio en verde. No se ejecutó `./scripts/ci/parallel_runtime_test_gate.sh` (16 hilos, binarios repetidos), ni `cargo doc`, ni `./dev/ci.sh all`, ni la suite de `zeroclaw-channels`. No se verificó la interacción con el dashboard web real ni con un daemon.

@@ -6,7 +6,8 @@ Contenido de la rama del fork (solo estos archivos nuevos en la raíz):
 
 - `posible-bug-ws-stop-pierde-contexto-8794.md`: análisis con tabla de evidencia, contrato leído y resultados de ejecución.
 - `posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md`: plan de corrección (PR 1 y PR 2) y casos de prueba.
-- `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch`: 13 tests (T1 a T12 y las dos variantes de T9) listos para aplicar. Modifica `crates/zeroclaw-runtime/src/agent/safety_net.rs` y `crates/zeroclaw-gateway/src/ws.rs`.
+- `posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch`: 13 tests (T1 a T12 y las dos variantes de T9). Modifica `crates/zeroclaw-runtime/src/agent/safety_net.rs` y `crates/zeroclaw-gateway/src/ws.rs`.
+- `posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch`: el fix de PR 1 (solo `crates/zeroclaw-runtime/src/agent/turn/mod.rs`). Aplicable por separado.
 - Este archivo.
 
 ## 1. Requisitos en Windows 11
@@ -29,7 +30,7 @@ git worktree add --detach C:\repos-git\zeroclaw-8794 65f8eb3c9284e396d9de7872c3d
 git remote add fork https://github.com/joalvaradon/zeroclaw.git
 git fetch fork fix/8794-ws-stop-keeps-tool-rounds
 $b = "fork/fix/8794-ws-stop-keeps-tool-rounds"
-$names = "posible-bug-ws-stop-pierde-contexto-8794.md","posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md","posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch","posible-bug-ws-stop-pierde-contexto-8794-retomar-windows.md"
+$names = "posible-bug-ws-stop-pierde-contexto-8794.md","posible-bug-ws-stop-pierde-contexto-8794-plan-trabajo.md","posible-bug-ws-stop-pierde-contexto-8794-tests-runtime.patch","posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch","posible-bug-ws-stop-pierde-contexto-8794-retomar-windows.md"
 New-Item -ItemType Directory C:\repos-git\analisis-8794 -Force | Out-Null
 foreach ($n in $names) { git show "${b}:$n" | Out-File -Encoding utf8NoBOM "C:\repos-git\analisis-8794\$n" }
 ```
@@ -48,18 +49,23 @@ git apply C:\repos-git\analisis-8794\posible-bug-ws-stop-pierde-contexto-8794-te
 
 cargo test -p zeroclaw-runtime --lib --locked -- issue_8794 --test-threads=1
 cargo test -p zeroclaw-gateway --lib --locked -- issue_8794 --test-threads=1
+
+# Con el fix de PR 1
+git apply --check C:\repos-git\analisis-8794\posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch
+git apply C:\repos-git\analisis-8794\posible-bug-ws-stop-pierde-contexto-8794-fix-pr1.patch
+cargo test -p zeroclaw-runtime --lib --locked -- issue_8794 approval_cancellation --test-threads=1
 ```
 
 Resultado esperado en Linux, sobre `65f8eb3c` sin fix:
 
-- runtime: 7 verdes y 1 rojo (T1 `issue_8794_t1_cancel_during_approval_records_the_round`).
+- runtime sin el fix: 7 verdes y 1 rojo (T1 `issue_8794_t1_cancel_during_approval_records_the_round`). Con el fix: 9 verdes (incluye `approval_cancellation_abandons_retained_and_waiting_calls_once`).
 - gateway: T3 y T12 verdes; T4, T10 y T11 rojos.
 
 Si en Windows algún resultado difiere, anótalo: los tests de gateway abren sockets en `127.0.0.1` y usan SQLite real. No se ejecutó nada de esto en Windows. Los dos tests de gateway que dependen de temporización (T10, T12) conviene repetirlos varias veces.
 
 ## 4. Siguiente trabajo (resumen del plan)
 
-1. PR 1 (`zeroclaw-runtime`): registrar la ronda cuando se cancela durante la aprobación (T1 pasa a verde) y decidir el caso de tool calls emitidos en el stream (T6). Respetar la restricción del plan: no repetir `abandon_unexecuted_prepared_contexts`.
+1. PR 1 (`zeroclaw-runtime`): el fix de la cancelación durante la aprobación ya está en el parche (T1 verde). Falta decidir el caso de tool calls emitidos en el stream (T6), correr `parallel_runtime_test_gate.sh` y `cargo doc`, y preparar el PR con la plantilla vigente.
 2. Resolver H6 (T11): no avanzar el watermark si el reemplazo durable falla en la rama cancelada de `ws.rs`.
 3. PR 2: persistencia durable de rondas de herramientas (T4, T10). Requiere decisión de mantenedores y declaración de privacidad de datos en reposo; ver el plan, pasos 4 y 4 bis.
 4. Leer en el worktree, antes de redactar el PR: `.github/pull_request_template.md`, `CONTRIBUTING.md` y `docs/book/src/maintainers/pr-workflow.md`. Sin firmas ni atribución de IA en commits ni PR (regla del proyecto).
@@ -76,6 +82,6 @@ Alternativa: `claude --teleport session_01TPcXVWjBbBBg2gn6uetQiB` desde un clon 
 ## 6. Qué no se hizo
 
 - Reproducción en un daemon real.
-- Cualquier fix; los cuatro tests rojos siguen rojos.
+- Fix de PR 2 y de H6: T4, T10 y T11 siguen rojos. El fix de PR 1 sí está escrito y verificado en Linux.
 - Los tests no se ejecutaron en Windows, ni la suite completa de los crates, ni `parallel_runtime_test_gate.sh`.
 - PR 2 depende de una decisión de diseño de los mantenedores.

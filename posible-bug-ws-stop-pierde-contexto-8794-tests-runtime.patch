@@ -1,8 +1,8 @@
 diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
-index 60202f1..471e397 100644
+index 60202f1..7cf9836 100644
 --- a/crates/zeroclaw-gateway/src/ws.rs
 +++ b/crates/zeroclaw-gateway/src/ws.rs
-@@ -6833,4 +6833,246 @@ data: {\"type\":\"message_stop\"}\n\n",
+@@ -6833,4 +6833,248 @@ data: {\"type\":\"message_stop\"}\n\n",
              "model_context_window is additive and omitted when unset"
          );
      }
@@ -37,9 +37,7 @@ index 60202f1..471e397 100644
 +        fixture: &mut ParkedTurnFixture,
 +        client: &mut WsClient,
 +    ) -> serde_json::Value {
-+        fixture
-+            .start_parked_turn(client, "read the note")
-+            .await;
++        fixture.start_parked_turn(client, "read the note").await;
 +        fixture.release_next();
 +        let second = fixture.next_provider_request().await;
 +        assert!(
@@ -231,9 +229,13 @@ index 60202f1..471e397 100644
 +        issue_8794_park_after_tool_round(&mut fixture, &mut client).await;
 +
 +        issue_8794_abort(&fixture, session_id).await;
-+        send_chat(&mut client, "zeroclaw_fixture_followup sent right after stop").await;
-+        let arrived = tokio::time::timeout(Duration::from_secs(5), fixture.request_seen.recv())
-+            .await;
++        send_chat(
++            &mut client,
++            "zeroclaw_fixture_followup sent right after stop",
++        )
++        .await;
++        let arrived =
++            tokio::time::timeout(Duration::from_secs(5), fixture.request_seen.recv()).await;
 +        let carried = matches!(
 +            &arrived,
 +            Ok(Some(request)) if request.to_string().contains("zeroclaw_fixture_followup")
@@ -250,10 +252,10 @@ index 60202f1..471e397 100644
 +    }
  }
 diff --git a/crates/zeroclaw-runtime/src/agent/safety_net.rs b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-index 627a23e..27fcfd6 100644
+index 627a23e..90537ca 100644
 --- a/crates/zeroclaw-runtime/src/agent/safety_net.rs
 +++ b/crates/zeroclaw-runtime/src/agent/safety_net.rs
-@@ -4090,3 +4090,441 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+@@ -4090,3 +4090,454 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
          "a switch written through the poisoned guard must be observed by the loop"
      );
  }
@@ -412,7 +414,10 @@ index 627a23e..27fcfd6 100644
 +    }
 +    while rx.recv().await.is_some() {}
 +    let err = handle.await.expect("task join").expect_err("cancelled");
-+    assert!(!debug_contains(&err.new_messages, "zeroclaw_fixture_thinking"));
++    assert!(!debug_contains(
++        &err.new_messages,
++        "zeroclaw_fixture_thinking"
++    ));
 +    let marker = interruption_marker();
 +    let assistants: Vec<_> = err
 +        .new_messages
@@ -556,6 +561,16 @@ index 627a23e..27fcfd6 100644
 +            .iter()
 +            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
 +        "the cancelled-at-approval round must be recorded (pairing contract C4/C6)"
++    );
++    let interrupted =
++        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
++    assert!(
++        err.new_messages.iter().any(|m| {
++            matches!(m, ConversationMessage::ToolResults(_))
++                && format!("{m:?}").contains("t1a")
++                && format!("{m:?}").contains(&interrupted)
++        }),
++        "the recorded call must be paired with an interrupted result (pairing contract C6)"
 +    );
 +}
 +
