@@ -1,6 +1,6 @@
 # Plan de trabajo: issue 8794, Stop en el dashboard pierde el trabajo del turno
 
-Estado: BORRADOR no validado en frío (Fase 7 pendiente). Análisis en `posible-bug-ws-stop-pierde-contexto-8794.md`. Leerlo primero.
+Estado: BORRADOR con una pasada en frío (subagente opus, 2026-11-05) ya incorporada. Sigue sin compilarse ni ejecutarse nada. Pendientes: lane B/D y regla de aprobaciones (no se leyó `pr-workflow.md`), reproducción real. Análisis en `posible-bug-ws-stop-pierde-contexto-8794.md`. Leerlo primero.
 
 ## 6.1 Resumen y severidad
 
@@ -39,10 +39,12 @@ PR 1
 
 1. Cancelación en aprobación (H2).
    - Archivo: `crates/zeroclaw-runtime/src/agent/turn/mod.rs`, alrededor de `} = prepare_tool_calls(` (línea 3358 en la base).
-   - Cambio: capturar el `Err` de `prepare_tool_calls`; si `is_tool_loop_cancelled(&e)`, construir resultados con la cadena `turn-tool-interrupted-before-result` (ya usada en `mod.rs` línea 3589 y 3615 para el mismo fin) para cada llamada del lote, llamar `turn_state.append_tool_round(...)` con `assistant_history_content` y propagar el error. Reutilizar el bloque de líneas 3570 a 3659 en lugar de duplicarlo: extraer función si hace falta.
+   - Cambio: capturar el `Err` de `prepare_tool_calls`; si `is_tool_loop_cancelled(&e)`, construir resultados con la cadena `turn-tool-interrupted-before-result` (línea 3589 la usa para el historial; 3615 solo emite el evento de UI) para cada llamada del lote, llamar `turn_state.append_tool_round(...)` con `assistant_history_content` y propagar el error.
+   - Restricciones (revisión en frío): `prepare_tool_calls` ya abandonó los contextos; NO volver a llamar `call_prep::abandon_unexecuted_prepared_contexts` (el test `approval_cancellation_abandons_retained_and_waiting_calls_once` exige que ocurra una sola vez), por lo que no se puede reutilizar tal cual el bloque 3570 a 3659. Con `Err` el llamador no recibe `ordered_results` (resultados de Deny, Replace y hook-cancel se pierden): cambiar el contrato (error que lleve el estado parcial) o sintetizar el resultado interrumpido para todas las llamadas. Documentar la elección en el PR.
+   - Valor: bajo (se pierde la petición sin ejecutar, no trabajo ejecutado). Considerar posponer este paso.
    - Validar: `cargo test -p zeroclaw-runtime <nombre_test_nuevo>`.
-2. Cancelación durante streaming con tool calls emitidos (H3, parte herramientas). DECISIÓN ABIERTA: no implementar sin revisar con el mantenedor si un tool call incompleto debe reponerse. Evaluar primero si `outcome.tool_calls` está completo en el momento de la cancelación (`stream_consume.rs`, ancla `if forwarded_text.is_empty() {`). Si los argumentos pueden estar truncados, no persistir. Documentar la decisión en el PR.
-3. Comandos del PR 1: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked -p zeroclaw-runtime`, `./scripts/ci/rust_quality_gate.sh`.
+2. Cancelación durante streaming con tool calls emitidos (H3, parte herramientas). DECISIÓN ABIERTA: no implementar sin revisar con el mantenedor si un tool call incompleto debe reponerse. Evaluar primero si `outcome.tool_calls` está completo en el momento de la cancelación (`stream_consume.rs`, ancla `if forwarded_text.is_empty() {`). Si los argumentos pueden estar truncados, no persistir. Documentar la decisión en el PR. Revisión en frío (INFERIDO): Anthropic y los proveedores compatibles emiten cada `ToolCall` completo, pero el lote puede estar incompleto y los argumentos no se validan como JSON; como no hubo ejecución, persistirlos exige resultados sintéticos, igual que en el paso 1. No se revisaron otros proveedores.
+3. Comandos del PR 1: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked -p zeroclaw-runtime`, `cargo test --locked -p zeroclaw-gateway` (si T1 vive en `ws.rs`), `./scripts/ci/rust_quality_gate.sh`. Existencia de los scripts y paquetes verificada en la revisión en frío; las plantillas existen pero no se han leído.
 
 PR 2 (solo tras decisión de diseño; no codificar a ciegas)
 
@@ -54,13 +56,23 @@ PR 2 (solo tras decisión de diseño; no codificar a ciegas)
 
 | # | Cubre | Antes del fix | Después |
 |---|---|---|---|
-| T1 | Cancelar durante aprobación pendiente (H2) con historial previo | `agent.history()` no contiene `AssistantToolCalls` de la ronda cancelada; se espera que la aserción "history contiene la ronda" falle | contiene la ronda con resultado `turn-tool-interrupted-before-result` |
-| T2 | Cancelar a mitad de lote con una herramienta completada | ya pasa (E7); sirve de control | sin cambios |
-| T3 | Stop vía `/api/sessions/{id}/abort` durante varias rondas, luego un segundo mensaje en la misma conexión (patrón de los tests de `ws.rs` cerca de la línea 3750) | verificar si el segundo prompt enviado al proveedor contiene las rondas previas | debe contenerlas |
-| T4 | Mismo escenario con nueva conexión (restauración desde la tienda) | las rondas no están (E3), se espera fallo | según formato de PR 2 |
-| T5 | Cancelar con solo thinking streameado | se persiste solo el marcador (E11, INFERIDO) | definir con mantenedores |
+| T1 | Cancelar durante aprobación pendiente (H2). En `ws.rs`, copiar el patrón de `an_approval_sent_after_sign_out_resolves_nothing_inner`: `always_ask = vec!["file_read"]`, `script_tool_call(1, "file_read", ...)`, `next_frame_of(&mut client, "approval_request")`, `handle_api_session_abort`, `wait_for_turn_to_settle`, segundo `send_chat`, `next_provider_request()` | Predicción: ROJO. El cuerpo de la segunda petición no contiene `tool_use` con id `toolu_fixture` | Contiene `tool_use` `toolu_fixture` con su `tool_result` sintético. Decidir antes si el texto interrumpido llega al proveedor (ACP lo excluye: `!follow_up_request...contains(&synthetic)` en `dispatch.rs`) |
+| T2 | Cancelar a mitad de lote con una herramienta completada; comprobar `err.new_messages` (`StreamedTurnError`) | Predicción: VERDE en master (E7). Control, no rojo. Hoy ningún test comprueba el historial en este caso (`safety_net_midbatch_cancel_emits_events_for_completed_tools` solo mira eventos) | `AssistantToolCalls` y `ToolResults` con la salida de la herramienta completada y el texto interrumpido para la otra |
+| T3 | Stop vía `/api/sessions/{id}/abort` tras una ronda de herramienta, luego segundo mensaje en la misma conexión. Fixture: `ParkedTurnFixture` nativo (Anthropic), una sola ronda (el id es fijo `toolu_fixture`), `file_read` sin `always_ask` sobre un `note.txt` con contenido único, ronda 2 aparcada | Predicción: VERDE en master (historial en memoria, E7). Test de caracterización | Sin cambios: la petición 3 contiene un `tool_result` con el contenido único |
+| T4 | Mismo escenario con reconexión (`fixture.connect(session_id)` de nuevo, restauración desde sqlite) | Predicción: ROJO solo con herramientas nativas: la petición no contiene el contenido único de la herramienta (E3) | Tras PR 2, la petición tras reconectar contiene el contenido único de la herramienta |
+| T5 | Cancelar con solo `StreamEvent::ThinkingDelta`; en runtime con `StreamThenHangProvider` (`safety_net.rs`), cancelar al recibir `TurnEvent::Thinking`; patrón `safety_net_cancel_after_streamed_output_persists_partial` | Predicción: `err.new_messages` contiene un único assistant igual al marcador (E11) | Control: igual, salvo decisión explícita de mantenedores sobre razonamiento no firmado |
 
-Fixtures: el proveedor mock debe emitir herramientas con resultados distintos del texto final para que el test discrimine. Ninguno de estos tests se ha escrito ni ejecutado.
+Fixtures: usar proveedor nativo y una sola ronda de herramienta; la herramienta debe devolver contenido único distinto del texto final para que el test discrimine. Ninguno de estos tests se ha escrito ni ejecutado.
+
+Casos adicionales sugeridos por la revisión en frío:
+
+- T6: `StreamEvent::ToolCall` ya emitido y cuelgue (`StreamThenHangProvider`), para H3 herramientas.
+- T7: cancelación entre rondas (inicio de iteración, `mod.rs` línea 2040): rondas previas presentes y sin marcador duplicado.
+- T8: herramientas en paralelo, una completada y otra cancelada; comprobar historial, no solo eventos.
+- T9: T3 y T4 en modo prompt-guided como control (se espera que durable conserve `[Tool results]`, E3).
+- T10: reconexión tras Stop por cambio de modelo o de sesión (patrón de T4).
+- T11: fallo de escritura en la rama `was_cancelled` con `FailingReplaceBackend` (H6): el turno siguiente no debe perder el historial en memoria.
+- T12: mensaje enviado entre el POST de abort y la trama `aborted` (H5): ¿se procesa o se pierde?
 
 ## 6.6 Impacto y validación manual
 
