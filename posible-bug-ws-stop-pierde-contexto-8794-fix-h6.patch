@@ -1,0 +1,96 @@
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index 60202f1..dc8c165 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -1443,6 +1443,33 @@ fn note_own_transcript_write(
+     }
+ }
+ 
++/// Write the session's post-turn transcript and, only when the store took the
++/// write, record it as this connection's own so the next turn does not mistake
++/// it for another writer's change.
++///
++/// When the write fails the store still holds the transcript this connection
++/// last synced to, so the watermark stays as it was: the next turn then sees
++/// no change and keeps the live agent's history, instead of rebuilding it from
++/// the stale store and discarding the turn that just ran. The next successful
++/// write replaces the whole transcript from the agent's history, so the store
++/// converges without a delta.
++fn persist_post_turn_state(
++    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
++    queue: &crate::session_queue::SessionActorQueue,
++    session_key: &str,
++    durable: &[zeroclaw_providers::ChatMessage],
++    breadcrumb_present: bool,
++    persisted_watermark: &mut PersistedWatermark,
++) {
++    if replace_conversation_state_unless_deleted(backend, session_key, durable, breadcrumb_present)
++    {
++        *persisted_watermark = PersistedWatermark {
++            generation: queue.advance_generation(session_key),
++            len: durable.len(),
++        };
++    }
++}
++
+ /// Outcome of seeding an agent from a persisted transcript.
+ struct RestoredHistory {
+     /// Trim notice produced by seeding, to forward to the client.
+@@ -2480,17 +2507,14 @@ async fn process_chat_message(
+             } else {
+                 zeroclaw_providers::durable_chat_messages(agent.history())
+             };
+-            let crumb = agent.history_has_trim_breadcrumb();
+-            replace_conversation_state_unless_deleted(
++            persist_post_turn_state(
+                 backend.as_ref(),
++                &state.session_queue,
+                 session_key,
+                 &durable,
+-                crumb,
++                agent.history_has_trim_breadcrumb(),
++                persisted_watermark,
+             );
+-            *persisted_watermark = PersistedWatermark {
+-                generation: state.session_queue.advance_generation(session_key),
+-                len: durable.len(),
+-            };
+         }
+ 
+         // Inform the client the turn was aborted
+@@ -2540,9 +2564,14 @@ async fn process_chat_message(
+     match result {
+         Ok(outcome) => {
+             if let Some(ref backend) = state.session_backend {
+-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+-                *persisted_watermark =
+-                    note_own_transcript_write(&state.session_queue, session_key, agent);
++                persist_post_turn_state(
++                    backend.as_ref(),
++                    &state.session_queue,
++                    session_key,
++                    &zeroclaw_providers::durable_chat_messages(agent.history()),
++                    agent.history_has_trim_breadcrumb(),
++                    persisted_watermark,
++                );
+             }
+ 
+             // Fire-and-forget memory consolidation so facts from WS sessions
+@@ -2715,9 +2744,14 @@ async fn process_chat_message(
+         }
+         Err(e) => {
+             if let Some(ref backend) = state.session_backend {
+-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+-                *persisted_watermark =
+-                    note_own_transcript_write(&state.session_queue, session_key, agent);
++                persist_post_turn_state(
++                    backend.as_ref(),
++                    &state.session_queue,
++                    session_key,
++                    &zeroclaw_providers::durable_chat_messages(agent.history()),
++                    agent.history_has_trim_breadcrumb(),
++                    persisted_watermark,
++                );
+             }
+ 
+             // Set session state to error

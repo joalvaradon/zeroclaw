@@ -216,3 +216,36 @@ Sobre el fallo ajeno de gateway: `unreadable_existing_config_survives_failed_sav
 Alcance del fix: cubre H2 solamente (cancelación durante la aprobación). No cubre H3 (tool calls emitidos en el stream y T6, decisión abierta), H1 (PR 2: T4 y T10) ni H6 (T11, escritura durable fallida en `ws.rs`).
 
 Límites: T1 se vio en rojo antes del fix con la aserción original; la aserción reforzada de emparejamiento (resultado interrumpido de la llamada `t1a`) se añadió después y solo se vio en verde. No se ejecutó `./scripts/ci/parallel_runtime_test_gate.sh` (16 hilos, binarios repetidos), ni `cargo doc`, ni `./dev/ci.sh all`, ni la suite de `zeroclaw-channels`. No se verificó la interacción con el dashboard web real ni con un daemon.
+
+## Decisiones y fix de H6 (2026-11-05, base `65f8eb3c`)
+
+Decisiones del usuario: (1) aplicar el cambio de firma de `prepare_tool_calls` como fix definitivo de PR 1; (2) dejar el hallazgo lateral (el prompt se persiste al terminar el turno) para PR 2; (3) corregir H6.
+
+### PR 1 con firma (definitivo)
+
+`...-fix-pr1.patch` ahora contiene la variante con firma (`PreparationAborted`, `turn/mod.rs` y `turn/call_prep.rs`). El fix simple anterior se eliminó del árbol para evitar confusión. T1 y T13 pasan; ver el informe de impacto para las cifras.
+
+### H6: la escritura durable fallida avanzaba el watermark
+
+Mecanismo (VERIFICADO por lectura y por ejecución): en `crates/zeroclaw-gateway/src/ws.rs`, los tres puntos de escritura posteriores al turno (ramas de cancelación, éxito y error) llamaban a la escritura, ignoraban el `bool` que devuelve y avanzaban el watermark de la conexión igualmente. Si la escritura fallaba, la tienda conservaba la transcripción anterior pero el watermark decía lo contrario; `refresh_history_if_advanced` del turno siguiente veía una longitud distinta, ejecutaba `agent.clear_history()` y reconstruía el agente desde la tienda obsoleta. La rama de éxito pierde más que la de cancelación: con la tienda vacía, el turno siguiente pierde el prompt y la ronda de herramientas del turno recién terminado.
+
+Fix (`...-fix-h6.patch`, solo `ws.rs`, 4 hunks): un helper `persist_post_turn_state` escribe y avanza el watermark solo si la escritura se realizó; en caso contrario el watermark queda como estaba, el turno siguiente no ve cambios y conserva el historial vivo, y la siguiente escritura correcta reemplaza la transcripción completa (convergencia sin delta). Los tres puntos lo usan. Una sesión borrada durante el turno sigue tratándose como "nada que persistir" (el helper existente devuelve `true`).
+
+Inventario del patrón (búsqueda `advance_generation(` y `note_own_transcript_write(` en `crates/`, calibrada contra el caso conocido de `ws.rs`): los otros sitios que fijan un watermark tras escribir ya están condicionados (`restored.persisted` en `ws.rs` al conectar y en `refresh_history_if_advanced`); las dos apariciones en `api.rs` (alta de mensaje y borrado de sesión) avisan a otras conexiones y no fijan el watermark de una conexión. La rama de error de turno usa el mismo helper pero no tiene test propio.
+
+Evidencia (ejecutada):
+
+| Comprobación | Resultado |
+|---|---|
+| T11 (`issue_8794_t11_failed_durable_write_keeps_in_memory_tool_round`, camino de cancelación) y T15 (`issue_8794_t15_failed_durable_write_after_completed_turn_keeps_history`, camino de turno completado), con el helper forzado a avanzar siempre | ROJO los dos, en `a failed durable write must not discard the live agent's tool round` y `...the completed turn from the live agent` |
+| Mismos tests con el fix | VERDE los dos |
+| Fallo inyectado | Trigger SQL real `BEFORE INSERT ON sessions` en la base SQLite del fixture; comprobación de sanidad de que la transcripción queda vacía |
+| Suite de la librería de gateway | `cargo test -p zeroclaw-gateway --lib --locked -j4`: `775 passed; 3 failed`. Fallan T4 y T10 (PR 2) y el test ajeno de permisos (root) |
+| Formato y lint | `cargo fmt --all -- --check` limpio; `cargo clippy -p zeroclaw-runtime -p zeroclaw-gateway --all-targets --locked -j4 -- -D warnings` sin avisos |
+| Parches | `...-fix-pr1.patch`, `...-fix-h6.patch` y `...-tests-runtime.patch` aplican sobre `65f8eb3c` limpio en cualquier orden y reproducen el árbol de trabajo (mismo hash del diff) |
+
+Límites: el watermark que se conserva asume que, antes del turno, coincidía con el estado de la tienda; es lo que establecen el restore y el fin de turno anterior, y no se probó con otro escritor concurrente. La rama de error del turno no tiene test. No se ejecutó la suite de `zeroclaw-channels`, `parallel_runtime_test_gate.sh`, `cargo doc` ni un daemon real.
+
+### Recomendación de PRs
+
+Por "una preocupación por PR": PR 1 (runtime, T1 y T13) y un PR separado para H6 (gateway, T11 y T15). Tocan archivos distintos y no tienen orden entre sí; ambos enlazan el issue como `Related #8794`. PR 2 (T4, T10 y el hallazgo lateral) depende de la decisión de diseño de los mantenedores.

@@ -84,3 +84,9 @@ No incluirlo en PR 1 (una preocupación por PR). Tratarlo junto con PR 2: ambos 
 - Las opciones L2 y L3 no se implementaron; sus impactos son análisis de código más T14.
 - No se ejecutó `parallel_runtime_test_gate.sh`, `cargo doc`, `./dev/ci.sh all`, la suite de `zeroclaw-channels` ni nada en Windows o en un daemon real.
 - La suite de gateway, tras las modificaciones, no se volvió a correr completa; T14 y los tests de la issue sí.
+
+## 4. Decisiones (2026-11-05)
+
+- Se aplicó la opción B (cambio de firma) como fix definitivo de PR 1. El parche `...-fix-pr1.patch` es ahora esa variante; el fix simple se retiró del árbol.
+- El hallazgo lateral queda para PR 2, junto con la persistencia durable de las rondas de herramientas (L3 es la opción de referencia). No se implementó nada de L1, L2 ni L3.
+- Se corrigió H6 en un parche aparte (`...-fix-h6.patch`); ver el análisis.
