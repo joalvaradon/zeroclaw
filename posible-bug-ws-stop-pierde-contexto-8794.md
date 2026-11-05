@@ -72,7 +72,7 @@ Criterio de búsqueda (mecanismo): "cualquier salida de turno por cancelación q
   - `rpc/turn.rs`: `TurnOutcome::Cancelled { partial_text, messages: Vec<ConversationMessage> }` ya lleva mensajes estructurados. Sin hueco; modelo para PR 2 (VERIFICADO).
   - `events.rs:188` (`stream_text_posthoc_chunks`): una llamada en `mod.rs:3682` queda después de `append_tool_round` (sin pérdida); la de `mod.rs:3266` solo aplica con `on_delta`, que es `None` en la ruta streamed (INFERIDO).
   - `max_iter.rs:423`, `mod.rs:3676`, `mod.rs:2040`: las rondas previas ya están en el historial. Benignos.
-- Sitios aún NO leídos: canales (Telegram, etc.).
+- Canales (`crates/zeroclaw-channels/src/orchestrator/mod.rs`, ancla `"Cancelled in-flight channel request due to newer message"`): la cancelación ocurre por un mensaje nuevo; la rama leída solo registra el evento y cancela el borrador (`cancel_draft`). No se vio persistencia de historial en esa rama. Posible hueco análogo, fuera del alcance de 8794 (dashboard web); se sugiere rastrearlo aparte (INFERIDO). `acp_server.rs` usa estado estructurado propio (no leído en detalle).
 - Calibración de búsqueda: no realizada con patrón; las anclas anteriores se encontraron por lectura directa. Un grep de `ToolLoopCancelled` en `agent/turn/*.rs` devolvió call_prep.rs:326, events.rs:188, max_iter.rs:423, mod.rs:2040, 3668, 3676, de los cuales solo 326 y 2040 se leyeron con contexto; 188 (stream_text_posthoc_chunks), 423 (resumen final) y 3676 no se analizaron.
 
 ## Estado en GitHub (verificado vía páginas web, 2026-11-05)
@@ -102,7 +102,23 @@ No hay PR que cierre 8794 según lo leído. No verificado si existe PR abierto s
 
 1. Reproducir en daemon real: Stop con tareas largas y mensaje de redirección en la misma conexión (se espera que funcione), tras cambiar de modelo o de sesión, y tras recargar la página.
 2. (Resuelto) El cliente no reabre el socket tras `aborted`.
-3. Leer canales (Telegram, etc.).
+3. (Resuelto parcialmente) Canales: ver clasificación arriba.
 4. Decidir con mantenedores qué hacer con razonamiento no firmado.
 5. Leer el diff de PR 9378 y 10197 para reutilizar su formato.
-6. Plantillas de issue/PR del proyecto (`bug_report.yml`, `pull_request_template.md`, `CONTRIBUTING.md`, `pr-workflow.md`): NO leídas en esta ronda. Antes de redactar cualquier salida al repositorio, leerlas.
+6. (Resuelto) Plantillas y flujo leídos el 2026-11-05 en el SHA `65f8eb3c`: ver la sección siguiente.
+7. Aún sin leer: `docs/book/src/contributing/architecture-map.md` (AGENTS.md lo exige para cambios de arquitectura, config, seguridad o persistencia; aplica al PR 2), `docs/book/src/contributing/privacy.md` y `docs/book/src/maintainers/labels.md` fuera de la sección de risk labels.
+
+## Datos para reportar, según la plantilla vigente
+
+El issue 8794 ya existe, por lo que no hace falta un issue nuevo. Si el usuario autoriza un comentario, estos son los campos de `.github/ISSUE_TEMPLATE/bug_report.yml` (leída en este SHA) con lo que este análisis aporta:
+
+- Affected component: `web dashboard` (el issue lo marcó `runtime/daemon`; ambos son defendibles porque la pérdida ocurre en `zeroclaw-gateway` y `zeroclaw-runtime`).
+- Severity: S1 - workflow blocked (la del issue).
+- Current / Expected behavior: ya están en el issue; agregar la tabla E1 a E12 y el matiz de que en la misma conexión el historial en memoria conserva las rondas nativas.
+- Steps to reproduce: del issue. Agregar la variante "cambiar de modelo o recargar la página tras Stop". Marcar `N/A: no ejecutado en este entorno de análisis` para cualquier reproducción propia.
+- ZeroClaw version: `65f8eb3c9284e396d9de7872c3df6dba993b7093` (SHA analizado). `zeroclaw --version` y `zeroclaw doctor` (que pide `CONTRIBUTING.md`): `N/A, no ejecutable en este entorno de análisis`; se obtienen en la ejecución en la nube.
+- Rust version, OS: no aplica (sin compilación); el issue indica Ubuntu 24.04.
+- Regression: Unknown (el issue). Pre-flight checks: "reproducido en la última master" NO se cumple en este análisis (solo lectura de código); no marcarlo.
+- Privacidad: redactar secretos e identidades (merge gate de `CONTRIBUTING.md`).
+
+Clasificación de PR (leída en `pr-workflow.md`, SHA `65f8eb3c`): PR 1 encaja en la lane B (narrow bug/fix) solo si queda `risk:medium`. El issue ya lleva `risk:high`, y los labels de riesgo son decisión manual de los mantenedores; si el PR lo hereda, pasa a la lane D con dos aprobaciones Core independientes (o la vía acelerada, con sus condiciones). PR 2 (persistencia y compatibilidad de transcripción) es lane D: toca un límite de persistencia/compatibilidad.

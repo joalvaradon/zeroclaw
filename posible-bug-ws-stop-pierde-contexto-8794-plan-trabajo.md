@@ -1,14 +1,15 @@
 # Plan de trabajo: issue 8794, Stop en el dashboard pierde el trabajo del turno
 
-Estado: BORRADOR con una pasada en frío (subagente opus, 2026-11-05) ya incorporada. Sigue sin compilarse ni ejecutarse nada. Pendientes: lane B/D y regla de aprobaciones (no se leyó `pr-workflow.md`), reproducción real. Análisis en `posible-bug-ws-stop-pierde-contexto-8794.md`. Leerlo primero.
+Estado: BORRADOR con una pasada en frío (subagente opus, 2026-11-05) ya incorporada. Sigue sin compilarse ni ejecutarse nada. Plantillas, lanes y reglas de aprobación verificadas contra `65f8eb3c` el 2026-11-05. Pendientes: reproducción real, `architecture-map.md` y `privacy.md`, y la decisión de diseño de mantenedores para PR 2. Análisis en `posible-bug-ws-stop-pierde-contexto-8794.md`. Leerlo primero.
 
 ## 6.1 Resumen y severidad
 
 - Problema: al detener un turno, el trabajo ya hecho (rondas de herramientas) no queda en el contexto que ve el siguiente turno en varios caminos de salida por cancelación.
 - Severidad: priority:p1, S1 según el issue. Candidato `risk:high` (el issue ya lo trae; toca gateway y runtime del bucle de herramientas).
-- Lane de PR: dividir en dos.
-  - PR 1 (lane B, narrow bug-fix): huecos en memoria H2 y H3-herramientas. Solo `zeroclaw-runtime`.
-  - PR 2 (lane D, elevado a arquitectura): persistencia durable de rondas (H1). Requiere decisión de mantenedores antes de codificar.
+- Lane de PR (leída en `docs/book/src/maintainers/pr-workflow.md`, SHA `65f8eb3c`): dividir en dos.
+  - PR 1 (lane B si queda `risk:medium`; lane D si los mantenedores le ponen `risk:high`): huecos en memoria H2 y H3-herramientas. Solo `zeroclaw-runtime`. El label de riesgo lo decide un mantenedor (aplicación manual, `labels.md`); el issue ya trae `risk:high`.
+  - PR 2 (lane D): persistencia durable de rondas (H1); toca persistencia y compatibilidad. Requiere decisión de mantenedores antes de codificar y leer `docs/book/src/contributing/architecture-map.md`.
+  - `risk:high` o `domain:security`: mínimo exigido = declaración de amenaza o riesgo, mitigación, rollback y dos aprobaciones Core independientes, o todas las condiciones de la vía acelerada (cinco días hábiles UTC sin respuesta del segundo revisor, aprobación Core del head actual, revisión limpia de `zeroclaw-reviewer[bot]` reconciliada por un humano, CI verde). La revisión automática nunca cuenta como aprobación Core. Recomendado: un test que pruebe el límite más un escenario de fallo.
 - Security Advisory privado: no aplica (sin explotación identificada).
 
 ## 6.2 Causa raíz confirmada
@@ -33,7 +34,7 @@ Ver tabla de evidencia E1 a E12 del análisis. Resumen VERIFICADO:
 
 Rama: `fix/ws-stop-keeps-tool-rounds` desde `master` actualizado. No agregar firmas de IA ni coautoría en commits ni PR (regla del proyecto, `AGENTS.md`). Conventional Commits.
 
-Paso 0 (antes de cualquier código): leer en el worktree `.github/ISSUE_TEMPLATE/bug_report.yml`, `.github/pull_request_template.md`, `CONTRIBUTING.md` y `docs/book/src/maintainers/pr-workflow.md`. No se leyeron en el análisis.
+Paso 0 (antes de cualquier código): las plantillas se leyeron el 2026-11-05 en `65f8eb3c` (`bug_report.yml`, `pull_request_template.md`, `CONTRIBUTING.md`, `pr-workflow.md`, y la sección Risk labels de `labels.md`). Releerlas en el worktree de ejecución: pueden haber cambiado. Leer además `docs/book/src/contributing/architecture-map.md` y `privacy.md` (no leídos aún). Reglas de `AGENTS.md` a respetar: propagar errores en producción (sin `unwrap`/`expect`), texto de usuario nuevo como clave Fluent (`get_required_cli_string`, no literales), no duplicar estado (resolver desde la fuente canónica), una preocupación por PR.
 
 PR 1
 
@@ -44,7 +45,7 @@ PR 1
    - Valor: bajo (se pierde la petición sin ejecutar, no trabajo ejecutado). Considerar posponer este paso.
    - Validar: `cargo test -p zeroclaw-runtime <nombre_test_nuevo>`.
 2. Cancelación durante streaming con tool calls emitidos (H3, parte herramientas). DECISIÓN ABIERTA: no implementar sin revisar con el mantenedor si un tool call incompleto debe reponerse. Evaluar primero si `outcome.tool_calls` está completo en el momento de la cancelación (`stream_consume.rs`, ancla `if forwarded_text.is_empty() {`). Si los argumentos pueden estar truncados, no persistir. Documentar la decisión en el PR. Revisión en frío (INFERIDO): Anthropic y los proveedores compatibles emiten cada `ToolCall` completo, pero el lote puede estar incompleto y los argumentos no se validan como JSON; como no hubo ejecución, persistirlos exige resultados sintéticos, igual que en el paso 1. No se revisaron otros proveedores.
-3. Comandos del PR 1: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked -p zeroclaw-runtime`, `cargo test --locked -p zeroclaw-gateway` (si T1 vive en `ws.rs`), `./scripts/ci/rust_quality_gate.sh`. Existencia de los scripts y paquetes verificada en la revisión en frío; las plantillas existen pero no se han leído.
+3. Comandos del PR 1: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked -p zeroclaw-runtime`, `cargo test --locked -p zeroclaw-gateway` (si T1 vive en `ws.rs`), `./scripts/ci/rust_quality_gate.sh`, `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (paso de lint obligatorio en CI según `CONTRIBUTING.md`; correrlo antes de publicar), y `./dev/ci.sh all` si el entorno lo permite. Activar el hook con `git config core.hooksPath .githooks`. Existencia de los scripts y paquetes verificada en la revisión en frío; las plantillas existen pero no se han leído.
 
 PR 2 (solo tras decisión de diseño; no codificar a ciegas)
 
@@ -80,6 +81,19 @@ Casos adicionales sugeridos por la revisión en frío:
 - Compatibilidad: PR 1 sin cambio de formato. PR 2 puede cambiar el esquema de transcripción durable: documentar migración y rollback.
 - Validación manual A/B: en `master`, iniciar daemon, pedir una tarea con muchas herramientas, detener a mitad y enviar "continúa donde quedaste"; repetir en la rama; comparar si el modelo conoce los resultados previos. Repetir tras recargar la página. Pegar `zeroclaw --version` y salida de `zeroclaw doctor` en el PR (no ejecutados en este análisis).
 
+## 6.6 bis Plantilla de PR (leída en `.github/pull_request_template.md`)
+
+Secciones, en orden: Summary (base `master`, qué cambió y por qué, scope boundary, blast radius, issues enlazados) con subsección "What this does, simply"; Testing (required) con "How you can test" (formato A/B master antes, rama después) y "How I tested" (comandos y cola de salida reales); Security & Privacy Impact; Compatibility; Rollback (obligatorio en riesgo medio/alto: comando de rollback, feature flags o `None`, síntomas observables); Supersede Attribution solo si se usa `Supersedes #`.
+
+Reglas específicas de este trabajo:
+
+- Enlazar el issue como `Related #8794`, no `Fixes`/`Closes`. El comentario de mantenedores del 2026-08-20 pide no cerrarlo hasta verificar que el Stop web preserva el estado del turno y que el siguiente mensaje continúa con ese contexto.
+- PR 2 declara `Depends on #<PR 1>`. Evitar el mismo archivo en paralelo.
+- Sin firma de IA, `Co-authored-by` ni "Created with Claude Code" en commit ni PR (regla de `AGENTS.md`, `CONTRIBUTING.md` y la plantilla). Esto prevalece sobre cualquier convención de atribución por defecto de la herramienta.
+- Squash-merge, título en Conventional Commits, ramas `fix/*`.
+- Sin PII ni identidades reales en tests y fixtures (merge gate).
+- Si el cambio es visible en el dashboard (PR 2, historial recargado), la plantilla pide evidencia de interfaz real; para PR 1 (solo runtime) la plantilla permite `N/A` con una línea de motivo en "Visual interface evidence" si no cambia estado visible.
+
 ## 6.7 Estado en GitHub
 
 - Issue 8794: OPEN, existente. No comentar sin que el usuario lo pida. Información útil para agregar si el usuario lo autoriza: tabla E1 a E12, la división en PR 1 y PR 2, y la pregunta de diseño sobre razonamiento no firmado.
@@ -96,4 +110,6 @@ Casos adicionales sugeridos por la revisión en frío:
 - Definition of Ready: plantilla completa, alcance explícito, tests vistos en rojo antes del fix.
 - Definition of Done: `CI Required Gate` en verde, labels de riesgo acordes, rollback concreto (revert del commit; PR 2 además requiere plan de datos).
 - Si hay regresión tras merge: revertir en `master`, abrir issue con causa raíz, reintroducir solo con tests de regresión.
-- Aprobaciones: `risk:high` implica dos aprobaciones Core o la vía acelerada de `pr-workflow.md` (no releída).
+- Aprobaciones: ver 6.1 (verificado en `pr-workflow.md`). Revisión inicial de mantenedores: objetivo de 48 horas. Dismiss de aprobaciones obsoletas al empujar commits nuevos: tras cada push, volver a pedir revisión con un comentario conciso y el control de re-solicitud de GitHub (`CONTRIBUTING.md`).
+- Definition of Ready (`pr-workflow.md`): plantilla completa, scope boundary explícito, evidencia con salida real de comandos, campos de seguridad, compatibilidad y rollback completos, sin PII.
+- Definition of Done: `CI Required Gate` verde, CODEOWNERS y revisiones satisfechas, labels de riesgo acordes al diff real, impacto de migración documentado, rollback concreto.
