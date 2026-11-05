@@ -34,7 +34,7 @@ Ver tabla de evidencia E1 a E12 del análisis. Resumen VERIFICADO:
 
 Rama: `fix/ws-stop-keeps-tool-rounds` desde `master` actualizado. No agregar firmas de IA ni coautoría en commits ni PR (regla del proyecto, `AGENTS.md`). Conventional Commits.
 
-Paso 0 (antes de cualquier código): las plantillas se leyeron el 2026-11-05 en `65f8eb3c` (`bug_report.yml`, `pull_request_template.md`, `CONTRIBUTING.md`, `pr-workflow.md`, y la sección Risk labels de `labels.md`). Releerlas en el worktree de ejecución: pueden haber cambiado. Leer además `docs/book/src/contributing/architecture-map.md` y `privacy.md` (no leídos aún). Reglas de `AGENTS.md` a respetar: propagar errores en producción (sin `unwrap`/`expect`), texto de usuario nuevo como clave Fluent (`get_required_cli_string`, no literales), no duplicar estado (resolver desde la fuente canónica), una preocupación por PR.
+Paso 0 (antes de cualquier código): las plantillas se leyeron el 2026-11-05 en `65f8eb3c` (`bug_report.yml`, `pull_request_template.md`, `CONTRIBUTING.md`, `pr-workflow.md`, y la sección Risk labels de `labels.md`). Releerlas en el worktree de ejecución: pueden haber cambiado. `architecture-map.md`, `privacy.md`, `memory-payload-lifecycle.md`, `history-management.md`, `tool-execution-lifecycle.md`, `runtime-state-and-persistence.md`, `rfcs.md` y `user-boundary-proof.md` se leyeron en parte el 2026-11-05 (ver "Contrato leído" del análisis); leer completos, además de `request-lifecycle.md`, `testing.md`, `gateway/api.md`, `developing/web.md`, `fnd-001` y `fnd-006`, antes de codificar. Reglas de `AGENTS.md` a respetar: propagar errores en producción (sin `unwrap`/`expect`), texto de usuario nuevo como clave Fluent (`get_required_cli_string`, no literales), no duplicar estado (resolver desde la fuente canónica), una preocupación por PR.
 
 PR 1
 
@@ -49,7 +49,7 @@ PR 1
 
 PR 2 (solo tras decisión de diseño; no codificar a ciegas)
 
-4. Proponer en el issue o en un RFC corto el formato durable: opciones (a) conservar la proyección y agregar un registro estructurado de rondas en el turno interrumpido, siguiendo lo que hizo PR 9378 para ACP; (b) persistir un resumen textual del trabajo hecho junto al marcador. Elegir con mantenedores. Revisar el diff de PR 9378 y de PR 10197 primero.
+4. Proponer en el issue o en un RFC corto el formato durable (corrección: `rfcs.md` indica que una migración o cambio de esquema por sí solos NO requieren RFC; usar un issue ordinario y preguntar a un mantenedor si el cambio cruza algún disparador de RFC. Declarar propietario, alcance, durabilidad, privacidad y truncado de los resultados persistidos, y si respetan `max_tool_result_chars`; ver C7): opciones (a) conservar la proyección y agregar un registro estructurado de rondas en el turno interrumpido, siguiendo lo que hizo PR 9378 para ACP; (b) persistir un resumen textual del trabajo hecho junto al marcador. Elegir con mantenedores. Revisar el diff de PR 9378 y de PR 10197 primero.
 5. Implementar en `ws.rs` (rama `was_cancelled`, ancla `let needs_marker = match &result {`) y en la restauración (`restore_agent_history`). Pasar por la depuración de secretos existente antes de guardar resultados de herramientas.
 6. Validar: `cargo test --locked -p zeroclaw-gateway`, `./dev/ci.sh all` si el entorno lo permite.
 
@@ -62,6 +62,8 @@ PR 2 (solo tras decisión de diseño; no codificar a ciegas)
 | T3 | Stop vía `/api/sessions/{id}/abort` tras una ronda de herramienta, luego segundo mensaje en la misma conexión. Fixture: `ParkedTurnFixture` nativo (Anthropic), una sola ronda (el id es fijo `toolu_fixture`), `file_read` sin `always_ask` sobre un `note.txt` con contenido único, ronda 2 aparcada | Predicción: VERDE en master (historial en memoria, E7). Test de caracterización | Sin cambios: la petición 3 contiene un `tool_result` con el contenido único |
 | T4 | Mismo escenario con reconexión (`fixture.connect(session_id)` de nuevo, restauración desde sqlite) | Predicción: ROJO solo con herramientas nativas: la petición no contiene el contenido único de la herramienta (E3) | Tras PR 2, la petición tras reconectar contiene el contenido único de la herramienta |
 | T5 | Cancelar con solo `StreamEvent::ThinkingDelta`; en runtime con `StreamThenHangProvider` (`safety_net.rs`), cancelar al recibir `TurnEvent::Thinking`; patrón `safety_net_cancel_after_streamed_output_persists_partial` | Predicción: `err.new_messages` contiene un único assistant igual al marcador (E11) | Control: igual, salvo decisión explícita de mantenedores sobre razonamiento no firmado |
+
+Contrato que los tests deben respetar: nunca queda un `tool_use` sin su `tool_result` (C6); los resultados sintéticos no generan recibo (C5); los fixtures usan datos sintéticos y placeholders neutrales de `privacy.md`, por ejemplo `zeroclaw_fixture_marker` como contenido único de la herramienta (C11). Nivel de prueba (`user-boundary-proof.md`, fila Gateway): T1, T3 y T4 deben pasar por la ruta real y el WebSocket real; reconexión y temporización pueden pedir evidencia manual adicional, con un nombre explícito de la brecha.
 
 Fixtures: usar proveedor nativo y una sola ronda de herramienta; la herramienta debe devolver contenido único distinto del texto final para que el test discrimine. Ninguno de estos tests se ha escrito ni ejecutado.
 
@@ -80,6 +82,13 @@ Casos adicionales sugeridos por la revisión en frío:
 - Funcional: el siguiente mensaje tras Stop conserva el contexto del trabajo hecho.
 - Compatibilidad: PR 1 sin cambio de formato. PR 2 puede cambiar el esquema de transcripción durable: documentar migración y rollback.
 - Validación manual A/B: en `master`, iniciar daemon, pedir una tarea con muchas herramientas, detener a mitad y enviar "continúa donde quedaste"; repetir en la rama; comparar si el modelo conoce los resultados previos. Repetir tras recargar la página. Pegar `zeroclaw --version` y salida de `zeroclaw doctor` en el PR (no ejecutados en este análisis).
+
+## 6.6 ter Contrato de arquitectura aplicable
+
+- `architecture-map.md` pide que un cambio de bucle de herramientas nombre si afecta aprobación, despacho, recibos, eventos de observer, historial o cancelación. PR 1 afecta historial y cancelación (y el camino de aprobación en el paso 1); no debe tocar recibos ni observer. Declararlo en el scope boundary.
+- Lista de revisión de `tool-execution-lifecycle.md` para el PR: "¿La cancelación cierra solo las tarjetas y resultados de herramientas sin terminar?" y "¿Incluye validación a nivel de frontera para la superficie visible (ACP/WS, gateway)?".
+- El paso 1 del plan se justifica contra C4: el contrato dice que preparación llena un slot por llamada cancelada; con `Err` no llega al historial.
+- El paso 2 (stream cancelado con tool calls) exige resultados sintéticos por C6; si no se pueden emparejar todas las llamadas, no persistir ninguna.
 
 ## 6.6 bis Plantilla de PR (leída en `.github/pull_request_template.md`)
 
