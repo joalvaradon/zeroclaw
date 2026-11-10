@@ -1,0 +1,43 @@
+name: Probe channel created_at
+
+# Runs only the channel created_at tests on a probe branch. Nothing here
+# publishes, caches, or touches secrets.
+on:
+  push:
+    branches: ['probe/11420-canales-*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  probe:
+    name: Channel created_at tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Tree under test
+        run: |
+          git rev-parse HEAD
+          git log -1 --format=%s
+      - name: Run the channel created_at tests
+        # The first three are the probe; the last is an existing hydration
+        # test that must pass on both trees, so a run where nothing was
+        # selected or compiled cannot look like a result.
+        run: >
+          cargo test --locked -p zeroclaw-channels --lib -- --test-threads=1
+          hydration_cap_keeps_the_created_at_of_retained_rows_in_sqlite
+          hydration_cap_with_an_orphan_turn_keeps_retained_times_and_adds_a_newer_closure
+          trim_resync_keeps_created_at_of_retained_rows_in_sqlite
+          hydration_drops_ownership_when_the_cap_removes_the_owned_marker

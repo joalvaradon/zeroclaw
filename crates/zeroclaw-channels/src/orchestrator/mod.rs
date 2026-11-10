@@ -18869,6 +18869,101 @@ fn channel_trim_resync_survives_restart() {
     );
 }
 
+/// A per-turn trim of a SQLite-backed channel conversation must keep the
+/// `created_at` of every row it retains. The turns are appended the way a
+/// channel turn appends them, the tool-call loop then trims its working
+/// buffer (drops the oldest turns, inserts the breadcrumb, prefixes the
+/// current user turn with a volatile preamble), and the real resync wrapper
+/// publishes the result.
+#[cfg(test)]
+#[test]
+fn trim_resync_keeps_created_at_of_retained_rows_in_sqlite() {
+    use zeroclaw_infra::session_backend::SessionBackend;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+    let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+    let sender = "trim_resync_created_at".to_string();
+    let nap = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let mut known_prefix = Vec::new();
+    for turn in [
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("a1"),
+        ChatMessage::user("q2"),
+        ChatMessage::assistant("a2"),
+        ChatMessage::user("q3"),
+        ChatMessage::assistant("a3"),
+        ChatMessage::user("q4 raw"),
+    ] {
+        known_prefix =
+            append_sender_turn(ctx.as_ref(), &sender, turn).expect("turn must be appended");
+        nap();
+    }
+    let before = backend.load_with_timestamps(&sender);
+    assert_eq!(before.len(), 7);
+    let times_before: Vec<_> = before
+        .iter()
+        .map(|m| m.created_at.expect("RFC 3339 created_at"))
+        .collect();
+    assert!(
+        times_before.windows(2).all(|w| w[0] < w[1]),
+        "the seeded rows must carry distinct, increasing times"
+    );
+
+    // The loop dropped q1..a2, inserted the breadcrumb, and prefixed the
+    // current user turn with the volatile preamble for the provider call.
+    let history = vec![
+        ChatMessage::system("system prompt"),
+        ChatMessage::user(zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL),
+        ChatMessage::user("q3"),
+        ChatMessage::assistant("a3"),
+        ChatMessage::user("[reply_target: x]\nq4 raw"),
+        ChatMessage::assistant("a4"),
+    ];
+    nap();
+    let resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &sender,
+        &history,
+        true,  // history_has_trim_breadcrumb
+        false, // crumb_present_before_loop
+        known_prefix.len() - 1,
+        &known_prefix,
+        Some("q4 raw"),
+    );
+    assert!(!resync_failed, "the trim resync must be confirmed");
+
+    let after = backend.load_with_timestamps(&sender);
+    let contents: Vec<&str> = after.iter().map(|m| m.message.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        [
+            zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL,
+            "q3",
+            "a3",
+            "q4 raw"
+        ]
+    );
+    let times_after: Vec<_> = after
+        .iter()
+        .map(|m| m.created_at.expect("RFC 3339 created_at"))
+        .collect();
+    assert_eq!(
+        times_after[1..],
+        times_before[4..],
+        "rows retained by the trim must keep the time they were first persisted"
+    );
+    assert!(
+        times_after[0] > times_before[6],
+        "the breadcrumb is a new row, written now"
+    );
+    assert_eq!(
+        backend.get_session_trim_breadcrumb(&sender).unwrap(),
+        Some(true)
+    );
+}
+
 /// If the transcript half of a trim resync fails, the breadcrumb flag must
 /// not be written either — otherwise durable `trim_breadcrumb` could describe
 /// a trimmed transcript that was never actually committed. Routing both
@@ -24911,6 +25006,116 @@ api_key = "anthropic-key"
             store.get_session_trim_breadcrumb(&sender).unwrap(),
             Some(true),
             "an already-correct flag must not be rewritten"
+        );
+    }
+
+    /// Persist `count` alternating user/assistant rows one at a time, with a
+    /// pause between them so every row carries its own `created_at`.
+    fn seed_timed_transcript(
+        store: &SqliteSessionBackend,
+        sender: &str,
+        count: usize,
+        last_is_user: bool,
+    ) {
+        for i in 0..count {
+            let user_turn = if last_is_user {
+                (count - 1 - i) % 2 == 0
+            } else {
+                i % 2 == 0
+            };
+            let msg = if user_turn {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(sender, &msg).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn hydration_cap_keeps_the_created_at_of_retained_rows_in_sqlite() {
+        // Channels default to the SQLite session backend. Hydration caps an
+        // over-long transcript and persists the capped transcript through
+        // `replace_conversation_state`; rows that survive the cap were first
+        // persisted earlier and must keep that time.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let sender = "chan_cap_times".to_string();
+        let extra = 4;
+        seed_timed_transcript(&store, &sender, MAX_CHANNEL_HISTORY + extra, false);
+
+        let before = store.load_with_timestamps(&sender);
+        assert_eq!(before.len(), MAX_CHANNEL_HISTORY + extra);
+        let times_before: Vec<_> = before[extra..]
+            .iter()
+            .map(|m| m.created_at.expect("RFC 3339 created_at"))
+            .collect();
+        assert!(
+            times_before.windows(2).all(|w| w[0] < w[1]),
+            "the seeded rows must carry distinct, increasing times"
+        );
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+        assert_eq!(hydrated.messages.len(), MAX_CHANNEL_HISTORY);
+
+        let after = store.load_with_timestamps(&sender);
+        assert_eq!(after.len(), MAX_CHANNEL_HISTORY);
+        for (row, kept) in after.iter().zip(&before[extra..]) {
+            assert_eq!(row.message.content, kept.message.content);
+        }
+        let times_after: Vec<_> = after
+            .iter()
+            .map(|m| m.created_at.expect("RFC 3339 created_at"))
+            .collect();
+        assert_eq!(
+            times_after, times_before,
+            "rows kept by the cap must keep the time they were first persisted"
+        );
+    }
+
+    #[test]
+    fn hydration_cap_with_an_orphan_turn_keeps_retained_times_and_adds_a_newer_closure() {
+        // The transcript ends on a user turn: hydration caps it, appends a
+        // closure, and persists. Retained rows keep their time; the closure is
+        // the only row this pass adds.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let sender = "chan_cap_orphan_times".to_string();
+        let extra = 4;
+        seed_timed_transcript(&store, &sender, MAX_CHANNEL_HISTORY + extra, true);
+
+        let before = store.load_with_timestamps(&sender);
+        let last_seeded = before.last().and_then(|m| m.created_at).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+        assert!(hydrated.orphan_closed);
+        // The cap runs before the closure is added, so the closure sits on top
+        // of a full window.
+        assert_eq!(hydrated.messages.len(), MAX_CHANNEL_HISTORY + 1);
+
+        let after = store.load_with_timestamps(&sender);
+        assert_eq!(after.len(), MAX_CHANNEL_HISTORY + 1);
+        for (row, kept) in after[..MAX_CHANNEL_HISTORY].iter().zip(&before[extra..]) {
+            assert_eq!(row.message.content, kept.message.content);
+            assert_eq!(
+                row.created_at, kept.created_at,
+                "retained row `{}` must keep its time",
+                kept.message.content
+            );
+        }
+        let closure = after.last().unwrap();
+        assert_eq!(
+            closure.message.content,
+            "[Session interrupted — not continuing this request]"
+        );
+        assert!(
+            closure.created_at.unwrap() > last_seeded,
+            "the closure is newer than every seeded row"
         );
     }
 
