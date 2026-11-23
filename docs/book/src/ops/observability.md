@@ -450,7 +450,10 @@ On startup, if `log_persistence` is enabled and the file exists, the
 writer streams any schema-1 rows through an in-place migration to
 schema-2 before the first append. Pure streaming, bounded by a
 single line's allocation regardless of file size. The migrated file is
-atomically renamed into place. Files already at v2 are left untouched.
+atomically renamed into place. Files already at v2 are left untouched. A
+migration (or a `rolling` trim) cut short by a kill can leave its temp file
+next to the log; a start at least 30 minutes after it was created removes it,
+as described in [Logging architecture](../architecture/logging.md#orphaned-temp-files-are-swept-at-startup).
 
 If migration fails, the daemon logs a `warn` and continues writing v2
 appends; the old v1 rows remain readable by tools that still
