@@ -17,9 +17,61 @@ pub struct OtpValidator {
     config: OtpConfig,
     secret: Vec<u8>,
     cached_codes: Mutex<HashMap<String, u64>>,
+    /// Codes already consumed by [`Self::validate_single_use`], with the time
+    /// after which the same code can no longer validate anyway.
+    consumed_codes: Mutex<HashMap<String, u64>>,
+    /// Consecutive failed single-use attempts and when the lockout ends.
+    single_use_failures: Mutex<SingleUseFailures>,
 }
 
+#[derive(Debug, Default)]
+struct SingleUseFailures {
+    count: u32,
+    locked_until: u64,
+}
+
+/// How long single-use verification stays locked after
+/// `challenge_max_attempts` consecutive failures.
+const SINGLE_USE_LOCKOUT_SECS: u64 = 300;
+
 impl OtpValidator {
+    /// Load the enrolled secret without ever creating one. Unlike
+    /// [`Self::from_config`] this fails when no secret file exists, so a
+    /// caller that only verifies codes cannot mint a seed nobody holds.
+    pub fn from_existing(
+        config: &OtpConfig,
+        zeroclaw_dir: &Path,
+        store: &SecretStore,
+    ) -> Result<Self> {
+        let secret_path = secret_file_path(zeroclaw_dir);
+        if !secret_path.exists() {
+            anyhow::bail!(
+                "No OTP secret is enrolled at {}; enable security.otp and run zeroclaw once to enroll one",
+                secret_path.display()
+            );
+        }
+        let encoded = fs::read_to_string(&secret_path).with_context(|| {
+            format!(
+                "Failed to read OTP secret file {}",
+                secret_path.display().to_string()
+            )
+        })?;
+        let decrypted = store
+            .decrypt(encoded.trim())
+            .context("Failed to decrypt OTP secret file")?;
+        Ok(Self::with_secret(config, decode_base32_secret(&decrypted)?))
+    }
+
+    fn with_secret(config: &OtpConfig, secret: Vec<u8>) -> Self {
+        Self {
+            config: config.clone(),
+            secret,
+            cached_codes: Mutex::new(HashMap::new()),
+            consumed_codes: Mutex::new(HashMap::new()),
+            single_use_failures: Mutex::new(SingleUseFailures::default()),
+        }
+    }
+
     pub fn from_config(
         config: &OtpConfig,
         zeroclaw_dir: &Path,
@@ -47,11 +99,7 @@ impl OtpValidator {
             (raw.to_vec(), true)
         };
 
-        let validator = Self {
-            config: config.clone(),
-            secret,
-            cached_codes: Mutex::new(HashMap::new()),
-        };
+        let validator = Self::with_secret(config, secret);
         let uri = if generated {
             Some(validator.otpauth_uri())
         } else {
@@ -107,6 +155,64 @@ impl OtpValidator {
         Ok(is_valid)
     }
 
+    /// Verify a code for an action that must not be replayable (emergency-stop
+    /// resume). A code that validated once is consumed and refused again; the
+    /// recently-validated cache used by [`Self::validate`] is neither read nor
+    /// written. After `challenge_max_attempts` consecutive failures the
+    /// verifier refuses every code for [`SINGLE_USE_LOCKOUT_SECS`].
+    pub fn validate_single_use(&self, code: &str) -> Result<bool> {
+        self.validate_single_use_at(code, unix_timestamp_now())
+    }
+
+    fn validate_single_use_at(&self, code: &str, now_secs: u64) -> Result<bool> {
+        {
+            let failures = self.single_use_failures.lock();
+            if failures.locked_until > now_secs {
+                anyhow::bail!(
+                    "Too many failed OTP attempts; try again in {} seconds",
+                    failures.locked_until - now_secs
+                );
+            }
+        }
+
+        let normalized = code.trim();
+        let step = self.config.token_ttl_secs.max(1);
+        let counter = now_secs / step;
+        let well_formed = normalized.len() == OTP_DIGITS as usize
+            && normalized.chars().all(|ch| ch.is_ascii_digit());
+        let matches = well_formed
+            && [
+                counter.saturating_sub(1),
+                counter,
+                counter.saturating_add(1),
+            ]
+            .iter()
+            .any(|c| compute_totp_code(&self.secret, *c) == normalized);
+
+        let mut consumed = self.consumed_codes.lock();
+        consumed.retain(|_, expiry| *expiry >= now_secs);
+        let accepted = matches && !consumed.contains_key(normalized);
+        if accepted {
+            consumed.insert(
+                normalized.to_string(),
+                now_secs.saturating_add(step.saturating_mul(3)),
+            );
+        }
+        drop(consumed);
+
+        let mut failures = self.single_use_failures.lock();
+        if accepted {
+            *failures = SingleUseFailures::default();
+        } else {
+            failures.count = failures.count.saturating_add(1);
+            if failures.count >= self.config.challenge_max_attempts.max(1) {
+                failures.count = 0;
+                failures.locked_until = now_secs.saturating_add(SINGLE_USE_LOCKOUT_SECS);
+            }
+        }
+        Ok(accepted)
+    }
+
     pub fn otpauth_uri(&self) -> String {
         let secret = encode_base32_secret(&self.secret);
         let account = "zeroclaw";
@@ -117,7 +223,9 @@ impl OtpValidator {
         )
     }
 
-    #[cfg(test)]
+    /// The code an authenticator would show at `timestamp`. For tests that
+    /// need a valid code for a secret that was enrolled by a real process.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn code_for_timestamp(&self, timestamp: u64) -> String {
         let counter = timestamp / self.config.token_ttl_secs.max(1);
         compute_totp_code(&self.secret, counter)
@@ -321,5 +429,117 @@ mod tests {
 
         let ts = 1_700_000_000u64;
         assert_eq!(first.code_for_timestamp(ts), second.code_for_timestamp(ts));
+    }
+
+    fn single_use_validator(dir: &Path) -> OtpValidator {
+        let store = SecretStore::new(dir, true);
+        let config = OtpConfig {
+            challenge_max_attempts: 3,
+            ..test_config()
+        };
+        OtpValidator::from_config(&config, dir, &store).unwrap().0
+    }
+
+    /// A well-formed code that no accepted step (`counter - 1 ..= counter + 1`)
+    /// produces at `now`.
+    fn wrong_code(validator: &OtpValidator, now: u64) -> String {
+        let accepted = [
+            validator.code_for_timestamp(now.saturating_sub(30)),
+            validator.code_for_timestamp(now),
+            validator.code_for_timestamp(now + 30),
+        ];
+        (0..)
+            .map(|n| format!("{n:06}"))
+            .find(|candidate| !accepted.contains(candidate))
+            .unwrap()
+    }
+
+    #[test]
+    fn single_use_code_is_consumed_by_its_first_acceptance() {
+        let dir = tempdir().unwrap();
+        let validator = single_use_validator(dir.path());
+        let now = 1_700_000_000u64;
+        let code = validator.code_for_timestamp(now);
+
+        assert!(validator.validate_single_use_at(&code, now).unwrap());
+        assert!(
+            !validator.validate_single_use_at(&code, now).unwrap(),
+            "the same code must not validate twice"
+        );
+        assert!(
+            !validator.validate_single_use_at(&code, now + 30).unwrap(),
+            "nor in the next step, where it is still inside the accepted window"
+        );
+    }
+
+    #[test]
+    fn single_use_verification_locks_after_the_configured_failures() {
+        let dir = tempdir().unwrap();
+        let validator = single_use_validator(dir.path());
+        let now = 1_700_000_000u64;
+        let wrong = wrong_code(&validator, now);
+
+        // Three consecutive failures (challenge_max_attempts = 3) lock it.
+        for _ in 0..3 {
+            assert!(!validator.validate_single_use_at(&wrong, now).unwrap());
+        }
+        // While locked even a valid code is refused, with an error.
+        let valid = validator.code_for_timestamp(now + 1);
+        let error = validator
+            .validate_single_use_at(&valid, now + 1)
+            .expect_err("a locked verifier must refuse every code");
+        assert!(error.to_string().contains("Too many failed OTP attempts"));
+        let error = validator
+            .validate_single_use_at(&valid, now + SINGLE_USE_LOCKOUT_SECS - 1)
+            .expect_err("still locked one second before the lockout ends");
+        assert!(error.to_string().contains("Too many failed OTP attempts"));
+
+        // The lockout ends after SINGLE_USE_LOCKOUT_SECS.
+        let later = now + SINGLE_USE_LOCKOUT_SECS;
+        let code = validator.code_for_timestamp(later);
+        assert!(validator.validate_single_use_at(&code, later).unwrap());
+    }
+
+    #[test]
+    fn a_successful_single_use_code_resets_the_failure_count() {
+        let dir = tempdir().unwrap();
+        let validator = single_use_validator(dir.path());
+        let now = 1_700_000_000u64;
+        let wrong = wrong_code(&validator, now);
+
+        for _ in 0..2 {
+            assert!(!validator.validate_single_use_at(&wrong, now).unwrap());
+        }
+        let code = validator.code_for_timestamp(now);
+        assert!(validator.validate_single_use_at(&code, now).unwrap());
+        for _ in 0..2 {
+            assert!(!validator.validate_single_use_at(&wrong, now).unwrap());
+        }
+        // Two failures after the reset: not locked, so a fresh valid code works.
+        let later = now + 90;
+        let fresh = validator.code_for_timestamp(later);
+        assert!(validator.validate_single_use_at(&fresh, later).unwrap());
+    }
+
+    #[test]
+    fn from_existing_never_creates_a_secret() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), true);
+
+        let error = OtpValidator::from_existing(&test_config(), dir.path(), &store)
+            .expect_err("no secret is enrolled yet");
+        assert!(error.to_string().contains("No OTP secret is enrolled"));
+        assert!(
+            !secret_file_path(dir.path()).exists(),
+            "from_existing must not mint a secret"
+        );
+
+        let (enrolled, _) = OtpValidator::from_config(&test_config(), dir.path(), &store).unwrap();
+        let existing = OtpValidator::from_existing(&test_config(), dir.path(), &store).unwrap();
+        let ts = 1_700_000_000u64;
+        assert_eq!(
+            enrolled.code_for_timestamp(ts),
+            existing.code_for_timestamp(ts)
+        );
     }
 }

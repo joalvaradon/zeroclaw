@@ -123,6 +123,8 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 `config.toml` and re-instantiates those subsystems in the same process. The PID
 stays the same, but listeners briefly rebind.
 
+A few settings are decided once when the process starts and are not re-read by a reload; a change takes a restart. The emergency stop is the case today: whether it exists, its `state_file`, `require_otp_to_resume` and the OTP secret are fixed at daemon start, because the stop is live process state and not a policy that a config write can swap.
+
 Gateway config writes call `persist_and_swap()`: validate the staged authorization
 policy, save to disk inside an admitted, serialized config commit, publish that
 policy, publish the saved config and its revision as the new pair, and set

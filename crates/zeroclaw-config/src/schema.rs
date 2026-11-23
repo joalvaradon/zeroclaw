@@ -20758,8 +20758,10 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop configuration. Not enforced: no runtime path reads the
-    /// estop state, so these settings do not stop anything.
+    /// Emergency-stop configuration. The running daemon enforces kill-all and
+    /// tool-freeze; network-kill and domain-block are not enforced. These
+    /// settings are decided once when the process starts; a config reload does not
+    /// change them and a change takes a restart.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20975,17 +20977,21 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Emergency stop switch. Not enforced: no runtime path reads the estop
-    /// state, so enabling it does not stop anything.
+    /// Emergency stop switch. When true the daemon starts an emergency-stop
+    /// authority and refuses tool calls while a stop is engaged. Decided once
+    /// when the process starts. Commands that run tools outside the daemon
+    /// refuse to start while it is set.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path reserved for estop state. Not enforced: nothing reads its contents.
+    /// File where the daemon records the stop state so a restart can recover it.
+    /// Read once when the process starts; it is not the live authority.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations. Not enforced: the resume
-    /// command refuses to run.
+    /// Require a valid one-time OTP before resume operations. Needs an enrolled
+    /// OTP secret (security.otp.enabled); the daemon refuses to start with
+    /// estop enabled and this set when none exists.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }
