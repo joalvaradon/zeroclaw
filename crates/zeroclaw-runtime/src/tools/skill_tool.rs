@@ -494,6 +494,10 @@ impl Tool for SkillBuiltinTool {
         args: serde_json::Value,
         context: &zeroclaw_api::tool::ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
+        // The alias has its own name and does not run the trait default, so it
+        // asks the emergency-stop gate itself; the delegated target asks again
+        // under its own canonical name.
+        zeroclaw_api::dispatch_gate::check_tool(&self.tool_name)?;
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
         // at INFO with the delegation target and the locked scope keys.
@@ -1013,6 +1017,67 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    struct FrozenNamesGate(Vec<&'static str>);
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FrozenNamesGate {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if self.0.contains(&tool_name) {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(format!(
+                    "{tool_name} frozen by test gate"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_alias_is_refused_when_the_alias_or_its_target_is_frozen() {
+        let alias = SkillBuiltinTool::new(
+            "my_skill",
+            &sample_builtin_skill_tool(),
+            Arc::new(MockBuiltinTool::new("shell")),
+            HashMap::new(),
+        );
+        let context = zeroclaw_api::tool::ToolExecutionContext::default();
+        let args = serde_json::json!({"input": "x"});
+
+        let open = alias.execute_with_context(args.clone(), &context).await;
+        assert!(open.is_ok_and(|result| result.success));
+
+        // Freezing the delegated target's canonical name stops the alias.
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            Arc::new(FrozenNamesGate(vec!["shell"]));
+        let denied = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate,
+            alias.execute_with_context(args.clone(), &context),
+        )
+        .await
+        .expect_err("a frozen target must refuse the alias");
+        assert!(denied.to_string().contains("shell frozen by test gate"));
+
+        // Freezing the alias's own name stops it too.
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            Arc::new(FrozenNamesGate(vec!["my_skill__use_shell"]));
+        let denied = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate,
+            alias.execute_with_context(args, &context),
+        )
+        .await
+        .expect_err("a frozen alias name must refuse the alias");
+        assert!(denied.to_string().contains("my_skill__use_shell"));
     }
 
     #[test]

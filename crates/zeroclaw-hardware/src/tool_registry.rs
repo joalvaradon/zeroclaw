@@ -157,6 +157,11 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
 
+        // This path calls `execute` directly, so it asks the emergency-stop
+        // gate itself.
+        zeroclaw_api::dispatch_gate::check_tool(tool.name())
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
         tool.execute(args)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
@@ -288,6 +293,59 @@ mod tests {
         match result {
             Err(ToolError::UnknownTool(name)) => assert_eq!(name, "nonexistent_tool"),
             other => panic!("expected UnknownTool, got: {:?}", other),
+        }
+    }
+
+    struct FrozenNameGate(&'static str);
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FrozenNameGate {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if tool_name == self.0 {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(
+                    "frozen by test gate",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_by_the_dispatch_gate_before_the_tool_runs() {
+        let devices = empty_device_registry();
+        let registry = ToolRegistry::load(devices).await.expect("load failed");
+
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            Arc::new(FrozenNameGate("gpio_read"));
+        let frozen = zeroclaw_api::dispatch_gate::with_scoped_gate(gate.clone(), async {
+            registry.dispatch("gpio_read", serde_json::json!({})).await
+        })
+        .await;
+        match frozen {
+            Err(ToolError::ExecutionFailed(message)) => {
+                assert!(message.contains("frozen by test gate"), "{message}");
+            }
+            other => panic!("a frozen tool must be refused by the gate, got: {other:?}"),
+        }
+
+        // A different tool is not refused by that gate (it may fail for its
+        // own reasons, such as missing arguments).
+        let other = zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            registry.dispatch("gpio_write", serde_json::json!({})).await
+        })
+        .await;
+        if let Err(ToolError::ExecutionFailed(message)) = other {
+            assert!(!message.contains("frozen by test gate"), "{message}");
         }
     }
 

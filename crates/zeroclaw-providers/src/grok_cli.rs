@@ -651,6 +651,7 @@ impl GrokCliModelProvider {
                 log_acp_failure(FLAVOR, "protocol", &error.error_key(), outcome.stderr);
                 Err(anyhow::Error::new(error))
             }
+            Err(AcpSubprocessError::Denied(reason)) => Err(anyhow::Error::msg(reason)),
             Err(AcpSubprocessError::Timeout) => {
                 log_acp_failure(FLAVOR, "timeout", "grok_cli_timeout", outcome.stderr);
                 Err(anyhow::Error::msg(format!(

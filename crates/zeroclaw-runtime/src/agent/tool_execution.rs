@@ -179,10 +179,11 @@ fn record_tool_call_start(
     });
 }
 
-/// The answer sequential execution would give a call this turn cannot
-/// dispatch, recorded with the same observer events; `None` when the name
-/// resolves. Approval preparation uses it so nobody is asked to approve a
-/// call that would run nothing.
+/// The answer sequential execution would give a call that will run nothing,
+/// recorded with the same observer events: a name this turn cannot dispatch,
+/// or a tool the process-wide dispatch gate (emergency stop) refuses right
+/// now. `None` when the call can still run. Approval preparation uses it so
+/// nobody is asked to approve a call that would run nothing.
 pub(crate) fn undispatchable_tool_outcome(
     call_name: &str,
     call_arguments: &serde_json::Value,
@@ -198,8 +199,17 @@ pub(crate) fn undispatchable_tool_outcome(
             .unwrap_or(dispatch.excluded_tools),
         ..dispatch
     };
+    let mut denied = None;
     let unknown = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
-        DispatchResolution::Available(_) => return None,
+        DispatchResolution::Available(_) => {
+            match zeroclaw_api::dispatch_gate::check_tool(call_name) {
+                Ok(()) => return None,
+                Err(refusal) => {
+                    denied = Some(refusal);
+                    false
+                }
+            }
+        }
         DispatchResolution::Unavailable => false,
         DispatchResolution::Unknown => true,
     };
@@ -214,6 +224,32 @@ pub(crate) fn undispatchable_tool_outcome(
     );
     // Nothing ran; execution's duration here is only the lookup.
     let duration = Duration::ZERO;
+    if let Some(refusal) = denied {
+        // Same text the executor gives when the gate refuses at dispatch.
+        let reason = format!("Error executing {call_name}: {refusal}");
+        let model_visible = scrub_credentials(&reason);
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: call_name.to_string(),
+            tool_call_id: tool_call_id_owned,
+            duration,
+            success: false,
+            arguments: Some(full_args),
+            result: Some(model_visible.clone()),
+            channel: Some(meta.channel_name.to_string()),
+            agent_alias: meta.agent_alias.map(|s| s.to_string()),
+            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+            turn_id: Some(meta.turn_id.to_string()),
+        });
+        return Some(ToolExecutionOutcome {
+            output: model_visible,
+            success: false,
+            error_reason: Some(reason),
+            duration,
+            receipt: None,
+            output_data: None,
+            attachments: Vec::new(),
+        });
+    }
     Some(if unknown {
         unknown_tool_outcome(
             call_name,
@@ -2342,6 +2378,86 @@ mod tests {
             !outcome.output.contains("sk-CATCHME01234567") && outcome.output.contains("[REDACTED]"),
             "the scrubber still runs: the adjacent token pair is redacted: {}",
             outcome.output
+        );
+    }
+
+    struct FreezeNamedTool(&'static str);
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FreezeNamedTool {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if tool_name == self.0 {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(
+                    "emergency stop is engaged",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    /// Approval preparation asks this before it prompts: a call the dispatch
+    /// gate refuses gets its refusal at once, so nobody approves a call that
+    /// would run nothing.
+    #[tokio::test]
+    async fn a_call_the_dispatch_gate_refuses_is_answered_before_approval() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfigurableFailingTool {
+            output: zeroclaw_api::tool::ToolOutput::text("ran"),
+            error: None,
+        })];
+        let meta = test_turn_meta();
+        let ask = || {
+            super::undispatchable_tool_outcome(
+                "configurable_failing_tool",
+                &serde_json::json!({}),
+                Some("call-1"),
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+            )
+        };
+
+        assert!(
+            ask().is_none(),
+            "with no refusal the call goes on to approval"
+        );
+
+        let denied = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            Arc::new(FreezeNamedTool("configurable_failing_tool")),
+            async { ask() },
+        )
+        .await
+        .expect("a refused call is answered before approval");
+        assert!(!denied.success);
+        assert!(
+            denied.output.contains("emergency stop is engaged"),
+            "{}",
+            denied.output
+        );
+        assert_eq!(denied.duration, Duration::ZERO);
+
+        let other = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            Arc::new(FreezeNamedTool("some_other_tool")),
+            async { ask() },
+        )
+        .await;
+        assert!(
+            other.is_none(),
+            "freezing another tool must not refuse this one"
         );
     }
 

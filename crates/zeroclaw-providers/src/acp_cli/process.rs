@@ -57,6 +57,9 @@ pub(crate) enum AcpSubprocessError {
     Timeout,
     /// The request completed but the child could not be reaped.
     Reap,
+    /// The process-wide dispatch gate refused to start the agent. Carries the
+    /// gate's own reason, never child output.
+    Denied(String),
 }
 
 /// Result plus bounded stderr metadata for logging.
@@ -237,6 +240,16 @@ pub(crate) async fn run_oneshot_subprocess<A>(
 where
     A: FnOnce(&Value) -> Result<Option<Value>, AcpError>,
 {
+    // The agent this spawns runs its own tools outside `Tool::execute`, so
+    // the per-tool gate never sees them. Ask the process-wide gate before the
+    // child exists; a refusal here means no agent process is started.
+    if let Err(denied) = zeroclaw_api::dispatch_gate::check_work("ACP agent provider") {
+        return AcpSubprocessOutcome {
+            result: Err(AcpSubprocessError::Denied(denied.reason().to_string())),
+            stderr: StderrSummary::default(),
+        };
+    }
+
     #[cfg(not(windows))]
     cmd.kill_on_drop(true);
     cmd.stdin(std::process::Stdio::piped());

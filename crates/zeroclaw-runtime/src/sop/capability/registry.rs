@@ -101,6 +101,7 @@ impl SopCapabilityRegistry {
                 .with_context(|| format!("capability '{id}' input schema validation failed"))?;
         }
 
+        zeroclaw_api::dispatch_gate::check_work(&format!("SOP capability '{id}'"))?;
         let result = capability.execute(ctx, input)?;
         if result.success
             && let Some(schema) = info.output_schema.as_ref()

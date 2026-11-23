@@ -895,6 +895,13 @@ async fn execute_job_with_retry(
         }
         let (success, output) = match job.job_type {
             JobType::Shell => {
+                // A scheduled shell job is the `shell` tool's work by another
+                // route: kill-all and a freeze of `shell` both refuse it.
+                if let Err(denied) = zeroclaw_api::dispatch_gate::check_work("scheduled shell job")
+                    .and_then(|()| zeroclaw_api::dispatch_gate::check_tool("shell"))
+                {
+                    return (false, denied.to_string());
+                }
                 let Some(runtime) = runtime else {
                     return (
                         false,
@@ -1086,6 +1093,16 @@ async fn execute_and_persist_job(
             false,
             format!("cron target admission failed: {error}"),
         );
+    }
+    // A shell job the emergency stop refuses is deferred, not run and not
+    // recorded: a failed run would disable a one-shot job and skip a recurring
+    // job's occurrence for good, so neither would run after the stop is lifted.
+    if matches!(job.job_type, JobType::Shell)
+        && let Err(denied) = zeroclaw_api::dispatch_gate::check_work("scheduled shell job")
+            .and_then(|()| zeroclaw_api::dispatch_gate::check_tool("shell"))
+    {
+        let _ = release_job(config, &job.id);
+        return (job.id.clone(), false, denied.to_string());
     }
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
@@ -2759,6 +2776,117 @@ mod tests {
         assert!(output.contains("recovered"));
     }
 
+    struct DenyWorkGate;
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for DenyWorkGate {
+        fn check_tool(
+            &self,
+            _tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+
+        fn check_work(
+            &self,
+            what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(format!(
+                "{what} refused by test gate"
+            )))
+        }
+    }
+
+    struct FreezeShellGate;
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FreezeShellGate {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if tool_name == "shell" {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(
+                    "tool `shell` is frozen by the test gate",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_job_is_refused_while_the_shell_tool_is_frozen() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+        let security = test_security(&config);
+        let marker = config.data_dir.join("ran.flag");
+        let job = test_job(&format!("touch {}", marker.display()));
+
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> = Arc::new(FreezeShellGate);
+        let (success, output) = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate,
+            Box::pin(execute_job_with_retry(
+                &config,
+                &security,
+                "test-agent",
+                &job,
+                None,
+                false,
+                None,
+                None,
+            )),
+        )
+        .await;
+        assert!(!success, "{output}");
+        assert!(output.contains("frozen by the test gate"), "{output}");
+        assert!(
+            !marker.exists(),
+            "a frozen shell tool must also stop the scheduled shell job"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_job_is_refused_while_the_dispatch_gate_denies_work() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+        let security = test_security(&config);
+        let marker = config.data_dir.join("ran.flag");
+        let job = test_job(&format!("touch {}", marker.display()));
+
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> = Arc::new(DenyWorkGate);
+        let (success, output) = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate,
+            Box::pin(execute_job_with_retry(
+                &config,
+                &security,
+                "test-agent",
+                &job,
+                None,
+                false,
+                None,
+                None,
+            )),
+        )
+        .await;
+        assert!(!success, "{output}");
+        assert!(output.contains("scheduled shell job"), "{output}");
+        assert!(output.contains("refused by test gate"), "{output}");
+        assert!(
+            !marker.exists(),
+            "the job command must not run while the gate denies work"
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_exhausts_attempts() {
@@ -3360,6 +3488,48 @@ mod tests {
         assert!(output.contains("lifecycle generation is closing"));
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
         assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        release_job(&config, &job.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_shell_job_the_stop_refuses_is_deferred_not_consumed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::hours(1);
+        let job = cron::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::At { at },
+            "echo deferred",
+        )
+        .unwrap();
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> = Arc::new(DenyWorkGate);
+        let (_, success, output) = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate,
+            execute_and_persist_job(
+                &config,
+                &test_security(&config),
+                TEST_AGENT,
+                &job,
+                "stopped-cron",
+                None,
+            ),
+        )
+        .await;
+
+        assert!(!success);
+        assert!(output.contains("scheduled shell job"), "{output}");
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "a refused one-shot job must stay enabled");
+        assert!(after.last_status.is_none());
+        assert!(
+            claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the in-flight lock must be released so the job is claimable again"
+        );
         release_job(&config, &job.id).unwrap();
     }
 

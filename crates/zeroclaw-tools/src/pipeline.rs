@@ -577,6 +577,195 @@ mod tests {
         assert_steps_inherit_context(true).await;
     }
 
+    // ── Emergency-stop gate ────────────────────────────────
+
+    struct CountingStep {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(CountingStep);
+
+    #[async_trait]
+    impl Tool for CountingStep {
+        fn name(&self) -> &str {
+            "counting_step"
+        }
+        fn description(&self) -> &str {
+            "Counts how many times its body ran"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    struct FrozenToolGate(&'static str);
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FrozenToolGate {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> std::result::Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if tool_name == self.0 {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(
+                    "frozen by test gate",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> std::result::Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_child_step_is_refused_by_the_dispatch_gate() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["counting_step".into()],
+            },
+            vec![Arc::new(CountingStep {
+                calls: calls.clone(),
+            })],
+        );
+        let request = serde_json::json!({
+            "steps": [
+                {"tool": "counting_step", "args": {}},
+                {"tool": "counting_step", "args": {}}
+            ],
+            "parallel": false
+        });
+
+        // Without a gate the steps run.
+        let context = ToolExecutionContext::default();
+        let result = tool
+            .execute_with_context(request.clone(), &context)
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // With the child's canonical name frozen the pipeline itself is
+        // allowed but no child body runs.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let gate: Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            Arc::new(FrozenToolGate("counting_step"));
+        let result = zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            tool.execute_with_context(request.clone(), &context)
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("frozen by test gate"),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a frozen child tool must not run through the pipeline"
+        );
+    }
+
+    struct NamedStep {
+        name: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(NamedStep);
+
+    #[async_trait]
+    impl Tool for NamedStep {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Counts how many times its body ran"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    /// Parallel steps run in spawned tasks, which do not inherit a scoped
+    /// gate, so this test uses the process-wide gate. It denies one tool name
+    /// that no other test in this binary uses.
+    #[tokio::test]
+    async fn pipeline_parallel_steps_are_refused_by_the_process_wide_gate() {
+        let installed =
+            zeroclaw_api::dispatch_gate::install(Box::new(FrozenToolGate("parallel_frozen_step")));
+        assert!(
+            installed,
+            "another test installed the process-wide gate first; this test would pass vacuously"
+        );
+
+        let run = |name: &'static str| {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool = PipelineTool::new(
+                PipelineConfig {
+                    enabled: true,
+                    max_steps: 2,
+                    allowed_tools: vec![name.into()],
+                },
+                vec![Arc::new(NamedStep {
+                    name,
+                    calls: calls.clone(),
+                })],
+            );
+            let request = serde_json::json!({
+                "steps": [
+                    {"tool": name, "args": {}},
+                    {"tool": name, "args": {}}
+                ],
+                "parallel": true
+            });
+            (tool, request, calls)
+        };
+
+        // Control: an unfrozen tool runs both parallel steps.
+        let (tool, request, calls) = run("parallel_open_step");
+        let result = tool
+            .execute_with_context(request, &ToolExecutionContext::default())
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The frozen tool's body never runs, in either spawned step.
+        let (tool, request, calls) = run("parallel_frozen_step");
+        let result = tool
+            .execute_with_context(request, &ToolExecutionContext::default())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a frozen child tool must not run through a parallel pipeline"
+        );
+    }
+
     // ── Interpolation ──────────────────────────────────────
 
     #[test]

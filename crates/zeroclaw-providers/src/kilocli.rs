@@ -113,6 +113,12 @@ impl KiloCliModelProvider {
     /// Invoke the kilo binary with the given prompt and optional model.
     /// Returns the trimmed stdout output as the assistant response.
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
+        // `kilo` is a coding agent that may run its own tools outside
+        // `Tool::execute`, so the per-tool gate never sees them. Ask the
+        // process-wide gate before the child exists; a refusal means no
+        // process is started.
+        zeroclaw_api::dispatch_gate::check_work("KiloCLI provider")?;
+
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--print");
 
@@ -365,6 +371,53 @@ mod tests {
         assert!(
             msg.contains("Failed to spawn KiloCLI binary"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    struct RefuseAllWork;
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for RefuseAllWork {
+        fn check_tool(
+            &self,
+            _tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+
+        fn check_work(
+            &self,
+            what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(format!(
+                "{what} refused by test gate"
+            )))
+        }
+    }
+
+    // Prediction written before running: the binary does not exist. The test
+    // above shows that without a gate the call reaches the spawn and fails
+    // with "Failed to spawn". With the gate refusing work it must fail with the
+    // gate's reason and never reach the spawn.
+    #[tokio::test]
+    async fn a_refusing_dispatch_gate_starts_no_kilo_process() {
+        let model_provider = KiloCliModelProvider {
+            alias: "test".to_string(),
+            binary_path: PathBuf::from("/nonexistent/path/to/kilo"),
+        };
+        let gate: std::sync::Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            std::sync::Arc::new(RefuseAllWork);
+        let result = zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            model_provider.invoke_cli("hello", "default").await
+        })
+        .await;
+        let msg = result.expect_err("a refused call must fail").to_string();
+        assert!(
+            msg.contains("KiloCLI provider refused by test gate"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            !msg.contains("Failed to spawn"),
+            "the call must not reach the spawn: {msg}"
         );
     }
 }

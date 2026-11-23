@@ -1740,4 +1740,86 @@ mod tests {
             outcome_at(&run.prepared, 2).output
         );
     }
+
+    struct FreezeNamedTool(&'static str);
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for FreezeNamedTool {
+        fn check_tool(
+            &self,
+            tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            if tool_name == self.0 {
+                Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(
+                    "emergency stop is engaged",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn check_work(
+            &self,
+            _what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+    }
+
+    /// A supervised call the dispatch gate refuses is answered as execution
+    /// would answer it, and nobody is asked to approve it.
+    #[tokio::test]
+    async fn a_prompted_call_the_dispatch_gate_refuses_is_answered_without_asking() {
+        let registry = stub_tools(&["cron_list"]);
+        let call = parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1");
+        let gate = || std::sync::Arc::new(FreezeNamedTool("cron_list"));
+
+        let run = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate(),
+            prepare_supervised(&registry, &[], std::slice::from_ref(&call)),
+        )
+        .await;
+
+        assert_eq!(run.approval_requests, 0, "no approval request is sent");
+        let outcome = outcome_at(&run.prepared, 0);
+        assert!(!outcome.success);
+        assert!(
+            outcome.output.contains("emergency stop is engaged"),
+            "{}",
+            outcome.output
+        );
+        assert!(run.prepared.executable_indices.is_empty());
+        assert_eq!(
+            run.hook_events,
+            vec![
+                "before:cron_list:test-turn:0:0".to_string(),
+                "abandoned:cron_list:test-turn:0:0".to_string(),
+            ],
+            "the context is abandoned once and gets no after hook"
+        );
+        let executed = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            gate(),
+            executor_observer_events(&registry, &[], &call),
+        )
+        .await;
+        assert_eq!(
+            run.observer_events, executed,
+            "the observer sees what execution records for the same call"
+        );
+    }
+
+    /// Control: a gate that refuses another tool leaves this one to the
+    /// operator.
+    #[tokio::test]
+    async fn a_prompted_call_the_dispatch_gate_allows_still_asks() {
+        let registry = stub_tools(&["cron_list"]);
+        let call = parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1");
+
+        let run = zeroclaw_api::dispatch_gate::with_scoped_gate(
+            std::sync::Arc::new(FreezeNamedTool("some_other_tool")),
+            prepare_supervised(&registry, &[], std::slice::from_ref(&call)),
+        )
+        .await;
+
+        assert_eq!(run.approval_requests, 1, "the operator is asked");
+    }
 }

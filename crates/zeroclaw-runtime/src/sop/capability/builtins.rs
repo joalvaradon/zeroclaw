@@ -332,6 +332,56 @@ mod tests {
         assert_eq!(output, CapabilityResult::success(json!({"ok": true})));
     }
 
+    struct DenyWorkGate;
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for DenyWorkGate {
+        fn check_tool(
+            &self,
+            _tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+
+        fn check_work(
+            &self,
+            what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(format!(
+                "{what} refused by test gate"
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_step_is_refused_while_the_dispatch_gate_denies_work() {
+        let registry = SopCapabilityRegistry::with_builtins();
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "noop".into(),
+            body: String::new(),
+            kind: crate::sop::types::SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..crate::sop::types::SopStep::default()
+        };
+        // Without a gate the step runs.
+        assert!(
+            registry
+                .execute_step(context(), &step, json!({"ok": true}))
+                .is_ok()
+        );
+
+        let gate: std::sync::Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            std::sync::Arc::new(DenyWorkGate);
+        let error = zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            registry.execute_step(context(), &step, json!({"ok": true}))
+        })
+        .await
+        .expect_err("a denied gate must stop the capability before it runs");
+        let message = error.to_string();
+        assert!(message.contains("SOP capability 'noop'"), "{message}");
+        assert!(message.contains("refused by test gate"), "{message}");
+    }
+
     #[test]
     fn json_validate_fails_bad_value() {
         let registry = SopCapabilityRegistry::with_builtins();

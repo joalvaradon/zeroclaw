@@ -732,6 +732,14 @@ pub async fn run_with_authority(
 
     crate::health::mark_component_ok("daemon");
 
+    // The emergency-stop decision is made once per process. `main` makes it
+    // before it spawns any producer (the SOP ticker is spawned before this
+    // function runs); this call covers entry points that reach the daemon
+    // without `main`, and is idempotent. A reload re-enters here and keeps the
+    // first decision and its live state: `enabled`, `state_file` and
+    // `require_otp_to_resume` change only on restart.
+    crate::security::estop::install_for_config(&config)?;
+
     // The daemon owns the event bus: every component (gateway, cron,
     // heartbeat, RPC) publishes on and reads from this one. Its observer is
     // installed as the process-wide broadcast hook here, exactly once per run,

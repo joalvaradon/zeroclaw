@@ -735,6 +735,16 @@ where
         .unwrap_or_default();
 
     if method == "session/request_permission" || method.ends_with("/session/request_permission") {
+        // A session already running when the emergency stop engages still asks
+        // permission for each native tool. Never grant one while the gate
+        // refuses work; the agent sees a rejected tool, not a hang.
+        let permission_policy = if permission_policy == AcpPermissionPolicy::AllowOnce
+            && zeroclaw_api::dispatch_gate::check_work("ACP agent tool permission").is_err()
+        {
+            AcpPermissionPolicy::RejectOnce
+        } else {
+            permission_policy
+        };
         let outcome = permission_outcome(message, permission_policy);
         let response = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
@@ -1498,6 +1508,116 @@ mod tests {
             response.pointer("/result/outcome/optionId"),
             Some(&Value::String("allow".to_string()))
         );
+    }
+
+    struct RefuseAllWork;
+
+    impl zeroclaw_api::dispatch_gate::DispatchGate for RefuseAllWork {
+        fn check_tool(
+            &self,
+            _tool_name: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Ok(())
+        }
+
+        fn check_work(
+            &self,
+            what: &str,
+        ) -> Result<(), zeroclaw_api::dispatch_gate::DispatchDenied> {
+            Err(zeroclaw_api::dispatch_gate::DispatchDenied::new(format!(
+                "{what} refused by test gate"
+            )))
+        }
+    }
+
+    // Prediction written before running: with the gate refusing work, an
+    // `AllowOnce` alias still answers `deny` (the reject_once option). The
+    // sibling test above, run with no gate installed, answers `allow`.
+    #[tokio::test]
+    async fn allow_once_is_downgraded_while_the_dispatch_gate_refuses_work() {
+        let (mut client, mut peer) = duplex(4096);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    { "optionId": "allow", "kind": "allow_once" },
+                    { "optionId": "deny", "kind": "reject_once" }
+                ]
+            }
+        });
+        let gate: std::sync::Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            std::sync::Arc::new(RefuseAllWork);
+        zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            handle_server_request(&mut client, &request, AcpPermissionPolicy::AllowOnce)
+                .await
+                .expect("permission response");
+        })
+        .await;
+        drop(client);
+
+        let mut encoded = String::new();
+        peer.read_to_string(&mut encoded)
+            .await
+            .expect("read response");
+        let response: Value = serde_json::from_str(encoded.trim()).expect("valid response");
+        assert_eq!(
+            response.pointer("/result/outcome/optionId"),
+            Some(&Value::String("deny".to_string()))
+        );
+    }
+
+    // Prediction written before running: the binary does not exist. With no
+    // gate the run fails at `Spawn`; with the gate refusing work it fails at
+    // `Denied` and never reaches the spawn, so no agent process is started.
+    #[tokio::test]
+    async fn a_refusing_dispatch_gate_starts_no_agent_process() {
+        use crate::acp_cli::process::{AcpSubprocessError, run_oneshot_subprocess};
+
+        let prompt = [AcpPromptContent::Text("hello".to_string())];
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: None,
+            model: None,
+            session_check: None,
+            failure_marker: None,
+        };
+        let missing = "zeroclaw-estop-test-binary-that-does-not-exist";
+
+        let ungated = run_oneshot_subprocess(
+            tokio::process::Command::new(missing),
+            Duration::from_secs(5),
+            &request,
+            |_| Ok(None),
+        )
+        .await;
+        assert!(
+            matches!(ungated.result, Err(AcpSubprocessError::Spawn(_))),
+            "control: without a gate the run must reach the spawn"
+        );
+
+        let gate: std::sync::Arc<dyn zeroclaw_api::dispatch_gate::DispatchGate> =
+            std::sync::Arc::new(RefuseAllWork);
+        let gated = zeroclaw_api::dispatch_gate::with_scoped_gate(gate, async {
+            run_oneshot_subprocess(
+                tokio::process::Command::new(missing),
+                Duration::from_secs(5),
+                &request,
+                |_| Ok(None),
+            )
+            .await
+        })
+        .await;
+        match gated.result {
+            Err(AcpSubprocessError::Denied(reason)) => {
+                assert!(reason.contains("ACP agent provider refused by test gate"));
+            }
+            other => panic!("expected Denied before spawn, got {other:?}"),
+        }
     }
 
     #[test]
