@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::event::LogEvent;
-use crate::temp_guard::create_exclusive_temp;
+use crate::temp_guard::{TempKind, create_exclusive_temp, temp_sibling_path};
 
 /// Detect-and-migrate. No-op when the file contains no recognized legacy rows.
 pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
@@ -20,11 +20,11 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let tmp = path.with_extension(format!(
-        "migrate.{}.{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
+    let tmp = temp_sibling_path(
+        path,
+        TempKind::Migrate,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+    );
     let (out_file, mut temp_cleanup) = create_exclusive_temp(&tmp, "migration")?;
     let mut out = BufWriter::new(out_file);
 

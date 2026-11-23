@@ -41,7 +41,7 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
-use crate::temp_guard::create_exclusive_temp;
+use crate::temp_guard::{TempKind, create_exclusive_temp, temp_sibling_path};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -722,11 +722,11 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     }
     let skip = total - state.policy.max_entries;
 
-    let tmp = state.policy.path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
+    let tmp = temp_sibling_path(
+        &state.policy.path,
+        TempKind::Trim,
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-    ));
+    );
 
     // The guard lives outside the inner block and the file is moved into the
     // `BufWriter` inside it, so the handle is closed before the guard can
