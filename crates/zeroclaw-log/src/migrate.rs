@@ -376,6 +376,34 @@ mod tests {
     }
 
     #[test]
+    fn the_migrations_real_temp_name_is_one_the_sweep_recognizes() {
+        // The migration cannot be failed between creating its temp file and
+        // the rename, so an orphan of it is never observable here. What can be
+        // checked is the name it really creates, which is what the sweep keys on.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                r#"{"id":"id-1","timestamp":"2026-05-15T19:00:00Z","event_type":"agent_end","success":true}"#,
+            ],
+        );
+
+        migrate_legacy_jsonl_in_place(&path).unwrap();
+
+        let temp = crate::temp_guard::last_created_temp()
+            .expect("the migration created its temp file through the shared helper");
+        let parsed = crate::temp_guard::parse_temp_sibling(
+            "trace",
+            temp.file_name().unwrap().to_str().unwrap(),
+        )
+        .expect("the sweep must recognize the name the migration really uses");
+        assert_eq!(parsed.kind, crate::temp_guard::TempKind::Migrate);
+        assert_eq!(parsed.pid, std::process::id());
+        assert_eq!(temp.parent(), path.parent());
+    }
+
+    #[test]
     fn already_current_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");

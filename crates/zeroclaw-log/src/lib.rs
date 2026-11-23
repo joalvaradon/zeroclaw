@@ -9,6 +9,7 @@ pub mod layer;
 mod log_bridge;
 pub mod migrate;
 pub mod observer_bridge;
+mod orphan_sweep;
 pub mod reader;
 mod subscriber;
 mod temp_guard;

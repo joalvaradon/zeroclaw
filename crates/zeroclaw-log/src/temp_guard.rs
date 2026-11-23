@@ -20,12 +20,26 @@ pub(crate) enum TempKind {
 }
 
 impl TempKind {
+    /// Every writer kind. A reader of temp names matches against this list, so
+    /// a new kind is recognized by adding it here and to [`TempKind::infix`].
+    const ALL: [Self; 2] = [Self::Trim, Self::Migrate];
+
     fn infix(self) -> &'static str {
         match self {
             Self::Trim => "tmp",
             Self::Migrate => "migrate",
         }
     }
+}
+
+/// The parts of a name built by [`temp_sibling_path`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TempName {
+    pub(crate) kind: TempKind,
+    pub(crate) pid: u32,
+    /// Creation time in nanoseconds since the Unix epoch, as the writer read
+    /// its clock.
+    pub(crate) nanos: i64,
 }
 
 /// Path of a sibling temp file for `active`, in the same directory:
@@ -39,6 +53,56 @@ pub(crate) fn temp_sibling_path(active: &Path, kind: TempKind, now_nanos: i64) -
         std::process::id(),
         now_nanos
     ))
+}
+
+/// Recognize a name built by [`temp_sibling_path`]. `active_stem` is
+/// `Path::file_stem` of the active file, the same function `with_extension`
+/// uses, so producer and reader agree on what the stem is.
+///
+/// Only the exact shape `<stem>.<kind>.<digits>.<digits>` matches: no prefix
+/// matching, no extra segments, ASCII digits only (`str::parse` alone would
+/// accept a leading `+`), and values that do not fit `u32`/`i64` do not match.
+/// A reader that deletes what it recognizes relies on this being strict.
+pub(crate) fn parse_temp_sibling(active_stem: &str, file_name: &str) -> Option<TempName> {
+    let rest = file_name.strip_prefix(active_stem)?.strip_prefix('.')?;
+    let mut parts = rest.split('.');
+    let kind_part = parts.next()?;
+    let pid_part = parts.next()?;
+    let nanos_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let kind = TempKind::ALL
+        .into_iter()
+        .find(|kind| kind.infix() == kind_part)?;
+    Some(TempName {
+        kind,
+        pid: ascii_digits(pid_part)?.parse().ok()?,
+        nanos: ascii_digits(nanos_part)?.parse().ok()?,
+    })
+}
+
+fn ascii_digits(part: &str) -> Option<&str> {
+    (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())).then_some(part)
+}
+
+// Test seam: the last temp path created through `create_exclusive_temp` on this
+// thread. Both writers create their temp file there, so a test can read the
+// name each one really uses without a seam of its own.
+#[cfg(test)]
+thread_local! {
+    static LAST_CREATED: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_created(path: &Path) {
+    LAST_CREATED.with(|seen| *seen.borrow_mut() = Some(path.to_path_buf()));
+}
+
+#[cfg(test)]
+pub(crate) fn last_created_temp() -> Option<PathBuf> {
+    LAST_CREATED.with(|seen| seen.borrow().clone())
 }
 
 /// Removes the temp file on drop unless [`TempFileCleanup::disarm`] was called.
@@ -67,6 +131,8 @@ pub(crate) fn create_exclusive_temp(path: &Path, label: &str) -> Result<(File, T
     let file = opts
         .open(path)
         .with_context(|| format!("creating {label} temp {}", path.display()))?;
+    #[cfg(test)]
+    record_created(path);
     Ok((file, TempFileCleanup::new(path.to_path_buf())))
 }
 
@@ -144,5 +210,43 @@ mod tests {
                 active.with_extension(format!("migrate.{pid}.42"))
             );
         }
+    }
+
+    #[test]
+    fn a_produced_temp_name_is_recognized_with_its_parts() {
+        for active in [
+            "logs/runtime-trace.jsonl",
+            "logs/trace",
+            "logs/a.b.jsonl",
+            "runtime-trace.jsonl",
+        ] {
+            let active = Path::new(active);
+            let stem = active.file_stem().unwrap().to_str().unwrap();
+            for kind in [TempKind::Trim, TempKind::Migrate] {
+                let produced = temp_sibling_path(active, kind, 1_234_567);
+                assert_eq!(produced.parent(), active.parent());
+                let name = produced.file_name().unwrap().to_str().unwrap();
+                assert_eq!(
+                    parse_temp_sibling(stem, name),
+                    Some(TempName {
+                        kind,
+                        pid: std::process::id(),
+                        nanos: 1_234_567,
+                    }),
+                    "{name} must round-trip for the active path {}",
+                    active.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_of_another_stem_or_shape_is_not_recognized() {
+        assert_eq!(parse_temp_sibling("trace", "other.tmp.1.2"), None);
+        assert_eq!(parse_temp_sibling("trace", "trace.tmp.1.2.3"), None);
+        assert_eq!(parse_temp_sibling("trace", "trace.tmp.+1.2"), None);
+        assert_eq!(parse_temp_sibling("trace", "trace.tmp.1"), None);
+        assert!(parse_temp_sibling("trace", "trace.tmp.1.2").is_some());
+        assert!(parse_temp_sibling("trace", "trace.migrate.7.8").is_some());
     }
 }

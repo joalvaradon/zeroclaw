@@ -40,6 +40,7 @@ use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StorageP
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
+use crate::orphan_sweep::spawn_orphan_sweep;
 use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
 use crate::temp_guard::{TempKind, create_exclusive_temp, temp_sibling_path};
 use anyhow::{Context, Result};
@@ -215,6 +216,11 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
             next_archive_seq: AtomicU64::new(initial_archive_seq(&policy)),
         });
         spawn_worker(rx, worker_state);
+        // Clears temp files an earlier trim or migration left behind when the
+        // process was killed. Runs after the migration above, so a migration
+        // of this very process is already finished, and in the background, so
+        // a large backlog never delays startup.
+        spawn_orphan_sweep(&policy.path);
     } else {
         // No worker will ever run for a disabled policy; mark dead so
         // flush_for_test / re-init waiters do not spin on a false flag.
@@ -1158,10 +1164,12 @@ pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex:
 mod tests {
     use super::*;
     use crate::event::{EventCategory, Severity};
+    use crate::orphan_sweep::ORPHAN_MIN_AGE;
     // Archive-name predicates live in `reader`; only the tests below exercise
     // them directly, so importing them at module scope would be unused in a
     // non-test build.
     use crate::reader::{is_archive_core, is_stamp};
+    use crate::temp_guard::{TempKind, parse_temp_sibling};
 
     fn install_writer(dir: &Path, max_entries: usize) {
         let cfg = LogConfig {
@@ -1454,6 +1462,103 @@ mod tests {
             .unwrap()
             .to_path_buf();
         assert_eq!(trim_temp_names(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_trims_real_temp_name_is_one_the_sweep_recognizes() {
+        // The sweep can only remove what it can name. If the trim ever builds
+        // its temp name some other way, an orphan it leaves would be invisible
+        // to the sweep and no other test would notice.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+
+        {
+            let _armed = FailTrimRename::arm();
+            assert!(trim_to_last_entries(&state).is_err());
+        }
+
+        let temp = crate::temp_guard::last_created_temp()
+            .expect("the trim created its temp file through the shared helper");
+        let stem = state.policy.path.file_stem().unwrap().to_str().unwrap();
+        let parsed = parse_temp_sibling(stem, temp.file_name().unwrap().to_str().unwrap())
+            .expect("the sweep must recognize the name the trim really uses");
+        assert_eq!(parsed.kind, TempKind::Trim);
+        assert_eq!(parsed.pid, std::process::id());
+        assert_eq!(temp.parent(), state.policy.path.parent());
+    }
+
+    /// Seeds `<name>` next to the log the writer will use, creating its
+    /// directory (the default path sits in a `state/` subdirectory).
+    fn seed_in_log_dir(cfg: &LogConfig, workspace: &Path, names: &[&str]) -> PathBuf {
+        let dir = ResolvedPolicy::from_config(cfg, workspace)
+            .path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            fs::write(dir.join(name), "orphan\n").unwrap();
+        }
+        dir
+    }
+
+    fn nanos_ago_from_now(age: Duration) -> i64 {
+        chrono::Utc::now().timestamp_nanos_opt().unwrap() - i64::try_from(age.as_nanos()).unwrap()
+    }
+
+    #[test]
+    fn startup_removes_old_orphans_next_to_the_log_and_keeps_fresh_ones() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            ..LogConfig::default()
+        };
+        let old = nanos_ago_from_now(ORPHAN_MIN_AGE + Duration::from_secs(3600));
+        let fresh = nanos_ago_from_now(Duration::from_secs(60));
+        let old_trim = format!("runtime-trace.tmp.99999.{old}");
+        let old_migrate = format!("runtime-trace.migrate.99999.{old}");
+        let fresh_trim = format!("runtime-trace.tmp.99999.{fresh}");
+        for name in [&old_trim, &old_migrate, &fresh_trim] {
+            assert!(parse_temp_sibling("runtime-trace", name).is_some());
+        }
+        let dir = seed_in_log_dir(&cfg, tmp.path(), &[&old_trim, &old_migrate, &fresh_trim]);
+
+        init_from_config(&cfg, tmp.path());
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+        assert!(!dir.join(&old_trim).exists(), "an old trim orphan must go");
+        assert!(
+            !dir.join(&old_migrate).exists(),
+            "an old migration orphan must go"
+        );
+        assert!(
+            dir.join(&fresh_trim).exists(),
+            "an orphan younger than the threshold may belong to a live process"
+        );
+    }
+
+    #[test]
+    fn startup_under_a_disabled_policy_does_not_touch_the_directory() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        let old = nanos_ago_from_now(ORPHAN_MIN_AGE + Duration::from_secs(3600));
+        let old_trim = format!("runtime-trace.tmp.99999.{old}");
+        let dir = seed_in_log_dir(&cfg, tmp.path(), &[&old_trim]);
+
+        init_from_config(&cfg, tmp.path());
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+        assert!(
+            dir.join(&old_trim).exists(),
+            "`none` persists nothing and must not delete anything"
+        );
     }
 
     #[test]
