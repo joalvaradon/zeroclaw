@@ -601,6 +601,11 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         args: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> anyhow::Result<ToolResult> {
+        // Last point before the tool body: the process-wide dispatch gate
+        // (emergency stop) is asked with no `.await` between the check and
+        // the call. A tool that overrides this method must either forward to
+        // an inner `execute_with_context` or ask the gate itself.
+        crate::dispatch_gate::check_tool(self.name())?;
         context.run(self.execute(args)).await
     }
 
