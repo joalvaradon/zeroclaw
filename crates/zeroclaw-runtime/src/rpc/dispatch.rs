@@ -245,6 +245,11 @@ impl MethodAuthzExt for Method {
             }
 
             M::ToolsParamOptions => (Resource::Tools, Verb::Read),
+
+            // Emergency stop. The grant is a floor: the handlers also require
+            // admin grants and a local transport for `engage` and `resume`.
+            M::EstopStatus => (Resource::System, Verb::Read),
+            M::EstopEngage | M::EstopResume => (Resource::System, Verb::Execute),
         };
         MethodAuthz::Requires(resource, verb)
     }
@@ -270,6 +275,27 @@ struct TurnCompleteExtras {
     usage: Option<crate::rpc::types::TurnUsageTotals>,
 }
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
+
+/// The RPC error for a refused `estop/resume`. A resume that failed only
+/// because no code was sent carries `data.reason = "otp_required"`, so a client
+/// can ask the operator for one and send the request again.
+fn estop_resume_error(error: anyhow::Error) -> JsonRpcError {
+    if error.is::<crate::security::estop::OtpRequired>() {
+        return JsonRpcError {
+            code: FORBIDDEN,
+            message: format!("{error:#}"),
+            data: Some(serde_json::json!({ "reason": "otp_required" })),
+        };
+    }
+    let code = if error.is::<crate::security::estop::ResumeDenied>() {
+        FORBIDDEN
+    } else if error.is::<crate::security::estop::ResumeNotSaved>() {
+        INTERNAL_ERROR
+    } else {
+        INVALID_PARAMS
+    };
+    rpc_err(code, format!("{error:#}"))
+}
 
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
@@ -3622,6 +3648,11 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::ToolsParamOptions => self.handle_tools_param_options(params),
+
+            // Emergency stop
+            Method::EstopStatus => self.handle_estop_status(),
+            Method::EstopEngage => self.handle_estop_engage(params).await,
+            Method::EstopResume => self.handle_estop_resume(params).await,
         };
 
         if is_notification {
@@ -3630,7 +3661,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -10805,6 +10836,228 @@ impl RpcDispatcher {
         to_result(ConfigReloadResult { reloading: true })
     }
 
+    // ── Emergency stop ───────────────────────────────────────────
+
+    fn estop_snapshot_value(
+        snapshot: &crate::security::estop::EstopSnapshot,
+        include_error_detail: bool,
+    ) -> Value {
+        // The write error names the state file path: operators only.
+        let persist_error = if include_error_detail {
+            snapshot.persist_error.clone()
+        } else {
+            snapshot.persist_error.as_ref().map(|_| String::new())
+        };
+        serde_json::json!({
+            "enabled": true,
+            "revision": snapshot.revision,
+            "durable": snapshot.durable,
+            "persist_error": persist_error,
+            "state": snapshot.state,
+            "enforced_levels": ["kill-all", "tool-freeze"],
+            "unenforced_state": snapshot.state.has_unenforced(),
+        })
+    }
+
+    /// Engage and resume change the live stop state, so they are limited to
+    /// the local transport and to operator-level (admin) principals on top of
+    /// the method's grant.
+    fn estop_authority_for_write(
+        &self,
+    ) -> Result<std::sync::Arc<crate::security::estop::EstopAuthority>, JsonRpcError> {
+        if self.transport_kind != crate::rpc::transport::TransportKind::Local {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "emergency-stop engage and resume are available only over the local transport",
+            ));
+        }
+        if !self.has_admin_grants() {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "emergency-stop engage and resume require operator (admin) grants",
+            ));
+        }
+        crate::security::estop::global().ok_or_else(|| {
+            rpc_err(
+                INVALID_PARAMS,
+                "emergency stop is not enabled in this process (security.estop.enabled was false when it started; changing it takes a restart)",
+            )
+        })
+    }
+
+    /// Who sent an engage or resume, for the audit record. Empty when the
+    /// connection carries no authenticated principal.
+    fn estop_actor(&self) -> String {
+        self.auth
+            .as_ref()
+            .map(|auth| auth.principal.id.as_str().to_string())
+            .unwrap_or_default()
+    }
+
+    fn handle_estop_status(&self) -> RpcResult {
+        match crate::security::estop::global() {
+            Some(authority) => to_result(Self::estop_snapshot_value(
+                &authority.status(),
+                self.has_admin_grants(),
+            )),
+            None => to_result(serde_json::json!({ "enabled": false })),
+        }
+    }
+
+    async fn handle_estop_engage(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            level: String,
+            #[serde(default)]
+            tools: Vec<String>,
+            #[serde(default)]
+            domains: Vec<String>,
+        }
+        use crate::security::estop::EstopLevel;
+        let req: Params = parse_params(params)?;
+        // A scope list the level does not take is refused, not dropped: the
+        // stop that would engage is not the one the caller described. This is
+        // a parameter error like a malformed request, so it comes before the
+        // authorization lookup and needs no live authority to be reported.
+        match crate::security::estop::misplaced_scope(&req.level, &req.tools, &req.domains) {
+            Some(crate::security::estop::MisplacedScope::Tools) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "`tools` is only valid with level \"tool-freeze\", not {:?}",
+                        req.level
+                    ),
+                ));
+            }
+            Some(crate::security::estop::MisplacedScope::Domains) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "`domains` is only valid with level \"domain-block\", not {:?}",
+                        req.level
+                    ),
+                ));
+            }
+            None => {}
+        }
+        let authority = self.estop_authority_for_write()?;
+        let level = match req.level.as_str() {
+            "kill-all" => EstopLevel::KillAll,
+            "network-kill" => EstopLevel::NetworkKill,
+            "domain-block" => EstopLevel::DomainBlock(req.domains),
+            "tool-freeze" => {
+                if req.tools.is_empty() {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "tool-freeze requires at least one tool name",
+                    ));
+                }
+                EstopLevel::ToolFreeze(req.tools)
+            }
+            other => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("unknown emergency-stop level {other:?}"),
+                ));
+            }
+        };
+        let snapshot = tokio::task::spawn_blocking(move || authority.engage(level))
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("{e:#}")))?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "op": "estop/engage",
+                    "revision": snapshot.revision,
+                    "durable": snapshot.durable,
+                    "actor": self.estop_actor(),
+                })
+            ),
+            "emergency stop engaged"
+        );
+        to_result(Self::estop_snapshot_value(&snapshot, true))
+    }
+
+    async fn handle_estop_resume(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            #[serde(default)]
+            kill_all: bool,
+            #[serde(default)]
+            network: bool,
+            #[serde(default)]
+            domains: Vec<String>,
+            #[serde(default)]
+            tools: Vec<String>,
+            #[serde(default)]
+            otp: Option<String>,
+        }
+        use crate::security::estop::ResumeSelector;
+        let req: Params = parse_params(params)?;
+        let authority = self.estop_authority_for_write()?;
+        let mut selectors = Vec::new();
+        if req.network {
+            selectors.push(ResumeSelector::Network);
+        }
+        if !req.domains.is_empty() {
+            selectors.push(ResumeSelector::Domains(req.domains));
+        }
+        if !req.tools.is_empty() {
+            selectors.push(ResumeSelector::Tools(req.tools));
+        }
+        if req.kill_all || selectors.is_empty() {
+            selectors.push(ResumeSelector::KillAll);
+        }
+        let otp = req.otp;
+        let result =
+            tokio::task::spawn_blocking(move || authority.resume_many(selectors, otp.as_deref()))
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        let actor = self.estop_actor();
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // Every failed attempt is recorded, with who sent it and why it
+                // failed; the code itself is never logged.
+                let reason = if error.is::<crate::security::estop::OtpRequired>() {
+                    "otp_required"
+                } else if error.is::<crate::security::estop::ResumeDenied>() {
+                    "denied"
+                } else if error.is::<crate::security::estop::ResumeNotSaved>() {
+                    "state_file_not_written"
+                } else {
+                    "invalid_request"
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "op": "estop/resume",
+                            "actor": actor,
+                            "reason": reason,
+                        })),
+                    "emergency stop resume refused"
+                );
+                return Err(estop_resume_error(error));
+            }
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "op": "estop/resume",
+                    "revision": snapshot.revision,
+                    "actor": actor,
+                })
+            ),
+            "emergency stop resumed"
+        );
+        to_result(Self::estop_snapshot_value(&snapshot, true))
+    }
+
     fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
         schedule_daemon_reload_from_parts(
             self.ctx.reload_tx.clone(),
@@ -12808,14 +13061,20 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
+        let error = JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        };
+        self.send_rpc_error(id, error).await;
+    }
+
+    /// Send a handler's error as it is, including any structured `data`.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
         let resp = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: None,
-            error: Some(JsonRpcError {
-                code,
-                message: message.to_string(),
-                data: None,
-            }),
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -46010,6 +46269,153 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
         dispatcher.set_authenticated_for_test();
         (dispatcher, rx, sessions)
+    }
+
+    #[tokio::test]
+    async fn estop_engage_refuses_a_scope_the_level_does_not_take() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, _rx, _sessions) = make_dispatcher_with_capture(make_acp_test_config(&tmp));
+
+        for (params, needle) in [
+            (
+                json!({"level": "kill-all", "tools": ["shell"]}),
+                "tool-freeze",
+            ),
+            (
+                json!({"level": "kill-all", "domains": ["x.com"]}),
+                "domain-block",
+            ),
+            (
+                json!({"level": "network-kill", "domains": ["x.com"]}),
+                "domain-block",
+            ),
+            (
+                json!({"level": "domain-block", "tools": ["shell"], "domains": ["x.com"]}),
+                "tool-freeze",
+            ),
+            (
+                json!({"level": "tool-freeze", "tools": ["shell"], "domains": ["x.com"]}),
+                "domain-block",
+            ),
+        ] {
+            let err = dispatcher
+                .handle_estop_engage(&params)
+                .await
+                .expect_err(&format!("{params} must be refused"));
+            assert_eq!(err.code, INVALID_PARAMS, "{params}: {}", err.message);
+            assert!(
+                err.message.contains(needle),
+                "{params}: the error must name {needle}, got {:?}",
+                err.message
+            );
+        }
+
+        // A correctly scoped request is not refused for its scope. This
+        // process installs no emergency stop, so it stops later, at the
+        // authorization lookup, with a different error.
+        for params in [
+            json!({"level": "kill-all"}),
+            json!({"level": "tool-freeze", "tools": ["shell"]}),
+            json!({"level": "domain-block", "domains": ["x.com"]}),
+        ] {
+            let err = dispatcher
+                .handle_estop_engage(&params)
+                .await
+                .expect_err(&format!("{params} cannot engage in this process"));
+            assert!(
+                !err.message.contains("is only valid with level"),
+                "{params} is correctly scoped but was refused for its scope: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A dispatcher that never authenticated: no principal, so no admin grants.
+    fn make_unauthenticated_dispatcher(tmp: &tempfile::TempDir) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(make_acp_test_config(tmp), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "estop-test-peer:pid=1".into())
+    }
+
+    #[tokio::test]
+    async fn estop_engage_and_resume_need_operator_grants_and_the_local_transport() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut dispatcher = make_unauthenticated_dispatcher(&tmp);
+
+        // Local transport, but no operator (admin) grants.
+        let engage = dispatcher
+            .handle_estop_engage(&json!({"level": "kill-all"}))
+            .await
+            .expect_err("engage needs admin grants");
+        assert_eq!(engage.code, FORBIDDEN, "{}", engage.message);
+        assert!(engage.message.contains("admin"), "{}", engage.message);
+        let resume = dispatcher
+            .handle_estop_resume(&json!({"kill_all": true}))
+            .await
+            .expect_err("resume needs admin grants");
+        assert_eq!(resume.code, FORBIDDEN, "{}", resume.message);
+        assert!(resume.message.contains("admin"), "{}", resume.message);
+
+        // A non-local transport is refused before grants are even looked at.
+        for transport in [
+            crate::rpc::transport::TransportKind::Wss,
+            crate::rpc::transport::TransportKind::Inproc,
+        ] {
+            dispatcher.transport_kind = transport;
+            let engage = dispatcher
+                .handle_estop_engage(&json!({"level": "kill-all"}))
+                .await
+                .expect_err("engage is local-only");
+            assert_eq!(engage.code, FORBIDDEN, "{transport:?}: {}", engage.message);
+            assert!(
+                engage.message.contains("local"),
+                "{transport:?}: {}",
+                engage.message
+            );
+            let resume = dispatcher
+                .handle_estop_resume(&json!({"kill_all": true}))
+                .await
+                .expect_err("resume is local-only");
+            assert_eq!(resume.code, FORBIDDEN, "{transport:?}: {}", resume.message);
+            assert!(
+                resume.message.contains("local"),
+                "{transport:?}: {}",
+                resume.message
+            );
+        }
+    }
+
+    #[test]
+    fn estop_resume_error_tells_the_client_when_only_a_code_is_missing() {
+        use crate::security::estop::{OtpRequired, ResumeDenied};
+
+        let missing = estop_resume_error(anyhow::Error::new(OtpRequired(
+            "OTP code is required to resume estop state".into(),
+        )));
+        assert_eq!(missing.code, FORBIDDEN);
+        assert_eq!(missing.data, Some(json!({"reason": "otp_required"})));
+
+        // A wrong, replayed or rate-limited code is not a request for one.
+        let wrong = estop_resume_error(anyhow::Error::new(ResumeDenied(
+            "Invalid OTP code; estop resume denied".into(),
+        )));
+        assert_eq!(wrong.code, FORBIDDEN);
+        assert_eq!(wrong.data, None);
+
+        let malformed = estop_resume_error(anyhow::Error::msg("bad tool name"));
+        assert_eq!(malformed.code, INVALID_PARAMS);
+        assert_eq!(malformed.data, None);
+
+        // An authorized resume whose state file could not be written is a
+        // server fault, not a bad request.
+        let unsaved = estop_resume_error(anyhow::Error::new(
+            crate::security::estop::ResumeNotSaved("state file not written".into()),
+        ));
+        assert_eq!(unsaved.code, INTERNAL_ERROR);
+        assert_eq!(unsaved.data, None);
     }
 
     #[tokio::test]

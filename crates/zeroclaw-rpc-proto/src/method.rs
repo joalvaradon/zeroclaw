@@ -152,6 +152,11 @@ pub enum Method {
     SopsGraphDraft,
     SopsTriggerSources,
     ToolsParamOptions,
+
+    // Emergency stop (daemon-owned authority)
+    EstopStatus,
+    EstopEngage,
+    EstopResume,
 }
 
 impl Method {
@@ -278,6 +283,9 @@ impl Method {
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
+        (Method::EstopStatus, "estop/status"),
+        (Method::EstopEngage, "estop/engage"),
+        (Method::EstopResume, "estop/resume"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -481,6 +489,11 @@ impl Method {
             M::SopsGraphDraft => (Untyped, Typed("SopGraph")),
             M::SopsTriggerSources => (None, Typed("TriggerSourceRegistry")),
             M::ToolsParamOptions => (Untyped, Untyped),
+
+            // Emergency stop
+            M::EstopStatus => (None, Untyped),
+            M::EstopEngage => (Untyped, Untyped),
+            M::EstopResume => (Untyped, Untyped),
         };
         MethodContract { params, result }
     }

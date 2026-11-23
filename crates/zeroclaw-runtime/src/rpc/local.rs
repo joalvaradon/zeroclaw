@@ -182,7 +182,12 @@ pub enum LocalRpcCallError {
     #[error("local daemon protocol failed: {0}")]
     Protocol(String),
     #[error("local daemon rejected the request ({code}): {message}")]
-    Remote { code: i64, message: String },
+    Remote {
+        code: i64,
+        message: String,
+        /// The error's structured `data`, when the daemon sent any.
+        data: Option<serde_json::Value>,
+    },
 }
 
 #[cfg(unix)]
@@ -263,6 +268,7 @@ where
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown RPC error")
                     .to_string(),
+                data: error.get("data").cloned(),
             });
         }
         return frame.get("result").cloned().ok_or_else(|| {
