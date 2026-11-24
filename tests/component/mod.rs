@@ -25,6 +25,8 @@ mod direct_cli_terminal_completion;
 mod dockerignore_test;
 #[cfg(feature = "agent-runtime")]
 mod estop_cli;
+#[cfg(feature = "agent-runtime")]
+mod estop_daemon;
 #[cfg(feature = "gateway")]
 mod gateway;
 #[cfg(all(feature = "agent-runtime", feature = "gateway"))]
