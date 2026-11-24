@@ -187,7 +187,7 @@ Streams JSON events: `llm_request`, `tool_call_start`, `tool_call`, `agent_start
 
 ### Emergency Stop
 
-Emergency stop is **not enforced**: no running agent, daemon, or tool reads the state file `zeroclaw estop` used to write, so it stops nothing. Every form of the command (including `status`, `resume`, and `--otp`) refuses to run and changes no state. Do not offer it as a way to halt the agent. To halt the agent now, stop the ZeroClaw process itself, after confirming with the user.
+Emergency stop is owned by the running daemon (`security.estop.enabled`, read at daemon start). `zeroclaw estop` engages, resumes or shows it over the local RPC socket and fails without changing anything when no daemon is reachable. It refuses new tool calls (`kill-all` or `--level tool-freeze --tool <name>`); it does not interrupt a call already running, does not enforce `network-kill` or `domain-block`, and `zeroclaw agent`, `acp`, `gateway start` and `channel start` refuse to start while estop is enabled because they run tools outside the daemon. To halt a running call now, stop the ZeroClaw process itself, after confirming with the user.
 
 ### Gateway Lifecycle
 

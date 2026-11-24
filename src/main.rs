@@ -1388,20 +1388,22 @@ Examples:
         relay_command: RelayCommands,
     },
 
-    /// Emergency stop (not enforced: every form of this command refuses to run)
+    /// Emergency stop (the daemon enforces kill-all and tool-freeze; requires a running daemon)
+    #[command(args_conflicts_with_subcommands = true)]
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
 
-        /// Level (not enforced: every form of this command refuses to run).
+        /// Level to engage (default: kill-all). `network-kill` and
+        /// `domain-block` are refused: no runtime path enforces them.
         #[arg(long, value_enum)]
         level: Option<EstopLevelArg>,
 
-        /// Domain pattern(s). Accepted but ignored: the command is not enforced.
+        /// Domain pattern(s) for `--level domain-block`.
         #[arg(long = "domain")]
         domains: Vec<String>,
 
-        /// Tool name(s). Accepted but ignored: the command is not enforced.
+        /// Tool name(s) for `--level tool-freeze`.
         #[arg(long = "tool")]
         tools: Vec<String>,
     },
@@ -8638,20 +8640,22 @@ fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
 
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
-    /// Not enforced: refuses to run.
+    /// Show the daemon's emergency-stop state.
     Status,
-    /// Not enforced: refuses to run.
+    /// Resume from an emergency stop (an OTP code may be required).
     Resume {
-        /// Accepted but ignored: the command is not enforced.
+        /// Clear a legacy network-kill entry.
         #[arg(long)]
         network: bool,
-        /// Accepted but ignored: the command is not enforced.
+        /// Clear legacy blocked-domain entries.
         #[arg(long = "domain")]
         domains: Vec<String>,
-        /// Accepted but ignored: the command is not enforced.
+        /// Unfreeze these tools (with no flags, resume clears kill-all).
         #[arg(long = "tool")]
         tools: Vec<String>,
-        /// Accepted but ignored: the command is not enforced.
+        /// OTP code. `-` reads it from stdin; when omitted on a terminal you
+        /// are prompted. A code given on the command line is visible to other
+        /// processes of the same user.
         #[arg(long)]
         otp: Option<String>,
     },
@@ -10079,6 +10083,26 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 "{}",
                 ta("cli-otp-enrollment-uri", &[("uri", &uri)], "Enrollment URI")
             );
+        }
+    }
+
+    // Emergency stop is decided once per process, before any producer starts
+    // (the SOP maintenance ticker below is spawned before the daemon loop). A
+    // daemon installs the authority here; a command that runs tools in this
+    // process without the daemon cannot honor an enabled stop, so it refuses
+    // to start rather than run ungated.
+    #[cfg(feature = "agent-runtime")]
+    {
+        if matches!(&cli.command, Commands::Daemon { .. }) {
+            security::install_for_config(&config)?;
+        } else if let Some(command) = estop_standalone_command(&cli.command)
+            && config.security.estop.enabled
+        {
+            bail!(ta(
+                "cli-estop-standalone-refused",
+                &[("command", command)],
+                ""
+            ));
         }
     }
 
@@ -12093,7 +12117,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 ta(
                     "cli-status-estop",
                     &[("v", &config.security.estop.enabled.to_string())],
-                    "E-stop enabled: (not enforced)"
+                    "E-stop enabled:"
                 )
             );
             println!();
@@ -12245,7 +12269,12 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
         },
 
-        Commands::Estop { .. } => handle_estop_command(),
+        Commands::Estop {
+            estop_command,
+            level,
+            domains,
+            tools,
+        } => handle_estop_command(&config, estop_command, level, domains, tools).await,
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -14227,16 +14256,306 @@ Add pricing to the active provider profile or supply a catalog entry."
     }
 }
 
+/// Commands that execute tools or agent turns in their own process, outside
+/// the daemon that owns the emergency-stop authority.
 #[cfg(feature = "agent-runtime")]
-fn handle_estop_command() -> Result<()> {
-    // No runtime path reads the estop state file, so engaging it would stop
-    // nothing. Refuse every form of the command before looking at its
-    // arguments, so the operator learns at once that nothing was stopped.
-    bail!(ta(
-        "cli-estop-not-enforced",
-        &[],
-        "`zeroclaw estop` is not enforced: no running agent, daemon, or tool reads the estop state file, so engaging it would not stop anything. The estop state was not changed. To halt the agent now, stop the ZeroClaw process itself."
-    ))
+fn estop_standalone_command(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Agent { .. } => Some("agent"),
+        #[cfg(feature = "channel-acp-server")]
+        Commands::Acp { .. } => Some("acp"),
+        Commands::Gateway {
+            gateway_command: None | Some(zeroclaw::GatewayCommands::Start { .. }),
+        } => Some("gateway"),
+        Commands::Channel {
+            channel_command: ChannelCommands::Start,
+        } => Some("channel start"),
+        _ => None,
+    }
+}
+
+/// Build the daemon request for one `zeroclaw estop` form. The CLI never
+/// touches the state file: the running daemon owns the emergency-stop state
+/// and every form goes to it over the local RPC.
+#[cfg(feature = "agent-runtime")]
+fn estop_request(
+    command: Option<EstopSubcommands>,
+    level: Option<EstopLevelArg>,
+    domains: Vec<String>,
+    tools: Vec<String>,
+    read_otp: impl FnOnce(Option<String>) -> Result<Option<String>>,
+) -> Result<(&'static str, serde_json::Value)> {
+    match command {
+        Some(EstopSubcommands::Status) => Ok(("estop/status", serde_json::json!({}))),
+        Some(EstopSubcommands::Resume {
+            network,
+            domains,
+            tools,
+            otp,
+        }) => {
+            let otp = read_otp(otp)?;
+            Ok((
+                "estop/resume",
+                serde_json::json!({
+                    "network": network,
+                    "domains": domains,
+                    "tools": tools,
+                    "otp": otp,
+                }),
+            ))
+        }
+        None => {
+            let level = match level.unwrap_or(EstopLevelArg::KillAll) {
+                EstopLevelArg::KillAll => "kill-all",
+                EstopLevelArg::NetworkKill => "network-kill",
+                EstopLevelArg::DomainBlock => "domain-block",
+                EstopLevelArg::ToolFreeze => "tool-freeze",
+            };
+            // The daemon refuses the same mismatch; checking here as well
+            // gives the operator the corrected command even with no daemon.
+            use zeroclaw_runtime::security::{MisplacedScope, misplaced_scope};
+            match misplaced_scope(level, &tools, &domains) {
+                Some(MisplacedScope::Tools) => {
+                    let flags: Vec<String> =
+                        tools.iter().map(|tool| format!("--tool {tool}")).collect();
+                    let command = format!("zeroclaw estop --level tool-freeze {}", flags.join(" "));
+                    bail!(ta("cli-estop-scope-tools", &[("command", &command)], ""));
+                }
+                Some(MisplacedScope::Domains) => {
+                    bail!(ta("cli-estop-scope-domains", &[], ""));
+                }
+                None => {}
+            }
+            Ok((
+                "estop/engage",
+                serde_json::json!({
+                    "level": level,
+                    "domains": domains,
+                    "tools": tools,
+                }),
+            ))
+        }
+    }
+}
+
+/// The OTP for `estop resume`: `--otp -` reads one line from stdin and `--otp
+/// <code>` uses the argument (visible to other processes of the same user).
+/// With no flag nothing is sent: the daemon says whether it wants a code, and
+/// only then does [`prompt_estop_otp`] ask the terminal.
+#[cfg(feature = "agent-runtime")]
+fn read_estop_otp(arg: Option<String>) -> Result<Option<String>> {
+    match arg.as_deref() {
+        Some("-") => read_estop_otp_line(),
+        Some(code) => Ok(Some(code.to_string())),
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn read_estop_otp_line() -> Result<Option<String>> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    // A code typed at a terminal is not echoed; a piped code (`--otp -`) has no
+    // terminal to hide it from.
+    let echo = EchoOff::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    drop(echo);
+    read?;
+    let code = line.trim().to_string();
+    Ok((!code.is_empty()).then_some(code))
+}
+
+/// Turns terminal echo off on standard input until dropped. A no-op when
+/// standard input is not a terminal, and on platforms without termios, where
+/// the code stays visible as typed.
+#[cfg(feature = "agent-runtime")]
+struct EchoOff {
+    #[cfg(unix)]
+    saved: Option<libc::termios>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl EchoOff {
+    #[cfg(unix)]
+    fn new() -> Self {
+        let fd = libc::STDIN_FILENO;
+        let mut term = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `tcgetattr` fills `term` only when it returns 0, and the
+        // value is read only in that case; `fd` is standard input.
+        let saved = unsafe {
+            if libc::isatty(fd) == 1 && libc::tcgetattr(fd, term.as_mut_ptr()) == 0 {
+                Some(term.assume_init())
+            } else {
+                None
+            }
+        };
+        if let Some(saved) = saved {
+            let mut quiet = saved;
+            quiet.c_lflag &= !libc::ECHO;
+            // SAFETY: `quiet` is a fully initialised copy of the attributes
+            // just read from this descriptor.
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+        }
+        Self { saved }
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(saved) = self.saved {
+            // SAFETY: restores the attributes read in `new` on the same descriptor.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
+            // The newline the user typed was not echoed.
+            eprintln!();
+        }
+    }
+}
+
+/// Ask the terminal for the code the daemon said it needs.
+#[cfg(feature = "agent-runtime")]
+fn prompt_estop_otp() -> Result<Option<String>> {
+    eprint!("{}", t("cli-estop-otp-prompt", "OTP code: "));
+    std::io::stderr().flush()?;
+    read_estop_otp_line()
+}
+
+/// Whether the daemon's error data says the resume failed only because no
+/// code was sent (`estop/resume`, `data.reason`).
+#[cfg(feature = "agent-runtime")]
+fn estop_otp_required(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|data| data.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        == Some("otp_required")
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_estop_result(method: &str, result: &serde_json::Value) {
+    if result.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+        println!("{}", t("cli-estop-disabled", ""));
+        return;
+    }
+    let header = match method {
+        "estop/engage" => "cli-estop-engaged",
+        "estop/resume" => "cli-estop-resume-done",
+        _ => "cli-estop-status",
+    };
+    println!("{}", t(header, ""));
+
+    let state = &result["state"];
+    let kill_all = state["kill_all"].as_bool().unwrap_or(false).to_string();
+    println!("{}", ta("cli-estop-kill-all", &[("v", &kill_all)], ""));
+
+    let list = |field: &str| -> Vec<String> {
+        state[field]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let tools = list("frozen_tools");
+    if tools.is_empty() {
+        println!("{}", t("cli-estop-tools-none", ""));
+    } else {
+        println!("{}", ta("cli-estop-tools", &[("v", &tools.join(", "))], ""));
+    }
+    let domains = list("blocked_domains");
+    if domains.is_empty() {
+        println!("{}", t("cli-estop-domains-none", ""));
+    } else {
+        println!(
+            "{}",
+            ta("cli-estop-domains", &[("v", &domains.join(", "))], "")
+        );
+    }
+
+    let revision = result["revision"].as_u64().unwrap_or(0).to_string();
+    let durable = result["durable"].as_bool().unwrap_or(false);
+    println!(
+        "{}",
+        ta(
+            "cli-estop-revision",
+            &[("revision", &revision), ("durable", &durable.to_string())],
+            ""
+        )
+    );
+    if let Some(updated_at) = state["updated_at"].as_str() {
+        println!("{}", ta("cli-estop-updated-at", &[("v", updated_at)], ""));
+    }
+    if result["unenforced_state"].as_bool().unwrap_or(false) {
+        println!("{}", t("cli-estop-unenforced", ""));
+    }
+    // `resume` with no flags lifts kill-all only; say so when tools stay frozen.
+    if method == "estop/resume" && !tools.is_empty() {
+        println!("{}", t("cli-estop-tools-still-frozen", ""));
+    }
+    if !durable {
+        let error = result["persist_error"].as_str().unwrap_or("unknown error");
+        eprintln!("{}", ta("cli-estop-not-durable", &[("error", error)], ""));
+    }
+}
+
+/// `zeroclaw estop`: engage, resume or show the emergency stop owned by the
+/// running daemon. Success is printed only after the daemon's committed
+/// response; with no reachable daemon the command fails and changes nothing.
+#[cfg(feature = "agent-runtime")]
+async fn handle_estop_command(
+    config: &Config,
+    command: Option<EstopSubcommands>,
+    level: Option<EstopLevelArg>,
+    domains: Vec<String>,
+    tools: Vec<String>,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    use zeroclaw_runtime::rpc::local::{LocalRpcCallError, call_local};
+    let (method, mut params) = estop_request(command, level, domains, tools, read_estop_otp)?;
+    let mut asked_for_code = false;
+    let result = loop {
+        match call_local(config, method, params.clone()).await {
+            Ok(value) => break value,
+            Err(LocalRpcCallError::Unavailable { path, .. }) => bail!(ta(
+                "cli-estop-daemon-required",
+                &[("path", &path.display().to_string())],
+                ""
+            )),
+            // The daemon wants a code and none was given: ask once, on a
+            // terminal, and send the same request again. The refused attempt
+            // changed nothing and did not count as a wrong code.
+            Err(LocalRpcCallError::Remote { message, data, .. })
+                if method == "estop/resume"
+                    && !asked_for_code
+                    && params["otp"].is_null()
+                    && estop_otp_required(data.as_ref())
+                    && std::io::stdin().is_terminal() =>
+            {
+                asked_for_code = true;
+                match prompt_estop_otp()? {
+                    Some(code) => params["otp"] = serde_json::Value::String(code),
+                    None => bail!(message),
+                }
+            }
+            Err(LocalRpcCallError::Remote { message, .. }) => bail!(message),
+            // The request may have reached the daemon before the transport
+            // failed (timeout, protocol error): say the state is unknown.
+            Err(other) => bail!(ta(
+                "cli-estop-state-unknown",
+                &[("error", &other.to_string())],
+                ""
+            )),
+        }
+    };
+    print_estop_result(method, &result);
+    Ok(())
 }
 
 fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
@@ -19807,50 +20126,245 @@ mod tests {
         }
     }
 
+    /// Parse `zeroclaw estop <argv>` and build the daemon request, with the
+    /// OTP supplied by `otp` instead of a terminal.
     #[cfg(feature = "agent-runtime")]
-    fn run_estop_from_argv(argv: &[&str]) -> Result<()> {
+    fn estop_request_from_argv(
+        argv: &[&str],
+        otp: Option<&str>,
+    ) -> (&'static str, serde_json::Value) {
         let mut full = vec!["zeroclaw", "estop"];
         full.extend_from_slice(argv);
         let cli = Cli::try_parse_from(full).expect("estop command should parse");
         match cli.command {
-            Commands::Estop { .. } => handle_estop_command(),
+            Commands::Estop {
+                estop_command,
+                level,
+                domains,
+                tools,
+            } => estop_request(estop_command, level, domains, tools, |arg| {
+                Ok(arg.or_else(|| otp.map(str::to_string)))
+            })
+            .expect("estop request should build"),
             other => panic!("expected estop command, got {other:?}"),
         }
     }
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn estop_refuses_every_form_instead_of_reporting_a_stop() {
-        let expected = ta("cli-estop-not-enforced", &[], "");
-        assert!(
-            expected.contains("zeroclaw estop"),
-            "the catalog must define cli-estop-not-enforced, got {expected:?}"
-        );
+    fn estop_forms_become_daemon_requests() {
+        use serde_json::json;
 
-        let invocations: &[&[&str]] = &[
-            &[],
-            &["--level", "kill-all"],
-            &["--level", "network-kill"],
-            &["--level", "domain-block", "--domain", "*.example.com"],
-            &["--level", "tool-freeze", "--tool", "shell"],
-            &["status"],
-            &["resume"],
-            &["resume", "--network"],
-            &["resume", "--domain", "*.example.com"],
-            &["resume", "--tool", "shell"],
-            &["resume", "--otp", "123456"],
-            &["resume", "--network", "--otp", "123456"],
-            &["--level", "domain-block"],
-            &["--level", "kill-all", "--domain", "*.example.com"],
-            &["resume", "--network", "--tool", "shell"],
-        ];
-        for argv in invocations {
-            let err = run_estop_from_argv(argv)
-                .expect_err("estop must not report success while nothing enforces it");
-            assert_eq!(err.to_string(), expected, "argv: {argv:?}");
+        assert_eq!(
+            estop_request_from_argv(&[], None),
+            (
+                "estop/engage",
+                json!({"level": "kill-all", "domains": [], "tools": []})
+            )
+        );
+        assert_eq!(
+            estop_request_from_argv(&["--level", "tool-freeze", "--tool", "shell"], None),
+            (
+                "estop/engage",
+                json!({"level": "tool-freeze", "domains": [], "tools": ["shell"]})
+            )
+        );
+        assert_eq!(
+            estop_request_from_argv(&["status"], None),
+            ("estop/status", json!({}))
+        );
+        assert_eq!(
+            estop_request_from_argv(&["resume", "--tool", "shell", "--otp", "123456"], None),
+            (
+                "estop/resume",
+                json!({"network": false, "domains": [], "tools": ["shell"], "otp": "123456"})
+            )
+        );
+        assert_eq!(
+            estop_request_from_argv(&["resume", "--network"], Some("654321")),
+            (
+                "estop/resume",
+                json!({"network": true, "domains": [], "tools": [], "otp": "654321"})
+            )
+        );
+    }
+
+    /// Like [`estop_request_from_argv`], but returns the builder's error.
+    #[cfg(feature = "agent-runtime")]
+    fn try_estop_request_from_argv(argv: &[&str]) -> Result<(&'static str, serde_json::Value)> {
+        let mut full = vec!["zeroclaw", "estop"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("estop command should parse");
+        match cli.command {
+            Commands::Estop {
+                estop_command,
+                level,
+                domains,
+                tools,
+            } => estop_request(estop_command, level, domains, tools, Ok),
+            other => panic!("expected estop command, got {other:?}"),
         }
     }
 
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn estop_scope_flags_without_their_level_build_no_request() {
+        for (argv, suggestion) in [
+            (&["--tool", "shell"][..], "--level tool-freeze"),
+            (&["--domain", "x.com"][..], "--level domain-block"),
+            (
+                &["--level", "kill-all", "--tool", "shell"][..],
+                "--level tool-freeze",
+            ),
+            (
+                &["--level", "kill-all", "--domain", "x.com"][..],
+                "--level domain-block",
+            ),
+            (
+                &["--level", "network-kill", "--domain", "x.com"][..],
+                "--level domain-block",
+            ),
+        ] {
+            let error = try_estop_request_from_argv(argv).expect_err(&format!(
+                "`zeroclaw estop {argv:?}` must not build a request"
+            ));
+            assert!(
+                error.to_string().contains(suggestion),
+                "`zeroclaw estop {argv:?}` must suggest `{suggestion}`, got: {error}"
+            );
+        }
+
+        // The forms that carry their level still build a request.
+        for argv in [
+            &[][..],
+            &["--level", "kill-all"][..],
+            &["--level", "tool-freeze", "--tool", "shell"][..],
+            &["--level", "domain-block", "--domain", "x.com"][..],
+        ] {
+            assert!(
+                try_estop_request_from_argv(argv).is_ok(),
+                "`zeroclaw estop {argv:?}` must still build a request"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn commands_that_run_tools_outside_the_daemon_are_the_ones_estop_refuses() {
+        for (argv, expected) in [
+            (
+                &["zeroclaw", "agent", "--agent", "default"][..],
+                Some("agent"),
+            ),
+            (&["zeroclaw", "gateway"][..], Some("gateway")),
+            (&["zeroclaw", "gateway", "start"][..], Some("gateway")),
+            (&["zeroclaw", "channel", "start"][..], Some("channel start")),
+            (&["zeroclaw", "daemon"][..], None),
+            (&["zeroclaw", "estop", "status"][..], None),
+        ] {
+            let cli = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            assert_eq!(estop_standalone_command(&cli.command), expected, "{argv:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn scope_flags_cannot_be_combined_with_an_estop_subcommand() {
+        // The subcommands read their own flags; a parent-level flag would be
+        // dropped and a different stop than the one asked for would run.
+        for argv in [
+            &["zeroclaw", "estop", "--tool", "shell", "resume"][..],
+            &["zeroclaw", "estop", "--domain", "x.com", "resume"][..],
+            &["zeroclaw", "estop", "--level", "kill-all", "status"][..],
+            &[
+                "zeroclaw",
+                "estop",
+                "--level",
+                "tool-freeze",
+                "--tool",
+                "shell",
+                "status",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{argv:?} must be a usage error"
+            );
+        }
+        // The subcommands' own flags and the flag-free forms still parse.
+        for argv in [
+            &["zeroclaw", "estop", "resume", "--tool", "shell"][..],
+            &["zeroclaw", "estop", "resume", "--domain", "x.com"][..],
+            &["zeroclaw", "estop", "status"][..],
+            &[
+                "zeroclaw",
+                "estop",
+                "--level",
+                "tool-freeze",
+                "--tool",
+                "shell",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_ok(),
+                "{argv:?} must still parse"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn resume_asks_for_a_code_only_when_the_daemon_says_it_needs_one() {
+        use serde_json::json;
+        assert!(estop_otp_required(Some(&json!({"reason": "otp_required"}))));
+        assert!(!estop_otp_required(Some(&json!({"reason": "other"}))));
+        assert!(!estop_otp_required(Some(&json!({}))));
+        assert!(!estop_otp_required(None));
+
+        // With no `--otp` nothing is read or sent up front, terminal or not.
+        assert_eq!(read_estop_otp(None).unwrap(), None);
+        assert_eq!(
+            read_estop_otp(Some("123456".into())).unwrap().as_deref(),
+            Some("123456")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn estop_strings_are_defined_in_the_catalog() {
+        // A missing key renders as `{key}`, so compare against that.
+        for key in [
+            "cli-estop-daemon-required",
+            "cli-estop-state-unknown",
+            "cli-estop-disabled",
+            "cli-estop-kill-all",
+            "cli-estop-revision",
+            "cli-estop-not-durable",
+            "cli-estop-unenforced",
+            "cli-estop-otp-prompt",
+            "cli-estop-standalone-refused",
+            "cli-estop-scope-tools",
+            "cli-estop-scope-domains",
+        ] {
+            let rendered = ta(
+                key,
+                &[
+                    ("path", "p"),
+                    ("error", "e"),
+                    ("v", "v"),
+                    ("revision", "1"),
+                    ("durable", "true"),
+                    ("command", "agent"),
+                ],
+                "",
+            );
+            assert!(
+                !rendered.trim().is_empty() && rendered != format!("{{{key}}}"),
+                "the catalog must define {key}, got {rendered:?}"
+            );
+        }
+    }
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {

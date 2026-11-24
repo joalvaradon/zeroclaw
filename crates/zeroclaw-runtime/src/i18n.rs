@@ -2687,40 +2687,111 @@ mod tests {
         }
     }
 
-    /// `zeroclaw estop` refuses to run because nothing enforces it, so every
-    /// catalogue must say so in its own language, name the command in the
-    /// refusal, and carry the `--help` and status wording that matches it. A
-    /// catalogue that copies English fails as untranslated.
+    /// The state-field labels in `zeroclaw estop` output.
     #[test]
-    fn estop_not_enforced_strings_are_translated_in_every_locale() {
-        let cases: [(&str, &[(&str, &str)]); 5] = [
-            ("cli-estop-not-enforced", &[]),
-            ("cli-estop-about", &[]),
-            ("cli-estop-status-about", &[]),
-            ("cli-estop-resume-about", &[]),
-            ("cli-status-estop", &[("v", "true")]),
+    fn estop_result_labels_are_defined_and_interpolate_in_every_locale() {
+        // These labels name state fields (`kill_all:`, `tool_freeze:`, ...) and
+        // are the same in every catalogue on purpose, so they are checked for
+        // being defined and carrying their value, not for differing from English.
+        let cases: [(&str, &str); 4] = [
+            ("cli-estop-kill-all", "kill_all:"),
+            ("cli-estop-tools", "tool_freeze:"),
+            ("cli-estop-domains", "domain_blocks:"),
+            ("cli-estop-updated-at", "updated_at:"),
+        ];
+        for (key, label) in cases {
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, &[("v", "VALUE-7")])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    value.contains(label) && value.contains("VALUE-7"),
+                    "{key} in {locale} must carry {label} and its value; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    /// The `zeroclaw estop` messages must exist and be translated in every
+    /// catalogue, keep the command name and the interpolated values that the
+    /// operator needs, and a catalogue that copies English fails as
+    /// untranslated.
+    #[test]
+    fn estop_strings_are_translated_in_every_locale() {
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [Case; 17] = [
+            ("cli-estop-about", &[], &[]),
+            ("cli-status-estop", &[("v", "true")], &["true"]),
+            (
+                "cli-estop-tools-still-frozen",
+                &[],
+                &["zeroclaw estop resume --tool"],
+            ),
+            ("cli-estop-tools-none", &[], &["tool_freeze:"]),
+            ("cli-estop-domains-none", &[], &["domain_blocks:"]),
+            (
+                "cli-estop-daemon-required",
+                &[("path", "/run/zc.sock")],
+                &["zeroclaw estop", "/run/zc.sock", "zeroclaw daemon"],
+            ),
+            (
+                "cli-estop-state-unknown",
+                &[("error", "timed out")],
+                &["timed out", "zeroclaw estop status"],
+            ),
+            ("cli-estop-disabled", &[], &["security.estop.enabled"]),
+            (
+                "cli-estop-revision",
+                &[("revision", "7"), ("durable", "false")],
+                &["7", "false"],
+            ),
+            (
+                "cli-estop-not-durable",
+                &[("error", "disk full")],
+                &["disk full"],
+            ),
+            (
+                "cli-estop-unenforced",
+                &[],
+                &["zeroclaw estop resume --network"],
+            ),
+            ("cli-estop-otp-prompt", &[], &["OTP"]),
+            (
+                "cli-estop-standalone-refused",
+                &[("command", "agent")],
+                &["zeroclaw agent", "security.estop.enabled"],
+            ),
+            (
+                "cli-estop-scope-tools",
+                &[("command", "zeroclaw estop --level tool-freeze --tool shell")],
+                &[
+                    "--tool",
+                    "--level tool-freeze",
+                    "zeroclaw estop --level tool-freeze --tool shell",
+                ],
+            ),
+            (
+                "cli-estop-scope-domains",
+                &[],
+                &["--domain", "--level domain-block"],
+            ),
+            ("cli-estop-status-about", &[], &[]),
+            ("cli-estop-resume-about", &[], &["OTP"]),
         ];
 
-        // The phrase each locale uses to say the command is not enforced.
-        // Without it a catalogue could go back to describing `estop` as
-        // engaging or resuming a stop and still be a translated string.
-        let not_enforced = |locale: &str, key: &str| -> &'static str {
-            match (locale, key) {
-                ("en", _) => "not enforced",
-                ("es", _) => "no se hace cumplir",
-                ("fr", "cli-estop-not-enforced") => "pas appliqué",
-                ("fr", _) => "non appliqué",
-                ("ja", "cli-estop-not-enforced") => "適用されていません",
-                ("ja", _) => "未適用",
-                ("zh-CN", _) => "未生效",
-                _ => unreachable!("unexpected locale {locale}"),
-            }
-        };
-
         let english_source = include_str!("../locales/en/cli.ftl");
-        for (key, args) in cases {
+        for (key, args, expected_parts) in cases {
             let english = format_ftl_message(english_source, "en", key, args)
                 .unwrap_or_else(|| panic!("{key} should format in en"));
+            assert!(
+                !english.trim().is_empty(),
+                "{key} must not be empty in en; got {english:?}"
+            );
 
             for (source, locale) in [
                 (include_str!("../locales/en/cli.ftl"), "en"),
@@ -2731,18 +2802,10 @@ mod tests {
             ] {
                 let value = format_ftl_message(source, locale, key, args)
                     .unwrap_or_else(|| panic!("{key} should format in {locale}"));
-                assert!(
-                    !value.trim().is_empty(),
-                    "{key} must not be empty in {locale}"
-                );
-                assert!(
-                    value.to_lowercase().contains(not_enforced(locale, key)),
-                    "{key} in {locale} should say the command is not enforced; got: {value:?}"
-                );
-                if key == "cli-estop-not-enforced" {
+                for expected in expected_parts {
                     assert!(
-                        value.contains("zeroclaw estop"),
-                        "{key} in {locale} should name the command; got: {value:?}"
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
                     );
                 }
                 if locale != "en" {

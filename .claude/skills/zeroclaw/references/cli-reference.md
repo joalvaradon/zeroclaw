@@ -187,9 +187,9 @@ zeroclaw channel doctor      # Check channel health
 
 ## Security & Emergency Stop
 
-**Emergency stop is not enforced.** No running agent, daemon, or tool reads the state file `zeroclaw estop` used to write, so it stops nothing. Every form of the command (including `status` and `resume`) refuses to run and changes no state. Do not use it to halt the agent. To halt the agent now, stop the ZeroClaw process itself.
+**Emergency stop is owned by the running daemon.** `zeroclaw estop` (`--level kill-all`, `--level tool-freeze --tool <name>`, `status`, `resume [--tool <name>] [--otp -]`) goes to the daemon over the local RPC socket and fails without changing anything when no daemon is reachable. It refuses new tool calls; it does not interrupt a call already running, does not enforce `network-kill` or `domain-block`, and `zeroclaw agent`, `acp`, `gateway start` and `channel start` refuse to start while estop is enabled because they run tools outside the daemon. `resume` needs a one-time OTP when `require_otp_to_resume` is set. To halt a running call now, stop the ZeroClaw process itself.
 
-The command still accepts `--level kill-all|network-kill|domain-block|tool-freeze`, `--domain`, `--tool`, `resume --network|--domain|--tool`, and `resume --otp`, but each invocation ends with the not-enforced error.
+`--level network-kill` and `--level domain-block` are accepted by the parser but the daemon refuses to engage them; `resume --network` and `resume --domain` only clear legacy entries from an old state file.
 
 Autonomy lives on a risk profile and a runtime profile, both alias-keyed; the agent points at them via `[agents.<alias>] risk_profile = "..."` and `runtime_profile = "..."`:
 

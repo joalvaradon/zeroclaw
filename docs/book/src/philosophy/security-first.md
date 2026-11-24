@@ -11,6 +11,6 @@ The runtime ships with:
 - Tool receipts: a cryptographically-linked audit log of every tool call
 - OTP-gated actions
 
-The `zeroclaw estop` emergency stop is not part of this list: it is not enforced today. See [the security model](../security/model.md).
+The `zeroclaw estop` emergency stop is a daemon control with limits: it refuses new tool calls, not ones already running, and the commands that run tools outside the daemon refuse to start while it is enabled. See [the security model](../security/model.md).
 
 For developers and home-lab users who understand the trade-offs, there's [YOLO mode](../getting-started/yolo.md): one config preset that disables the guardrails. It's loud, logged, and obviously named. Not the default.
