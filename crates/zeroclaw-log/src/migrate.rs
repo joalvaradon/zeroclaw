@@ -92,6 +92,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
+    before_migrate_rename_hook();
     fs::rename(&tmp, path).with_context(|| {
         format!(
             "renaming migration temp {} → {}",
@@ -119,6 +120,54 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// Test seam: an action that runs after the temp file is fully written and
+// before the rename, so a test can change the directory (for instance run a
+// sweep) in that window. Thread-local: a test calls the migration from its own
+// thread.
+#[cfg(test)]
+type ActionBeforeMigrateRename = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static RUN_BEFORE_MIGRATE_RENAME: std::cell::RefCell<Option<ActionBeforeMigrateRename>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_migrate_rename_hook() {
+    // Moved out for the call so the action can itself run code that reaches
+    // this hook without re-entering a live borrow.
+    let mut action = RUN_BEFORE_MIGRATE_RENAME.with(|slot| slot.borrow_mut().take());
+    if let Some(run) = action.as_mut() {
+        run();
+    }
+    RUN_BEFORE_MIGRATE_RENAME.with(|slot| *slot.borrow_mut() = action);
+}
+
+#[cfg(not(test))]
+fn before_migrate_rename_hook() {}
+
+/// Installs an action that runs on this thread inside the migration, after its
+/// temp file is written and before the rename, and removes it on drop. The
+/// writer's tests use it too, to fail the migration that startup runs.
+#[cfg(test)]
+pub(crate) struct SweepDuringMigration;
+
+#[cfg(test)]
+impl SweepDuringMigration {
+    pub(crate) fn install(action: impl FnMut() + 'static) -> Self {
+        RUN_BEFORE_MIGRATE_RENAME.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SweepDuringMigration {
+    fn drop(&mut self) {
+        RUN_BEFORE_MIGRATE_RENAME.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 fn file_needs_migration(path: &Path) -> Result<bool> {
@@ -293,6 +342,7 @@ fn category_for_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orphan_sweep::{ORPHAN_MIN_AGE, sweep_ahead_action};
     use std::io::Write;
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
@@ -377,9 +427,8 @@ mod tests {
 
     #[test]
     fn the_migrations_real_temp_name_is_one_the_sweep_recognizes() {
-        // The migration cannot be failed between creating its temp file and
-        // the rename, so an orphan of it is never observable here. What can be
-        // checked is the name it really creates, which is what the sweep keys on.
+        // The sweep can only remove what it can name. The name the migration
+        // really creates is what the sweep keys on, so it is checked here.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
         write_jsonl(
@@ -401,6 +450,70 @@ mod tests {
         assert_eq!(parsed.kind, crate::temp_guard::TempKind::Migrate);
         assert_eq!(parsed.pid, std::process::id());
         assert_eq!(temp.parent(), path.parent());
+    }
+
+    const LEGACY_ROW: &str = r#"{"id":"id-1","timestamp":"2026-05-15T19:00:00Z","event_type":"agent_end","success":true}"#;
+
+    /// Names in `dir` other than `keep`.
+    fn other_names(dir: &Path, keep: &str) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != keep)
+            .collect()
+    }
+
+    #[test]
+    fn a_sweep_that_judges_a_live_migration_temp_old_makes_the_migration_fail_and_keeps_the_log() {
+        // The sweep compares its own clock with the time in the temp file's
+        // name. A clock far enough ahead (or a migration long enough) makes the
+        // live temp file look abandoned; the consequence must be a failed
+        // migration and an untouched log, never a damaged one.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        write_jsonl(&path, &[LEGACY_ROW]);
+        let before = fs::read(&path).unwrap();
+        let (action, removed) =
+            sweep_ahead_action(&path, ORPHAN_MIN_AGE + std::time::Duration::from_secs(3600));
+        let _during = SweepDuringMigration::install(action);
+
+        let err = migrate_legacy_jsonl_in_place(&path)
+            .expect_err("a migration whose temp file was removed cannot rename it");
+
+        assert_eq!(removed.get(), 1, "the sweep must have taken the temp file");
+        assert!(
+            format!("{err:#}").contains("renaming migration temp"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the log must be untouched"
+        );
+        assert_eq!(other_names(tmp.path(), "trace.jsonl"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_sweep_at_the_migrations_own_time_leaves_its_temp_file_alone() {
+        // Control for the test above: with the same clock the temp file is
+        // seconds old, below the threshold, so the sweep keeps it and the
+        // migration completes.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        write_jsonl(&path, &[LEGACY_ROW]);
+        let (action, removed) = sweep_ahead_action(&path, std::time::Duration::ZERO);
+        let _during = SweepDuringMigration::install(action);
+
+        migrate_legacy_jsonl_in_place(&path).unwrap();
+
+        assert_eq!(
+            removed.get(),
+            0,
+            "a young temp file may belong to a live process"
+        );
+        let row: Value = serde_json::from_str(&read_all_lines(&path)[0]).unwrap();
+        assert_eq!(row["schema_version"], LogEvent::SCHEMA_VERSION);
+        assert_eq!(other_names(tmp.path(), "trace.jsonl"), Vec::<String>::new());
     }
 
     #[test]

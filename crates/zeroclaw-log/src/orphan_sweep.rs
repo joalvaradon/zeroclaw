@@ -93,6 +93,31 @@ pub(crate) fn sweep_orphans(
     sweep_with_pause(active, now_nanos, threshold, throttle, thread::sleep)
 }
 
+/// For a test that runs a sweep inside a trim or a migration: an action that
+/// sweeps the directory of `active` once, with a clock `ahead` of the real one,
+/// and the count of files it removed. A clock far enough ahead (or a trim or
+/// migration long enough) makes a live temp file look abandoned.
+#[cfg(test)]
+pub(crate) fn sweep_ahead_action(
+    active: &Path,
+    ahead: Duration,
+) -> (impl FnMut() + 'static, std::rc::Rc<std::cell::Cell<usize>>) {
+    let removed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let seen = std::rc::Rc::clone(&removed);
+    let active = active.to_path_buf();
+    let action = move || {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            + i64::try_from(ahead.as_nanos()).unwrap();
+        let no_pause = Throttle {
+            every: 0,
+            pause: Duration::ZERO,
+        };
+        let report = sweep_orphans(&active, now, ORPHAN_MIN_AGE, &no_pause).unwrap();
+        seen.set(report.deleted);
+    };
+    (action, removed)
+}
+
 /// [`sweep_orphans`] with the pause injected, so a test can count pauses
 /// instead of sleeping.
 fn sweep_with_pause(

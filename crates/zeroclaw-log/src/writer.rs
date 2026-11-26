@@ -792,8 +792,27 @@ thread_local! {
     static FAIL_BEFORE_TRIM_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// Test seam: an action that runs inside the same window, so a test can change
+// the directory (for instance run a sweep) between the temp file being
+// written and the rename. Thread-local for the same reason.
+#[cfg(test)]
+type ActionBeforeTrimRename = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static RUN_BEFORE_TRIM_RENAME: std::cell::RefCell<Option<ActionBeforeTrimRename>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 fn before_trim_rename_hook() -> Result<()> {
+    // Moved out for the call so the action can itself run code that reaches
+    // this hook without re-entering a live borrow.
+    let mut action = RUN_BEFORE_TRIM_RENAME.with(|slot| slot.borrow_mut().take());
+    if let Some(run) = action.as_mut() {
+        run();
+    }
+    RUN_BEFORE_TRIM_RENAME.with(|slot| *slot.borrow_mut() = action);
     if FAIL_BEFORE_TRIM_RENAME.with(std::cell::Cell::get) {
         anyhow::bail!("injected failure before trim rename");
     }
@@ -1164,7 +1183,7 @@ pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex:
 mod tests {
     use super::*;
     use crate::event::{EventCategory, Severity};
-    use crate::orphan_sweep::ORPHAN_MIN_AGE;
+    use crate::orphan_sweep::{ORPHAN_MIN_AGE, sweep_ahead_action};
     // Archive-name predicates live in `reader`; only the tests below exercise
     // them directly, so importing them at module scope would be unused in a
     // non-test build.
@@ -1489,6 +1508,92 @@ mod tests {
         assert_eq!(temp.parent(), state.policy.path.parent());
     }
 
+    /// Installs an action that runs on this thread inside the trim, after its
+    /// temp file is written and before the rename, and removes it on drop.
+    struct SweepDuringTrim;
+
+    impl SweepDuringTrim {
+        fn install(action: impl FnMut() + 'static) -> Self {
+            RUN_BEFORE_TRIM_RENAME.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+            Self
+        }
+    }
+
+    impl Drop for SweepDuringTrim {
+        fn drop(&mut self) {
+            RUN_BEFORE_TRIM_RENAME.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Runs one trim of `state` while a sweep of the log's directory runs
+    /// inside it, with a clock `ahead` of the one the trim used to name its
+    /// temp file. Returns the trim's outcome and how many files the sweep removed.
+    fn trim_with_a_sweep_ahead_by(
+        state: &Arc<WorkerState>,
+        ahead: Duration,
+    ) -> (Result<()>, usize) {
+        let (action, removed) = sweep_ahead_action(&state.policy.path, ahead);
+        let _during = SweepDuringTrim::install(action);
+        let outcome = trim_to_last_entries(state);
+        (outcome, removed.get())
+    }
+
+    #[test]
+    fn a_sweep_that_judges_a_live_trim_temp_old_makes_the_trim_fail_and_keeps_the_log() {
+        // The sweep compares its own clock with the time in the temp file's
+        // name. A clock far enough ahead (or a trim long enough) makes the
+        // live temp file look abandoned; the consequence must be a failed
+        // trim and an untouched active log, never a damaged log.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+        let before = fs::read(&state.policy.path).unwrap();
+
+        let (outcome, removed) =
+            trim_with_a_sweep_ahead_by(&state, ORPHAN_MIN_AGE + Duration::from_secs(3600));
+
+        assert_eq!(removed, 1, "the sweep must have taken the trim's temp file");
+        let err = outcome.expect_err("a trim whose temp file was removed cannot rename it");
+        assert!(
+            format!("{err:#}").contains("renaming trim temp"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&state.policy.path).unwrap(),
+            before,
+            "the active log must be untouched"
+        );
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_sweep_at_the_trims_own_time_leaves_its_temp_file_alone() {
+        // Control for the test above: with the same clock the temp file is
+        // seconds old, below the threshold, so the sweep keeps it and the
+        // trim completes.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+
+        let (outcome, removed) = trim_with_a_sweep_ahead_by(&state, Duration::ZERO);
+
+        assert_eq!(removed, 0, "a young temp file may belong to a live trim");
+        outcome.unwrap();
+        assert_eq!(
+            fs::read_to_string(&state.policy.path).unwrap(),
+            "{\"n\":3}\n{\"n\":4}\n"
+        );
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
     /// Seeds `<name>` next to the log the writer will use, creating its
     /// directory (the default path sits in a `state/` subdirectory).
     fn seed_in_log_dir(cfg: &LogConfig, workspace: &Path, names: &[&str]) -> PathBuf {
@@ -1506,6 +1611,116 @@ mod tests {
 
     fn nanos_ago_from_now(age: Duration) -> i64 {
         chrono::Utc::now().timestamp_nanos_opt().unwrap() - i64::try_from(age.as_nanos()).unwrap()
+    }
+
+    /// What a fmt subscriber writes, so a test can read the warnings.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedWarnings {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWarnings {
+        type Writer = CapturedWarnings;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn startup_goes_on_when_the_migration_fails_and_the_next_start_completes_it() {
+        // The migration that startup runs can fail (here: a sweep that takes its
+        // live temp file, as `a_sweep_that_judges_a_live_migration_temp_old...`
+        // shows). Startup must go on with the log as it was and write to it,
+        // and the next start, finding the file still in legacy shape, must
+        // migrate it.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            ..LogConfig::default()
+        };
+        let log = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        let dir = log.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = concat!(
+            r#"{"id":"id-1","timestamp":"2026-05-15T19:00:00Z","#,
+            r#""event_type":"agent_end","success":true}"#,
+            "\n"
+        );
+        fs::write(&log, legacy).unwrap();
+        let migrate_temps = |dir: &Path| -> Vec<String> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".migrate."))
+                .collect()
+        };
+
+        let (action, removed) =
+            sweep_ahead_action(&log, ORPHAN_MIN_AGE + Duration::from_secs(3600));
+        let during = crate::migrate::SweepDuringMigration::install(action);
+        let warnings = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(warnings.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || init_from_config(&cfg, tmp.path()));
+        drop(during);
+        let warned = String::from_utf8(warnings.0.lock().clone()).unwrap();
+        assert!(
+            warned.contains("legacy JSONL migration failed"),
+            "startup must say that the migration failed: {warned:?}"
+        );
+        assert_eq!(
+            removed.get(),
+            1,
+            "the sweep must have taken the migration's temp file"
+        );
+
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        ev.message = Some("after-failed-migration".into());
+        record_event(ev);
+        flush_for_test().unwrap();
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+        let after_failure = fs::read_to_string(&log).unwrap();
+        assert!(
+            after_failure.starts_with(legacy),
+            "the legacy row must be as it was: {after_failure}"
+        );
+        assert!(
+            after_failure.contains("after-failed-migration"),
+            "startup must go on and the writer must append: {after_failure}"
+        );
+        assert_eq!(migrate_temps(&dir), Vec::<String>::new());
+
+        init_from_config(&cfg, tmp.path());
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+        let after_next_start = fs::read_to_string(&log).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(after_next_start.lines().next().unwrap()).unwrap();
+        assert!(
+            first.get("timestamp").is_none(),
+            "the legacy row must be migrated"
+        );
+        assert_eq!(first["schema_version"], LogEvent::SCHEMA_VERSION);
+        assert!(
+            after_next_start.contains("after-failed-migration"),
+            "the row appended after the failure must survive the migration"
+        );
+        assert_eq!(migrate_temps(&dir), Vec::<String>::new());
     }
 
     #[test]
