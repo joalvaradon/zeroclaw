@@ -1,0 +1,124 @@
+name: zc12570-verify
+
+# Throwaway verification of the orphan temp-file sweep, run on a branch that is
+# never opened as a pull request. It repeats gates of the real CI for the
+# `zeroclaw-log` crate and runs mutation tests, which the real CI does not.
+
+on:
+  push:
+    branches: [ci/mutations-12570]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  gates-log:
+    name: zeroclaw-log gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Tree under test
+        run: |
+          git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+          git log --oneline -8
+      - name: Install system dependencies
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy, library only (code that is not compiled for tests)
+        run: cargo clippy -p zeroclaw-log --lib --locked -- -D warnings
+      - name: Clippy, all targets
+        run: cargo clippy -p zeroclaw-log --all-targets --locked -- -D warnings
+      - name: Comment hygiene gate
+        run: |
+          bash scripts/ci/comment_hygiene_gate.test.sh
+          bash scripts/ci/comment_hygiene_gate.sh
+      - name: Docs gates
+        env:
+          UPSTREAM_BASE: 2f3bcab4420b3b3b25de455e5d9aff58a6d76239
+        run: |
+          export BASE_SHA="$(git merge-base "$UPSTREAM_BASE" HEAD)"
+          echo "BASE_SHA=$BASE_SHA"
+          bash scripts/ci/docs_quality_gate.sh
+          bash scripts/ci/docs_links_gate.sh
+          python3 scripts/ci/check_internal_docs_links.py
+          python3 scripts/ci/check_internal_docs_links_test.py
+      - name: Tests, one thread
+        run: cargo test -p zeroclaw-log --lib --locked -- --test-threads=1
+      - name: Tests, default threads, three runs
+        run: |
+          for run in 1 2 3; do
+            echo "== run $run"
+            cargo test -p zeroclaw-log --lib --locked
+          done
+      - name: Mutation patterns match the code
+        run: python3 .github/zc12570/mutations.py check
+
+  workspace-clippy:
+    name: workspace clippy as in the real CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: clippy
+      - name: Install system dependencies
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy runner contract tests
+        run: bash scripts/ci/run_clippy.test.sh
+      - name: Clippy
+        shell: bash
+        run: |
+          bash scripts/ci/run_clippy.sh \
+            --scope workspace \
+            --summary-title "Lint diagnostics" \
+            --log-name cargo-clippy.log
+      - name: Rustdoc warnings gate
+        run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
+
+  mutations:
+    name: mutation ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [CONTROL, M1, M2, M3, M3b, M4, M5, M6, M7, M8, M9, M10, M11, M12, M13, M14]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - name: Apply the mutation
+        run: python3 .github/zc12570/mutations.py apply "${{ matrix.id }}"
+      - name: Run the tests on the mutated tree
+        run: |
+          set +e
+          cargo test -p zeroclaw-log --lib --locked -- --test-threads=1 2>&1 | tee mutation.log
+          echo "${PIPESTATUS[0]}" > mutation.rc
+          exit 0
+      - name: Verdict
+        run: python3 .github/zc12570/mutations.py verdict "${{ matrix.id }}" mutation.log "$(cat mutation.rc)"
