@@ -343,9 +343,22 @@ fn start_or_warn(
 }
 
 fn start_sweep_thread(active: PathBuf, slot: SweepSlot) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new()
-        .name("zeroclaw-log-sweep".into())
-        .spawn(move || run_sweep(&active, slot))
+    start_with(active, slot, |job| {
+        thread::Builder::new()
+            .name("zeroclaw-log-sweep".into())
+            .spawn(job)
+    })
+}
+
+/// Wraps the sweep, which owns `slot`, as a job for `spawn`. When `spawn` fails
+/// it drops the job unrun, and with it the slot. The spawner is a parameter so a
+/// test can make it fail.
+fn start_with(
+    active: PathBuf,
+    slot: SweepSlot,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+) -> io::Result<JoinHandle<()>> {
+    spawn(Box::new(move || run_sweep(&active, slot)))
 }
 
 fn run_sweep(active: &Path, slot: SweepSlot) {
@@ -412,7 +425,8 @@ mod tests {
     use crate::temp_guard::parse_temp_sibling;
     use crate::test_support::{CapturedWarnings, set_modified};
 
-    /// A fixed "now" far from any real clock, so ages are exact.
+    /// A fixed "now" (2027-01-15 UTC), so ages are exact. It does not need to
+    /// differ from the real clock: nothing here reads the real one.
     const NOW: i64 = 1_800_000_000_000_000_000;
     const STEM: &str = "runtime-trace";
     const NO_PAUSE: Throttle = Throttle {
@@ -646,10 +660,14 @@ mod tests {
         let mut asked_for = None;
 
         tracing::subscriber::with_default(subscriber, || {
+            // The real wrapper with a spawner that fails: the slot must come
+            // back because the unrun job is dropped, not because the test lets
+            // go of it.
             start_or_warn(&active, slot, |path, slot| {
-                asked_for = Some(path);
-                drop(slot);
-                Err(io::Error::other("injected: out of threads"))
+                asked_for = Some(path.clone());
+                start_with(path, slot, |_job| {
+                    Err(io::Error::other("injected: out of threads"))
+                })
             });
         });
 
@@ -671,7 +689,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let active = active_in(tmp.path());
         let old = nanos_ago(ORPHAN_MIN_AGE * 4);
-        let untouched = [
+        let mut untouched = vec![
             "runtime-trace.jsonl".to_string(),
             "runtime-trace.jsonl.seq".to_string(),
             "runtime-trace.0000000007-20260624-031500.jsonl".to_string(),
@@ -686,10 +704,13 @@ mod tests {
             format!("runtime-trace.tmp.1.{old}0000000000000000000000"),
             "runtime-trace.tmp.\u{661}.\u{662}".to_string(),
             "runtime-trace.tmp.abc.def".to_string(),
-            "runtime-trace.tmp.1.".to_string(),
             "runtime-trace.tmp.1".to_string(),
             "runtime-trace.tmp".to_string(),
         ];
+        // Windows drops a trailing dot from a name, so this one cannot exist there.
+        if cfg!(unix) {
+            untouched.push("runtime-trace.tmp.1.".to_string());
+        }
         fs::write(&active, "log\n").unwrap();
         for name in &untouched {
             if name != "runtime-trace.jsonl" {
