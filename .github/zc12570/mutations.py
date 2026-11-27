@@ -164,8 +164,18 @@ MUTATIONS = {
         ["startup_goes_on_when_the_migration_fails_and_the_next_start_completes_it"],
     ),
     "CONTROL": ("no change; must pass", [], []),
+    "M15": (
+        "the sweep runs only on the first start",
+        [
+            (
+                WRITER,
+                "        spawn_orphan_sweep(&policy.path);",
+                "        static FIRST: std::sync::Once = std::sync::Once::new();\n        FIRST.call_once(|| spawn_orphan_sweep(&policy.path));",
+            )
+        ],
+        ["a_config_reload_sweeps_orphans_that_appeared_since_the_last_start"],
+    ),
 }
-
 
 def read(path):
     return pathlib.Path(path).read_text(encoding="utf-8")

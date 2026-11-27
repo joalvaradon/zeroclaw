@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        id: [CONTROL, M1, M2, M3, M3b, M4, M5, M6, M7, M8, M9, M10, M11, M12, M13, M14]
+        id: [CONTROL, M1, M2, M3, M3b, M4, M5, M6, M7, M8, M9, M10, M11, M12, M13, M14, M15]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
