@@ -159,7 +159,7 @@ impl OtpValidator {
     /// resume). A code that validated once is consumed and refused again; the
     /// recently-validated cache used by [`Self::validate`] is neither read nor
     /// written. After `challenge_max_attempts` consecutive failures the
-    /// verifier refuses every code for [`SINGLE_USE_LOCKOUT_SECS`].
+    /// verifier refuses every code for `SINGLE_USE_LOCKOUT_SECS` (300 seconds).
     pub fn validate_single_use(&self, code: &str) -> Result<bool> {
         self.validate_single_use_at(code, unix_timestamp_now())
     }
