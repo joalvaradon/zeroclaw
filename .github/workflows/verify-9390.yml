@@ -22,7 +22,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   # Base of the delivery branch (origin/master when the branch was rebased).
-  BASE_SHA: 2f3bcab4420b3b3b25de455e5d9aff58a6d76239
+  BASE_SHA: d4a5d2afdde26bbd2ac0ae67fdd0a756cd12a254
 
 jobs:
   check:
