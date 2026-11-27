@@ -14394,7 +14394,7 @@ impl EchoOff {
             quiet.c_lflag &= !libc::ECHO;
             // SAFETY: `quiet` is a fully initialised copy of the attributes
             // just read from this descriptor.
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const quiet) };
         }
         Self { saved }
     }
@@ -14411,7 +14411,7 @@ impl Drop for EchoOff {
         #[cfg(unix)]
         if let Some(saved) = self.saved {
             // SAFETY: restores the attributes read in `new` on the same descriptor.
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const saved) };
             // The newline the user typed was not echoed.
             eprintln!();
         }
