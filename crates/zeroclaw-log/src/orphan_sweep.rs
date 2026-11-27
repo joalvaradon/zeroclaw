@@ -27,9 +27,11 @@ use crate::temp_guard::parse_temp_sibling;
 /// is kept. Two readings must both reach it: the creation time in the file name
 /// (known without a system call, checked first for every entry), and the time
 /// of the file's last modification (read only for entries that already look
-/// old). A trim or migration that is still writing keeps refreshing the second,
-/// so a long one is not taken for an abandoned one. Touching a file can only
-/// delay its removal, never hasten it.
+/// old). A migration writes as it reads, so it keeps refreshing the second. A
+/// trim writes nothing while it reads the lines it discards, so a trim that
+/// spends the whole threshold there is not protected by it. Writing to the file
+/// delays its removal; a file whose modification time was set back by hand
+/// (`touch -d`, `cp -p`) is judged by that time.
 ///
 /// Neither reading helps when the sweeping clock itself is ahead of the clock
 /// that stamped the file: both are compared with the sweeper's "now".
@@ -195,7 +197,15 @@ fn sweep_with_pause(
         // witness, read only here so a directory of unrelated entries, and
         // every young orphan, cost no extra call. A trim or migration still
         // writing keeps it fresh. Unreadable means unknown, and unknown is kept.
-        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
+        //
+        // This opens the file (`symlink_metadata` does not follow a link that
+        // replaced it) instead of using `DirEntry::metadata`. On Windows the
+        // latter returns what the directory entry holds, and NTFS refreshes
+        // that entry lazily while a handle is open: a file written for minutes
+        // without a sync can still report the time it was created. Measured on
+        // NTFS with writes 5 s apart and no sync: the first directory query
+        // returned the creation time, the next one the last write.
+        let modified = match fs::symlink_metadata(&path).and_then(|meta| meta.modified()) {
             Ok(time) => time,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 report.already_gone += 1;

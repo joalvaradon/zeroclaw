@@ -1744,33 +1744,39 @@ mod tests {
     #[test]
     fn startup_removes_old_orphans_next_to_the_log_and_keeps_fresh_ones() {
         let _guard = WRITER_TEST_LOCK.lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = LogConfig {
-            log_persistence: "rolling".into(),
-            ..LogConfig::default()
-        };
-        let old = nanos_ago_from_now(ORPHAN_MIN_AGE + Duration::from_secs(3600));
-        let fresh = nanos_ago_from_now(Duration::from_secs(60));
-        let old_trim = format!("runtime-trace.tmp.99999.{old}");
-        let old_migrate = format!("runtime-trace.migrate.99999.{old}");
-        let fresh_trim = format!("runtime-trace.tmp.99999.{fresh}");
-        for name in [&old_trim, &old_migrate, &fresh_trim] {
-            assert!(parse_temp_sibling("runtime-trace", name).is_some());
+        // Every policy that persists sweeps; `none` is the next test.
+        for policy in ["full", "rolling", "rotating"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = LogConfig {
+                log_persistence: policy.into(),
+                ..LogConfig::default()
+            };
+            let old = nanos_ago_from_now(ORPHAN_MIN_AGE + Duration::from_secs(3600));
+            let fresh = nanos_ago_from_now(Duration::from_secs(60));
+            let old_trim = format!("runtime-trace.tmp.99999.{old}");
+            let old_migrate = format!("runtime-trace.migrate.99999.{old}");
+            let fresh_trim = format!("runtime-trace.tmp.99999.{fresh}");
+            for name in [&old_trim, &old_migrate, &fresh_trim] {
+                assert!(parse_temp_sibling("runtime-trace", name).is_some());
+            }
+            let dir = seed_in_log_dir(&cfg, tmp.path(), &[&old_trim, &old_migrate, &fresh_trim]);
+
+            init_from_config(&cfg, tmp.path());
+            shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+            assert!(
+                !dir.join(&old_trim).exists(),
+                "{policy}: an old trim orphan must go"
+            );
+            assert!(
+                !dir.join(&old_migrate).exists(),
+                "{policy}: an old migration orphan must go"
+            );
+            assert!(
+                dir.join(&fresh_trim).exists(),
+                "{policy}: an orphan younger than the threshold may belong to a live process"
+            );
         }
-        let dir = seed_in_log_dir(&cfg, tmp.path(), &[&old_trim, &old_migrate, &fresh_trim]);
-
-        init_from_config(&cfg, tmp.path());
-        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
-
-        assert!(!dir.join(&old_trim).exists(), "an old trim orphan must go");
-        assert!(
-            !dir.join(&old_migrate).exists(),
-            "an old migration orphan must go"
-        );
-        assert!(
-            dir.join(&fresh_trim).exists(),
-            "an orphan younger than the threshold may belong to a live process"
-        );
     }
 
     #[test]
