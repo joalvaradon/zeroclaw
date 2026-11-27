@@ -13,6 +13,8 @@ mod orphan_sweep;
 pub mod reader;
 mod subscriber;
 mod temp_guard;
+#[cfg(test)]
+mod test_support;
 pub mod tool_io;
 pub mod writer;
 

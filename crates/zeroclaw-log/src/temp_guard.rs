@@ -32,16 +32,6 @@ impl TempKind {
     }
 }
 
-/// The parts of a name built by [`temp_sibling_path`].
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TempName {
-    pub(crate) kind: TempKind,
-    pub(crate) pid: u32,
-    /// Creation time in nanoseconds since the Unix epoch, as the writer read
-    /// its clock.
-    pub(crate) nanos: i64,
-}
-
 /// Path of a sibling temp file for `active`, in the same directory:
 /// `<stem>.<kind>.<pid>.<nanos>`, where `<stem>` is what `Path::with_extension`
 /// leaves of the active file name. Every writer that stages a file next to the
@@ -55,15 +45,19 @@ pub(crate) fn temp_sibling_path(active: &Path, kind: TempKind, now_nanos: i64) -
     ))
 }
 
-/// Recognize a name built by [`temp_sibling_path`]. `active_stem` is
-/// `Path::file_stem` of the active file, the same function `with_extension`
-/// uses, so producer and reader agree on what the stem is.
+/// Recognize a name built by [`temp_sibling_path`] and return the creation time
+/// in it, in nanoseconds since the Unix epoch as the writer read its clock.
+/// `active_stem` is `Path::file_stem` of the active file, the same function
+/// `with_extension` uses, so producer and reader agree on what the stem is.
 ///
 /// Only the exact shape `<stem>.<kind>.<digits>.<digits>` matches: no prefix
 /// matching, no extra segments, ASCII digits only (`str::parse` alone would
 /// accept a leading `+`), and values that do not fit `u32`/`i64` do not match.
 /// A reader that deletes what it recognizes relies on this being strict.
-pub(crate) fn parse_temp_sibling(active_stem: &str, file_name: &str) -> Option<TempName> {
+///
+/// The process id and the kind take part in the match but are not returned:
+/// the reader judges a name by its time alone.
+pub(crate) fn parse_temp_sibling(active_stem: &str, file_name: &str) -> Option<i64> {
     let rest = file_name.strip_prefix(active_stem)?.strip_prefix('.')?;
     let mut parts = rest.split('.');
     let kind_part = parts.next()?;
@@ -72,14 +66,11 @@ pub(crate) fn parse_temp_sibling(active_stem: &str, file_name: &str) -> Option<T
     if parts.next().is_some() {
         return None;
     }
-    let kind = TempKind::ALL
+    TempKind::ALL
         .into_iter()
         .find(|kind| kind.infix() == kind_part)?;
-    Some(TempName {
-        kind,
-        pid: ascii_digits(pid_part)?.parse().ok()?,
-        nanos: ascii_digits(nanos_part)?.parse().ok()?,
-    })
+    ascii_digits(pid_part)?.parse::<u32>().ok()?;
+    ascii_digits(nanos_part)?.parse().ok()
 }
 
 fn ascii_digits(part: &str) -> Option<&str> {
@@ -213,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn a_produced_temp_name_is_recognized_with_its_parts() {
+    fn a_produced_temp_name_is_recognized_and_gives_back_its_time() {
         for active in [
             "logs/runtime-trace.jsonl",
             "logs/trace",
@@ -226,13 +217,18 @@ mod tests {
                 let produced = temp_sibling_path(active, kind, 1_234_567);
                 assert_eq!(produced.parent(), active.parent());
                 let name = produced.file_name().unwrap().to_str().unwrap();
+                let infix = match kind {
+                    TempKind::Trim => "tmp",
+                    TempKind::Migrate => "migrate",
+                };
+                assert_eq!(
+                    name,
+                    format!("{stem}.{infix}.{}.1234567", std::process::id()),
+                    "the name is the one both writers have always produced"
+                );
                 assert_eq!(
                     parse_temp_sibling(stem, name),
-                    Some(TempName {
-                        kind,
-                        pid: std::process::id(),
-                        nanos: 1_234_567,
-                    }),
+                    Some(1_234_567),
                     "{name} must round-trip for the active path {}",
                     active.display()
                 );
@@ -246,7 +242,12 @@ mod tests {
         assert_eq!(parse_temp_sibling("trace", "trace.tmp.1.2.3"), None);
         assert_eq!(parse_temp_sibling("trace", "trace.tmp.+1.2"), None);
         assert_eq!(parse_temp_sibling("trace", "trace.tmp.1"), None);
-        assert!(parse_temp_sibling("trace", "trace.tmp.1.2").is_some());
-        assert!(parse_temp_sibling("trace", "trace.migrate.7.8").is_some());
+        assert_eq!(parse_temp_sibling("trace", "trace.tmp.1.2"), Some(2));
+        assert_eq!(parse_temp_sibling("trace", "trace.migrate.7.8"), Some(8));
+        assert_eq!(
+            parse_temp_sibling("trace", "trace.tmp.4294967296.2"),
+            None,
+            "a process id that does not fit u32 is not ours"
+        );
     }
 }

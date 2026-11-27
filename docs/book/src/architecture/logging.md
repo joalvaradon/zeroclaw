@@ -346,21 +346,22 @@ Archive discovery rejects symlinks. Matching the writer's filename shape is not 
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
 | `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
-Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's archive shape. The one other deletion in the log directory is the startup sweep of orphaned temp files, described [below](#orphaned-temp-files-are-swept-at-startup). Under `rotating`, the live `/api/logs` reader merges the active file with all retained archives; under the other policies it reads the active file alone. See [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's archive shape. The one other deletion in the log directory is the sweep of orphaned temp files that runs when the writer starts, described [below](#orphaned-temp-files-are-swept-when-the-writer-starts). Under `rotating`, the live `/api/logs` reader merges the active file with all retained archives; under the other policies it reads the active file alone. See [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
-Only `rotating` lists the log directory when the writer starts: it needs the highest archive number already on disk to keep the archive sequence increasing. The other policies create no archives, so the writer skips that listing for them.
+Only `rotating` lists the log directory to seed the archive sequence when the writer starts: it needs the highest archive number already on disk to keep that sequence increasing. The other policies create no archives, so the writer skips that listing for them. The writer's background sweep of orphaned temp files, described next, is a separate listing and runs under every policy except `none`.
 
-## Orphaned temp files are swept at startup
+## Orphaned temp files are swept when the writer starts
 
 The rolling trim and the schema migration each copy the log into a sibling temp file and rename it over the active file. A failure before the rename removes the temp file, but nothing runs when the process is killed, loses power, or panics in a build that aborts on panic, so the file stays on disk.
 
-When the writer starts under any policy except `none`, a background thread named `zeroclaw-log-sweep` lists the directory of the active log once and removes the leftovers. It removes an entry only when all of these hold:
+Each time the writer starts under any policy except `none`, which includes a config reload that restarts it, a background thread named `zeroclaw-log-sweep` lists the directory of the active log once and removes the leftovers. It removes an entry only when all of these hold:
 
 - The name is exactly `<stem>.tmp.<pid>.<nanos>` (trim) or `<stem>.migrate.<pid>.<nanos>` (migration). `<stem>` is the active file name without its last extension, and `<pid>` and `<nanos>` are ASCII digits.
 - It is a regular file. A symlink or a directory with such a name is left alone.
 - The creation time in `<nanos>` is at least 30 minutes old, which spares a trim or migration that started more recently. A name stamped in the future, or with a time of `0`, is kept, because its age cannot be trusted.
+- The file was last modified at least 30 minutes ago. This is read only for entries whose name already looks old. A trim or migration that is still writing keeps refreshing it, so a long one is not mistaken for an abandoned one. A modification time in the future, or one that cannot be read, keeps the file.
 
-The age compares the sweeping process's clock with the time written by the process that created the file. A clock that differs by 30 minutes or more, or a trim or migration that runs longer than that, can have its temp file removed where the platform allows removing an open file. That trim or migration then fails and the active log stays as it was.
+Both readings are compared with the sweeping process's clock. If that clock is 30 minutes or more ahead of the clock of the process that created the file, a live temp file looks abandoned by both and can be removed where the platform allows removing an open file. That trim or migration then fails and the active log stays as it was.
 
 The thread does not delay startup, pauses between batches of removals, and at most one sweep runs at a time, so a config reload during a sweep does not start another. A reload that points the log at a different directory while a sweep is running does not sweep the new directory until the next start. A log directory that does not exist yet has nothing to sweep and is not an error. When the sweep finds anything it logs one `info` summary with the counts and the ages of the oldest and newest leftover; a very recent one means a trim or migration was cut short recently. Entries it could not process are counted and logged once as a `warn`.
 

@@ -342,7 +342,8 @@ fn category_for_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orphan_sweep::{ORPHAN_MIN_AGE, sweep_ahead_action};
+    use crate::orphan_sweep::ORPHAN_MIN_AGE;
+    use crate::test_support::sweep_ahead_action;
     use std::io::Write;
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
@@ -442,13 +443,15 @@ mod tests {
 
         let temp = crate::temp_guard::last_created_temp()
             .expect("the migration created its temp file through the shared helper");
-        let parsed = crate::temp_guard::parse_temp_sibling(
-            "trace",
-            temp.file_name().unwrap().to_str().unwrap(),
-        )
-        .expect("the sweep must recognize the name the migration really uses");
-        assert_eq!(parsed.kind, crate::temp_guard::TempKind::Migrate);
-        assert_eq!(parsed.pid, std::process::id());
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        assert!(
+            crate::temp_guard::parse_temp_sibling("trace", name).is_some(),
+            "the sweep must recognize the name the migration really uses: {name}"
+        );
+        assert!(
+            name.starts_with(&format!("trace.migrate.{}.", std::process::id())),
+            "the migration's temp name keeps its historical shape: {name}"
+        );
         assert_eq!(temp.parent(), path.parent());
     }
 
@@ -466,15 +469,18 @@ mod tests {
     #[test]
     fn a_sweep_that_judges_a_live_migration_temp_old_makes_the_migration_fail_and_keeps_the_log() {
         // The sweep compares its own clock with the time in the temp file's
-        // name. A clock far enough ahead (or a migration long enough) makes the
-        // live temp file look abandoned; the consequence must be a failed
-        // migration and an untouched log, never a damaged one.
+        // name and with the file's modification time. A clock far enough ahead
+        // makes the live temp file look abandoned by both; the consequence must
+        // be a failed migration and an untouched log, never a damaged one.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
         write_jsonl(&path, &[LEGACY_ROW]);
         let before = fs::read(&path).unwrap();
-        let (action, removed) =
-            sweep_ahead_action(&path, ORPHAN_MIN_AGE + std::time::Duration::from_secs(3600));
+        let (action, removed) = sweep_ahead_action(
+            &path,
+            ORPHAN_MIN_AGE + std::time::Duration::from_secs(3600),
+            false,
+        );
         let _during = SweepDuringMigration::install(action);
 
         let err = migrate_legacy_jsonl_in_place(&path)
@@ -501,7 +507,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
         write_jsonl(&path, &[LEGACY_ROW]);
-        let (action, removed) = sweep_ahead_action(&path, std::time::Duration::ZERO);
+        let (action, removed) = sweep_ahead_action(&path, std::time::Duration::ZERO, false);
         let _during = SweepDuringMigration::install(action);
 
         migrate_legacy_jsonl_in_place(&path).unwrap();
@@ -510,6 +516,34 @@ mod tests {
             removed.get(),
             0,
             "a young temp file may belong to a live process"
+        );
+        let row: Value = serde_json::from_str(&read_all_lines(&path)[0]).unwrap();
+        assert_eq!(row["schema_version"], LogEvent::SCHEMA_VERSION);
+        assert_eq!(other_names(tmp.path(), "trace.jsonl"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_sweep_leaves_the_temp_file_of_a_migration_that_is_still_being_written() {
+        // A migration that has run for over an hour and is still writing: its
+        // name is far older than the threshold, but the file was modified a
+        // minute before the sweep looks, so the sweep keeps it and the
+        // migration completes.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        write_jsonl(&path, &[LEGACY_ROW]);
+        let (action, removed) = sweep_ahead_action(
+            &path,
+            ORPHAN_MIN_AGE + std::time::Duration::from_secs(3600),
+            true,
+        );
+        let _during = SweepDuringMigration::install(action);
+
+        migrate_legacy_jsonl_in_place(&path).unwrap();
+
+        assert_eq!(
+            removed.get(),
+            0,
+            "a file still being written is not abandoned"
         );
         let row: Value = serde_json::from_str(&read_all_lines(&path)[0]).unwrap();
         assert_eq!(row["schema_version"], LogEvent::SCHEMA_VERSION);

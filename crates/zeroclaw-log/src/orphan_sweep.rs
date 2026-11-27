@@ -8,23 +8,32 @@
 //!
 //! It deletes files, so it is deliberately narrow: only the exact name shape the
 //! two writers produce, only regular files (never links or directories), and
-//! only once the age recorded in the name is at least [`ORPHAN_MIN_AGE`]. It
-//! lists only the directory of the active log.
+//! only once both the age recorded in the name and the time since the file was
+//! last modified are at least [`ORPHAN_MIN_AGE`]. It lists only the directory
+//! of the active log.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use crate::temp_guard::parse_temp_sibling;
 
 /// A temp file younger than this may belong to a live trim or migration, so it
-/// is kept. The age comes from the creation time in the file name, which needs
-/// no extra system call per entry and cannot be refreshed by touching the file.
+/// is kept. Two readings must both reach it: the creation time in the file name
+/// (known without a system call, checked first for every entry), and the time
+/// of the file's last modification (read only for entries that already look
+/// old). A trim or migration that is still writing keeps refreshing the second,
+/// so a long one is not taken for an abandoned one. Touching a file can only
+/// delay its removal, never hasten it.
+///
+/// Neither reading helps when the sweeping clock itself is ahead of the clock
+/// that stamped the file: both are compared with the sweeper's "now".
+///
 /// Not a config key: nothing here needs an operator to tune it.
 pub(crate) const ORPHAN_MIN_AGE: Duration = Duration::from_secs(30 * 60);
 
@@ -36,10 +45,11 @@ pub(crate) struct Throttle {
     pub(crate) pause: Duration,
 }
 
-/// Pause 1 ms after every 256 removals. Measured on one machine (a virtual
-/// disk, 100000 empty files): a sweep takes about 1.5 s, and the tail latency
-/// of a concurrent synced write stays well below what it reaches without the
-/// pauses. Other disks may want other values.
+/// Pause 1 ms after every 256 removals. Measured once, on one machine (a virtual
+/// disk, 100000 empty files), before the modification-time check existed: a
+/// sweep took about 1.5 s, and the tail latency of a concurrent synced write
+/// stayed well below what it reaches without the pauses. Other disks may want
+/// other values.
 const SWEEP_THROTTLE: Throttle = Throttle {
     every: 256,
     pause: Duration::from_millis(1),
@@ -50,12 +60,14 @@ const SWEEP_THROTTLE: Throttle = Throttle {
 pub(crate) struct SweepReport {
     /// Orphans removed.
     pub(crate) deleted: usize,
-    /// Orphan-shaped files younger than the threshold.
+    /// Orphan-shaped files younger than the threshold, by the time in their
+    /// name or by their last modification.
     pub(crate) kept_recent: usize,
     /// Orphan-shaped files whose age cannot be trusted: stamped later than now
-    /// (the clock went backwards, or the name is not ours), or stamped `0`
-    /// (the writer's own clock was out of range). Kept, because deleting on a
-    /// doubtful age is the destructive choice.
+    /// (the clock went backwards, or the name is not ours), stamped `0` (the
+    /// writer's own clock was out of range), or modified at a time that is in
+    /// the future or not representable. Kept, because deleting on a doubtful
+    /// age is the destructive choice.
     pub(crate) kept_future: usize,
     /// Orphan-shaped entries that are not regular files: links and directories.
     pub(crate) kept_not_regular: usize,
@@ -91,31 +103,6 @@ pub(crate) fn sweep_orphans(
     throttle: &Throttle,
 ) -> Result<SweepReport> {
     sweep_with_pause(active, now_nanos, threshold, throttle, thread::sleep)
-}
-
-/// For a test that runs a sweep inside a trim or a migration: an action that
-/// sweeps the directory of `active` once, with a clock `ahead` of the real one,
-/// and the count of files it removed. A clock far enough ahead (or a trim or
-/// migration long enough) makes a live temp file look abandoned.
-#[cfg(test)]
-pub(crate) fn sweep_ahead_action(
-    active: &Path,
-    ahead: Duration,
-) -> (impl FnMut() + 'static, std::rc::Rc<std::cell::Cell<usize>>) {
-    let removed = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let seen = std::rc::Rc::clone(&removed);
-    let active = active.to_path_buf();
-    let action = move || {
-        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap()
-            + i64::try_from(ahead.as_nanos()).unwrap();
-        let no_pause = Throttle {
-            every: 0,
-            pause: Duration::ZERO,
-        };
-        let report = sweep_orphans(&active, now, ORPHAN_MIN_AGE, &no_pause).unwrap();
-        seen.set(report.deleted);
-    };
-    (action, removed)
 }
 
 /// [`sweep_orphans`] with the pause injected, so a test can count pauses
@@ -161,7 +148,7 @@ fn sweep_with_pause(
         // The cheap name check comes first: a directory with millions of
         // unrelated entries costs no system call per entry.
         let file_name = entry.file_name();
-        let Some(parsed) = file_name
+        let Some(stamp_nanos) = file_name
             .to_str()
             .and_then(|name| parse_temp_sibling(stem, name))
         else {
@@ -189,19 +176,43 @@ fn sweep_with_pause(
         // `0` is what a writer records when its own clock was out of range, so
         // the real creation time is unknown; against a normal clock it would
         // look decades old and a live temp file would be removed.
-        if parsed.nanos == 0 {
+        if stamp_nanos == 0 {
             report.kept_future += 1;
             continue;
         }
-        let age_nanos = now_nanos.saturating_sub(parsed.nanos);
-        let Ok(age_nanos) = u64::try_from(age_nanos) else {
+        let Some(age) = elapsed_since(now_nanos, stamp_nanos) else {
             report.kept_future += 1;
             continue;
         };
-        let age = Duration::from_nanos(age_nanos);
         report.oldest_age = Some(report.oldest_age.map_or(age, |oldest| oldest.max(age)));
         report.newest_age = Some(report.newest_age.map_or(age, |newest| newest.min(age)));
         if age < threshold {
+            report.kept_recent += 1;
+            continue;
+        }
+
+        // The name says old. The file's own last modification is the second
+        // witness, read only here so a directory of unrelated entries, and
+        // every young orphan, cost no extra call. A trim or migration still
+        // writing keeps it fresh. Unreadable means unknown, and unknown is kept.
+        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
+            Ok(time) => time,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                report.already_gone += 1;
+                continue;
+            }
+            Err(err) => {
+                report.note_error(&path, &err);
+                continue;
+            }
+        };
+        let Some(idle) = nanos_since_epoch(modified)
+            .and_then(|modified_nanos| elapsed_since(now_nanos, modified_nanos))
+        else {
+            report.kept_future += 1;
+            continue;
+        };
+        if idle < threshold {
             report.kept_recent += 1;
             continue;
         }
@@ -222,6 +233,20 @@ fn sweep_with_pause(
         }
     }
     Ok(report)
+}
+
+/// Time from `then_nanos` to `now_nanos`, or `None` when `then_nanos` is later
+/// than now (the two clocks disagree, so the age is not known).
+fn elapsed_since(now_nanos: i64, then_nanos: i64) -> Option<Duration> {
+    let nanos = u64::try_from(now_nanos.saturating_sub(then_nanos)).ok()?;
+    Some(Duration::from_nanos(nanos))
+}
+
+/// `time` as nanoseconds since the Unix epoch, or `None` when it is before the
+/// epoch or does not fit.
+fn nanos_since_epoch(time: SystemTime) -> Option<i64> {
+    let since = time.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_nanos()).ok()
 }
 
 /// Remove `path`; `Ok(false)` when it was already gone. Removing never follows
@@ -295,8 +320,19 @@ pub(crate) fn spawn_orphan_sweep(active: &Path) {
     #[cfg(test)]
     run_sweep(active, slot);
     #[cfg(not(test))]
-    if let Err(err) = start_sweep_thread(active.to_path_buf(), slot) {
-        // Housekeeping, not durability: the writer goes on without it.
+    start_or_warn(active, slot, start_sweep_thread);
+}
+
+/// Hands the sweep to `start`. If the thread cannot be started the writer goes
+/// on without the sweep: it is housekeeping, not durability. `start` takes the
+/// slot, so a start that fails has already let go of it and the next request
+/// can run. The starter is a parameter so a test can make it fail.
+fn start_or_warn(
+    active: &Path,
+    slot: SweepSlot,
+    start: impl FnOnce(PathBuf, SweepSlot) -> io::Result<JoinHandle<()>>,
+) {
+    if let Err(err) = start(active.to_path_buf(), slot) {
         tracing::warn!(
             target: "zeroclaw_log",
             error = ?err,
@@ -374,6 +410,7 @@ mod tests {
 
     use super::*;
     use crate::temp_guard::parse_temp_sibling;
+    use crate::test_support::{CapturedWarnings, set_modified};
 
     /// A fixed "now" far from any real clock, so ages are exact.
     const NOW: i64 = 1_800_000_000_000_000_000;
@@ -391,10 +428,29 @@ mod tests {
         dir.join("runtime-trace.jsonl")
     }
 
+    /// Creates `name` as a file last modified when the name says it was
+    /// created, as a writer that wrote it and was then killed would leave it.
+    /// A name that is not an orphan's keeps the modification time of now.
     fn seed(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "orphan\n").unwrap();
+        if let Some(stamp) = parse_temp_sibling(STEM, name).and_then(|n| u64::try_from(n).ok()) {
+            set_modified(&path, UNIX_EPOCH + Duration::from_nanos(stamp));
+        }
         path
+    }
+
+    fn modified_at(nanos: i64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_nanos(u64::try_from(nanos).unwrap())
+    }
+
+    /// Seeds an orphan whose name says it is `name_age` old and whose file was
+    /// last modified `idle` ago. Returns its name.
+    fn seed_idle(dir: &Path, name_age: Duration, idle: Duration) -> String {
+        let name = format!("runtime-trace.tmp.1.{}", nanos_ago(name_age));
+        let path = seed(dir, &name);
+        set_modified(&path, modified_at(nanos_ago(idle)));
+        name
     }
 
     fn names(dir: &Path) -> BTreeSet<String> {
@@ -410,6 +466,10 @@ mod tests {
 
     #[test]
     fn the_age_threshold_is_thirty_minutes() {
+        // Pins the figure the operator docs promise (`logging.md` and
+        // `observability.md` say 30 minutes). It checks the constant against
+        // that promise, not the sweep's behavior; the tests below use the
+        // constant itself.
         assert_eq!(ORPHAN_MIN_AGE, Duration::from_secs(30 * 60));
     }
 
@@ -500,6 +560,110 @@ mod tests {
         assert_eq!(report.deleted, 0);
         assert_eq!(report.kept_future, 1);
         assert_eq!(names(tmp.path()), BTreeSet::from([name]));
+    }
+
+    #[test]
+    fn an_old_name_on_a_file_that_was_modified_recently_is_kept() {
+        // A trim or migration that has run for a long time is still writing, so
+        // its name is old but the file is not idle.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = active_in(tmp.path());
+        let name = seed_idle(tmp.path(), ORPHAN_MIN_AGE * 4, Duration::from_secs(60));
+
+        let report = sweep_orphans(&active, NOW, ORPHAN_MIN_AGE, &NO_PAUSE).unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept_recent, 1);
+        assert_eq!(names(tmp.path()), BTreeSet::from([name]));
+    }
+
+    #[test]
+    fn a_recent_name_on_a_file_that_was_modified_long_ago_is_kept() {
+        // A file copied back from a backup keeps its old modification time. Its
+        // name says it was created a minute ago, so a live writer may own it:
+        // the name is a check of its own, not a duplicate of the other.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = active_in(tmp.path());
+        let name = seed_idle(tmp.path(), Duration::from_secs(60), ORPHAN_MIN_AGE * 4);
+
+        let report = sweep_orphans(&active, NOW, ORPHAN_MIN_AGE, &NO_PAUSE).unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept_recent, 1);
+        assert_eq!(names(tmp.path()), BTreeSet::from([name]));
+    }
+
+    #[test]
+    fn the_idle_threshold_is_inclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = active_in(tmp.path());
+        let idle_enough = seed_idle(tmp.path(), ORPHAN_MIN_AGE * 4, ORPHAN_MIN_AGE);
+        let just_under = seed_idle(
+            tmp.path(),
+            ORPHAN_MIN_AGE * 5,
+            ORPHAN_MIN_AGE - Duration::from_secs(1),
+        );
+
+        let report = sweep_orphans(&active, NOW, ORPHAN_MIN_AGE, &NO_PAUSE).unwrap();
+
+        assert_eq!(report.deleted, 1, "idle for exactly the threshold goes");
+        assert_eq!(report.kept_recent, 1);
+        assert_eq!(names(tmp.path()), BTreeSet::from([just_under]));
+        assert!(!tmp.path().join(idle_enough).exists());
+    }
+
+    #[test]
+    fn a_modification_time_in_the_future_is_kept() {
+        // The file system clock and the sweeping clock disagree, so how long the
+        // file has been idle is not known.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = active_in(tmp.path());
+        let name = seed_idle(tmp.path(), ORPHAN_MIN_AGE * 4, Duration::ZERO);
+        let path = tmp.path().join(&name);
+        set_modified(&path, modified_at(NOW + 3_600_000_000_000));
+
+        let report = sweep_orphans(&active, NOW, ORPHAN_MIN_AGE, &NO_PAUSE).unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept_future, 1);
+        assert_eq!(names(tmp.path()), BTreeSet::from([name]));
+    }
+
+    #[test]
+    fn a_sweep_thread_that_cannot_start_is_a_warning_and_leaves_the_slot_free() {
+        // `thread::Builder::spawn` can fail (no resources). The writer must go
+        // on and say so, and a later request must be able to sweep.
+        let _guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let active = active_in(tmp.path());
+        let slot = try_begin_sweep().expect("no sweep is running yet");
+        let warnings = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(warnings.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let mut asked_for = None;
+
+        tracing::subscriber::with_default(subscriber, || {
+            start_or_warn(&active, slot, |path, slot| {
+                asked_for = Some(path);
+                drop(slot);
+                Err(io::Error::other("injected: out of threads"))
+            });
+        });
+
+        assert_eq!(asked_for, Some(active));
+        let warned = warnings.text();
+        assert!(
+            warned.contains("could not start the orphan temp-file sweep thread")
+                && warned.contains("out of threads"),
+            "the failure must be reported with its cause: {warned:?}"
+        );
+        assert!(
+            try_begin_sweep().is_some(),
+            "a sweep that never started must not hold the slot"
+        );
     }
 
     #[test]

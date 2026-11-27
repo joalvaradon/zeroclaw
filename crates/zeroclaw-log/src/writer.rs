@@ -1183,12 +1183,14 @@ pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex:
 mod tests {
     use super::*;
     use crate::event::{EventCategory, Severity};
-    use crate::orphan_sweep::{ORPHAN_MIN_AGE, sweep_ahead_action};
+    use crate::orphan_sweep::ORPHAN_MIN_AGE;
+    use crate::test_support::{CapturedWarnings, set_modified, sweep_ahead_action};
+    use std::time::UNIX_EPOCH;
     // Archive-name predicates live in `reader`; only the tests below exercise
     // them directly, so importing them at module scope would be unused in a
     // non-test build.
     use crate::reader::{is_archive_core, is_stamp};
-    use crate::temp_guard::{TempKind, parse_temp_sibling};
+    use crate::temp_guard::parse_temp_sibling;
 
     fn install_writer(dir: &Path, max_entries: usize) {
         let cfg = LogConfig {
@@ -1501,10 +1503,15 @@ mod tests {
         let temp = crate::temp_guard::last_created_temp()
             .expect("the trim created its temp file through the shared helper");
         let stem = state.policy.path.file_stem().unwrap().to_str().unwrap();
-        let parsed = parse_temp_sibling(stem, temp.file_name().unwrap().to_str().unwrap())
-            .expect("the sweep must recognize the name the trim really uses");
-        assert_eq!(parsed.kind, TempKind::Trim);
-        assert_eq!(parsed.pid, std::process::id());
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        assert!(
+            parse_temp_sibling(stem, name).is_some(),
+            "the sweep must recognize the name the trim really uses: {name}"
+        );
+        assert!(
+            name.starts_with(&format!("{stem}.tmp.{}.", std::process::id())),
+            "the trim's temp name keeps its historical shape: {name}"
+        );
         assert_eq!(temp.parent(), state.policy.path.parent());
     }
 
@@ -1531,8 +1538,9 @@ mod tests {
     fn trim_with_a_sweep_ahead_by(
         state: &Arc<WorkerState>,
         ahead: Duration,
+        still_written: bool,
     ) -> (Result<()>, usize) {
-        let (action, removed) = sweep_ahead_action(&state.policy.path, ahead);
+        let (action, removed) = sweep_ahead_action(&state.policy.path, ahead, still_written);
         let _during = SweepDuringTrim::install(action);
         let outcome = trim_to_last_entries(state);
         (outcome, removed.get())
@@ -1541,9 +1549,9 @@ mod tests {
     #[test]
     fn a_sweep_that_judges_a_live_trim_temp_old_makes_the_trim_fail_and_keeps_the_log() {
         // The sweep compares its own clock with the time in the temp file's
-        // name. A clock far enough ahead (or a trim long enough) makes the
-        // live temp file look abandoned; the consequence must be a failed
-        // trim and an untouched active log, never a damaged log.
+        // name and with the file's modification time. A clock far enough ahead
+        // makes the live temp file look abandoned by both; the consequence must
+        // be a failed trim and an untouched active log, never a damaged log.
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let state = trim_state(tmp.path(), 2);
@@ -1551,7 +1559,7 @@ mod tests {
         let before = fs::read(&state.policy.path).unwrap();
 
         let (outcome, removed) =
-            trim_with_a_sweep_ahead_by(&state, ORPHAN_MIN_AGE + Duration::from_secs(3600));
+            trim_with_a_sweep_ahead_by(&state, ORPHAN_MIN_AGE + Duration::from_secs(3600), false);
 
         assert_eq!(removed, 1, "the sweep must have taken the trim's temp file");
         let err = outcome.expect_err("a trim whose temp file was removed cannot rename it");
@@ -1580,9 +1588,34 @@ mod tests {
         let state = trim_state(tmp.path(), 2);
         write_numbered_lines(&state.policy.path, 5);
 
-        let (outcome, removed) = trim_with_a_sweep_ahead_by(&state, Duration::ZERO);
+        let (outcome, removed) = trim_with_a_sweep_ahead_by(&state, Duration::ZERO, false);
 
         assert_eq!(removed, 0, "a young temp file may belong to a live trim");
+        outcome.unwrap();
+        assert_eq!(
+            fs::read_to_string(&state.policy.path).unwrap(),
+            "{\"n\":3}\n{\"n\":4}\n"
+        );
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_sweep_leaves_the_temp_file_of_a_trim_that_is_still_being_written() {
+        // A trim that has run for over an hour and is still writing: its name
+        // is far older than the threshold, but the file was modified a minute
+        // before the sweep looks, so the sweep keeps it and the trim completes.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+
+        let (outcome, removed) =
+            trim_with_a_sweep_ahead_by(&state, ORPHAN_MIN_AGE + Duration::from_secs(3600), true);
+
+        assert_eq!(removed, 0, "a file still being written is not abandoned");
         outcome.unwrap();
         assert_eq!(
             fs::read_to_string(&state.policy.path).unwrap(),
@@ -1604,36 +1637,21 @@ mod tests {
             .to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         for name in names {
-            fs::write(dir.join(name), "orphan\n").unwrap();
+            let path = dir.join(name);
+            fs::write(&path, "orphan\n").unwrap();
+            // Last modified when its name says it was created, as a file that
+            // a killed writer left behind would be.
+            if let Some(stamp) = parse_temp_sibling("runtime-trace", name)
+                .and_then(|nanos| u64::try_from(nanos).ok())
+            {
+                set_modified(&path, UNIX_EPOCH + Duration::from_nanos(stamp));
+            }
         }
         dir
     }
 
     fn nanos_ago_from_now(age: Duration) -> i64 {
         chrono::Utc::now().timestamp_nanos_opt().unwrap() - i64::try_from(age.as_nanos()).unwrap()
-    }
-
-    /// What a fmt subscriber writes, so a test can read the warnings.
-    #[derive(Clone, Default)]
-    struct CapturedWarnings(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedWarnings {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWarnings {
-        type Writer = CapturedWarnings;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
     }
 
     #[test]
@@ -1667,7 +1685,7 @@ mod tests {
         };
 
         let (action, removed) =
-            sweep_ahead_action(&log, ORPHAN_MIN_AGE + Duration::from_secs(3600));
+            sweep_ahead_action(&log, ORPHAN_MIN_AGE + Duration::from_secs(3600), false);
         let during = crate::migrate::SweepDuringMigration::install(action);
         let warnings = CapturedWarnings::default();
         let subscriber = tracing_subscriber::fmt()
@@ -1677,7 +1695,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || init_from_config(&cfg, tmp.path()));
         drop(during);
-        let warned = String::from_utf8(warnings.0.lock().clone()).unwrap();
+        let warned = warnings.text();
         assert!(
             warned.contains("legacy JSONL migration failed"),
             "startup must say that the migration failed: {warned:?}"
