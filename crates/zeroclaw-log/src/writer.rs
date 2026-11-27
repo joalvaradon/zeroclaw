@@ -1780,6 +1780,37 @@ mod tests {
     }
 
     #[test]
+    fn a_config_reload_sweeps_orphans_that_appeared_since_the_last_start() {
+        // `init_from_config` is also the reload path: the writer that is
+        // running is replaced, with no shutdown in between.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            ..LogConfig::default()
+        };
+        let old = nanos_ago_from_now(ORPHAN_MIN_AGE + Duration::from_secs(3600));
+        let before_start = format!("runtime-trace.tmp.99998.{old}");
+        let before_reload = format!("runtime-trace.tmp.99999.{old}");
+        let dir = seed_in_log_dir(&cfg, tmp.path(), &[&before_start]);
+
+        init_from_config(&cfg, tmp.path());
+        assert!(
+            !dir.join(&before_start).exists(),
+            "the first start sweeps what was there"
+        );
+        seed_in_log_dir(&cfg, tmp.path(), &[&before_reload]);
+
+        init_from_config(&cfg, tmp.path());
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+
+        assert!(
+            !dir.join(&before_reload).exists(),
+            "a reload must sweep what appeared since the last start"
+        );
+    }
+
+    #[test]
     fn startup_under_a_disabled_policy_does_not_touch_the_directory() {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
